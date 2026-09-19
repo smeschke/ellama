@@ -1,0 +1,42 @@
+"Master BOM — all assemblies, one sheet",,,,,,,,,,,
+,,,,,,,,,,,
+Assembly,,Item,Description,Manufacturer,Qty,Unit $,Ext $,Current source,Mouser / CS-ecosystem option,Origin of Manufacture,Link
+"Robot, Controller",Electronic,ESP32 DevKit V1,MCU,Generic,2,$6.00,$12.00,Amazon,Yes — ESP32-DevKitC-32E,China,https://www.amazon.com/dp/B0DSZFD1SD?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1
+Robot,Electronics,Llama Driver Board,PCB that esp32’s and motor driver headers mount to,PCB Board Fab,1,$4.00,$4.00,JLCPCB,No (custom),Taiwan,jlc
+Robot,Structure,Electronics Carrier Board,Mounting board for all the electronics,self-made (printed),1,$2.00,$2.00,In House,No (custom),USA,
+Robot,Powertrain,Hub Adapter,Adapts gearmotor to wheel barrow hub,self-made (printed),4,$1.00,$4.00,In House,No (custom),USA,
+Robot,Powertrain,Hub Bolts,5/16” x 1.5” long hex bolts with washer and nut,Generic,8,$0.60,$4.80,Lowe’s,No,China,
+Robot,Structure,Lug Nuts,½” nylock nut,Generic,4,$1.00,$4.00,Lowe’s,No,China,
+Robot,Structure,Axle Blocks,Blocks to retain ½” allthread axles,self-made (printed),4,$1.00,$4.00,In House,No (custom),USA,
+Robot,Electronic,BTS7960 43 A driver module,Motor Driver,Generic,4,$5.50,$22.00,Amazon,Partial – drivers are 4x the cost and ½ the capacity,China,https://www.amazon.com/dp/B09QKFFDQ3?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1
+Robot,Electronic,Battery Connectors,"F1 Style Terminal Connectors (two red, two blue) for 14g wire",Generic,4,$0.10,$0.40,Amazon,Yes,China,
+Robot,Electronic,2x4 IDC F-F ribbon cable,Cable to go from MCU it Motor drivers,Generic,4,$2.40,$9.60,Amazon,Yes,China,https://www.amazon.com/Pc-Accessories-Connectors-Sockets-8P-20cm-4PK/dp/B07DFBPZLJ/ref=sr_1_1?crid=4E1KKYIHTKBW&dib=eyJ2IjoiMSJ9.Dqu84r2FgQOkJ-BlcMtLEpG1K5KKJf14Oz16XPRx__tEK6MOxmMMGlzv3l2VHeopf3_nn7v7mj8rBcuYBFAOpCth_dqZ1szD6-2PmunHeg7mHg2TEtkrt0TYaUdTSEnc4My09KRcJ0Q9V7raj-ir4FTGimi0DXNvFl-7IvSz8mwCSGNVxX-s7xES6-3EDdJgApgSipqHpn4kTpF_j1xdDyFKkzffmqJm20woHndlM3C9Lyg_t0jYwFnCxiTb02mk9eKfksV9_62CBvfnEvPpVYMaCPt9N1q2amiftF-lV-A.q-cAuiZn0RhaGBPVQdLyr6ZZ5husXX4w7osrvVdWKGs&dib_tag=se&keywords=2x4%2Bidc&qid=1785362150&s=electronics&sprefix=2x4%2Bidc%2Celectronics%2C175&sr=1-1
+Robot,Powertrain,RS550 motor + triple spur gear reduction,Gear motor,Generic,4,$12.00,$48.00,Amazon,No,China,
+Robot,Electronic,Fuse Holder,Inline blade fuse holder with 14awg leads,Generic,1,$1.50,$1.50,Amazon,Yes,China,
+Robot,Electronic,Main,40A blade fuse,Generic,1,$0.30,$0.30,Amazon,Yes,China,
+Robot,Powertrain,Wheels,10” pnumatic wheel with 5/8” bearings,Generic,4,$7.00,$28.00,Harbor Freight,No,China,
+Robot,Structure,Axle,½” all thread x 8” axle,Generic,4,$2.50,$10.00,Lowe’s,No,China,
+Robot,Electronic,12 V 7 Ah SLA battery,Expert Power EXP1270 12v 7AH SLA Battery with F1 Terminals,ExpertPower,2,$21.00,$42.00,Amazon,Yes,USA,https://www.amazon.com/ExpertPower-EXP1270-Rechargeable-Lead-Battery/dp/B003S1RQ2S/ref=sr_1_7?crid=2IWVYMJLMKB2L&dib=eyJ2IjoiMSJ9.WPtp39CASMSlCWJLmm_rILYFAqz9bo0TL9I2098qAUc0bEARtdVvTQ8CxEX92KUUziPI5ktMbrM7tcdOhGFEe4nMks5yIVli8lUeq9zCHTKZtCjdk6e39gYVyUn7podOxBVnkP_8EzW_23z2cjSbWzip3Z3mb2TiuCZmLwMXMkaXItqYOGJRqzEfhsvcVuQAZcI9F5Wf3J10s_kpn6SGGSlyaKVVPF2T58dA4STJiRp7QMFUXyFPCW_-ZXcKgZCfBNNJjM3MPC-cattuuK0WsIZ4ecPiQGD3tFyeHk2DYS8.KJ3vIUx65r9XBkXtq8zmBs-vdc6jXUuZtblmvZX0rJo&dib_tag=se&keywords=12v%2B7ah%2Bsla&qid=1785365901&sprefix=12v%2B7ah%2Bsla%2Caps%2C177&sr=8-7&th=1
+Robot,Electronic,Battery Connection wire,14 gauge primary wire,Generic,1,$2.00,$2.00,Amazon,Yes,China,
+Robot,Electronic,Motors Wire,18 gauge primary wire,Generic,1,$1.00,$1.00,Amazon,Yes,China,
+Robot,Electronic,Logic Power Wire,22 gauge primary wire,Generic,1,$1.00,$1.00,Amazon,Yes,China,
+Controller,Electronic,Signal Wire,22g silicone wire,Generic,1,$1.00,$1.00,Amazon,Yes,China,
+Robot,Electronic,Weygo Connectors,6-bus weygo style connector,Weygo,3,$1.50,$4.50,Amazon,No,Germany,
+Robot,Electronic,5 V BEC (ESP32 supply),Buck converter for 12v to 5v,Generic,1,$1.00,$1.00,Amazon,Yes,China,
+Robot,Electronic,Battery Charger,Cen-Tech 12v 2a sla battery charger,CEN-TECH (Harbor Freight),1,$20.00,$20.00,Harbor Freight,No,China,
+Robot,Structure,Plywood base 11 x 18 in,11”x18”x3/4” hardwood plywood,Generic,1,$12.00,$12.00,In House,No (self-fab),USA,
+Robot,Structure,Plywood Axle Holder,3”x4”x3/4” hardwood plywood w/ four holes,Generic,4,$1.50,$6.00,In House,No (self-fab),USA,
+Robot,Structure,Axle Holder Screws,Sharp Point Lath Screws 1 ¼”,Generic,24,$0.10,$2.40,Lowe’s,No,China,https://www.homedepot.com/p/Teks-8-x-1-1-4-in-Phillips-Truss-Head-Sharp-Point-Lath-Screws-140-Pack-21512/100136421
+Robot,Structure,Motor mount,Mounts to hold 550 motor end of motor gearbox,self-made (printed),4,$1.00,$4.00,In House,No (self-fab),USA,
+Robot,Structure,Battery holder,Battery Holder,self-made (printed),1,$1.00,$1.00,In House,No (self-fab),USA,
+Robot,Powertrain,Wheel bushings,½” to 5/8” bushing 3 ½” long,Generic,4,$2.50,$10.00,Amazon,No,China,https://www.amazon.com/WFCYQ-Bushings-332-Replacement-Height/dp/B0FWC5977R/ref=sr_1_2?crid=I7BKJOFPIQQ4&dib=eyJ2IjoiMSJ9.Nnesl6M-FFTSsqVh75_JWt0uv6DAwpuA1uj5slZDRqG2_bGqRaT6-JO4IxGsIJIzel9q17lnN3-62fyL-R_UiF-7WM58svfUm0JDbEWXUk6xq1XXbomJ27usjYAfCPiXj5ZcrdjhybGGMpHTBk54m5ptUvjh40BKwzxaPUOmlsx63jP4qx4cjyuFDsBndK0UBrzh-8rnGMhcOCBgHedSQxVjV8gIITqLXcnJMhDK_DU.6CjU_qMlq52xMCSNZVTljSjPN-KmVakZH1ihIuVD_NA&dib_tag=se&keywords=5%2F8%2Bto%2B1%2F2%2Bwheel%2Bbushing&qid=1785365716&sprefix=5%2F8%2Bto%2B1%2F2%2Bwhee%2Caps%2C189&sr=8-2
+Robot,Electronic,Power Switch,Round Blue LED Toggle Switch 12v 20A,Generic,2,$1.10,$2.20,Amazon,Yes,China,https://www.amazon.com/dp/B08TBZ23C1?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1
+Robot,Structure,Body shell,Body,self-made (printed),1,$5.00,$5.00,In House,No (self-fab),USA,
+Robot,Structure,Axle Mount Fasteners,"1/4”x20 3” carriage bolts, nut, and washer",Generic,16,$0.70,$11.20,Amazon,No,China,https://www.amazon.com/EASTPUK-Carriage-Washers-Stainless-Outdoor/dp/B0FBFKSHXG/ref=sr_1_4?crid=1GE52Y8SJIPT&dib=eyJ2IjoiMSJ9.v3rXy-1DUUzLH6NuMgquUQ0Stg2ZyWvtL9Gm5S9kJbl-4-1SoG2xGlZe50gqQtO4RDWZgSK90Rv96dYM0L67S4pLTHo6F3V0HvBIvlmPLa7lpElu_RL1GZPKltnMKt9IRJDuhbc18WEv_xI-Yw9wxdG4Q1yqcUKhttgKlGAjHyDewoa5oGu4z3doF3IrZx17215-I9KiZvslcDy0v81ylTLw33wpDj8sdfvjAGPfOY0.6_ok6QEfCzQfGrbmBenJxhTziroN1hhfiS_gASupskA&dib_tag=se&keywords=1%2F4%22-20%2B3%22%2Bcarriage%2Bbolt&qid=1785363194&sprefix=1%2F4%2B-20%2B3%2Bcarriage%2Bbol%2Caps%2C195&sr=8-4&th=1
+"Robot, Controller",Structure,Consumables,Consumables,Generic,1,$5.00,$5.00,In House,No,USA,
+Controller,Electronic,Analog thumb joystick,KY-023 Control Stick,Generic,1,$1.20,$1.20,Amazon,Yes,China,https://www.amazon.com/dp/B0F4KJ6LKG?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1
+Controller,Electronic,USB Cable,usb c to usb a cable,Generic,1,$2.00,$2.00,Amazon,Yes,China,
+Controller,Structure,Printed enclosure,Enclosure,self-made (printed),1,$1.00,$1.00,In House,No (self-fab),USA,
+Controller,Electronic,USB Battery,Consumer USB Battyer,Generic,1,$10.00,$10.00,Amazon,No,China,
+,,,,,,,,,,,
+,,GRAND TOTAL (per full set: robot + controller),,,,,$300.10,,,,
