@@ -29,14 +29,10 @@ The MCU handles receiving motor commands and ramping motor current and speed to 
 
 eLlama is shown below and includes:
 
-- Extruded aluminum mounting rail *(todo)*
-- Front and rear bumpers *(todo)*
-- Battery bay *(todo)*
-- Status panel *(todo)*
 - MCU power button
 - Motion stop and lockout button (high-voltage switch)
 
-#### 1.2.3 Status Lights *(todo)*
+#### 1.2.3 Status Lights
 
 There are LED indicators on the switches, as well as a battery status indicator on the rear of the robot.
 
@@ -48,11 +44,7 @@ There are two switches on the robot. One switches the MCU and power for the moto
 
 A compute module is included with the robot. Additional payloads such as IMUs, lidar, cameras, GPS, and single-board computers can be easily, safely, and securely mounted in the compute module, and powered with the supplied 12V DC.
 
-#### 1.2.6 Orientation
-
-Image in images
-
-#### 1.2.7 Robot Equations
+#### 1.2.6 Robot Equations
 
 ```
 V = (vR + vL) / 2
