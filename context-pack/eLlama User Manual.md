@@ -73,6 +73,8 @@ Theta = (vR - vL) / effective track
 | Maximum Payload | 40 pounds |
 | All-terrain Payload | 20 pounds |
 | Maximum Speed | 1 m/s |
+| Turn Rate (in-place spin), low-speed setting | ~60–80°/s |
+| Turn Rate (in-place spin), high-speed setting | ~150–180°/s |
 | Climb Grade | 30% |
 | Sideslope | 15% |
 | Operating Temperature, Min | 0 F |
@@ -86,6 +88,8 @@ Theta = (vR - vL) / effective track
 | Wheel Encoders | None |
 | Internal Sensing | None |
 | Environmental | Rain resistant |
+
+Turn rate was measured via frame-by-frame video tracking of robot orientation across concrete, gravel, grass, and carpet. High-speed carpet readings were the noisiest of the set (lower visual contrast for tracking against carpet tiles), which widens that end of the range without necessarily reflecting a real difference in turn rate on that surface.
 
 ## 2. Getting Started
 
@@ -123,6 +127,6 @@ Conduct initial testing with the robot on blocks so that the wheels can spin fre
 
 ### 3.2 Lifting and Transport
 
-The robot can be lifted by one person using the handle on the back of the robot. If desired, the robot's main power switch can be left on during transport, as this will provide some active braking. If the robot is transported in a vehicle, it is advised to chock the tires.
+The robot can be lifted by one person using the handle on the back of the robot. If desired, the robot's main power switch can be left on during transport, as this will provide some active braking: with the drivers powered and no drive command present, each motor's two terminals are both held near ground rather than left floating, so the motor's back-EMF is shorted through the driver and resists rotation. This only works while the power switch is on — with it off, the drivers are unpowered and the outputs float. If the robot is transported in a vehicle, it is advised to chock the tires.
 
 The eLlama robot has a flat bottom and can be lifted on a single forklift fork and loaded into a truck bed.

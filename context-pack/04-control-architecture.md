@@ -80,8 +80,10 @@ for anything unattended or valuable. A bounded decision, not an oversight.
 If the MCU receives no signal from the controller for a fraction of a second, it enters
 failsafe and commands PWM zero.
 
-Stopping is PWM zero, not active braking: the 100:1 gear reduction holds the robot on a
-slope without help.
+PWM zero is not neutral: the BTS7960 drivers hold both terminals of each motor near
+ground rather than letting them float, shorting the motor's back-EMF through the driver.
+That is active (dynamic) braking, confirmed by testing — not just the 100:1 gear
+reduction holding the robot on a slope, though that helps too.
 
 *(Specific timeout values live in the firmware.)*
 

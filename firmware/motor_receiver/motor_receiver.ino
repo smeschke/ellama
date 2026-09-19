@@ -6,8 +6,9 @@
 // (which can send raw left/right values directly). This receiver does no
 // mixing -- it only ramps toward the commanded values (to protect the
 // gearboxes from instant direction reversals) and writes PWM to the
-// motors via the ESP32 LEDC peripheral. Stopping is just PWM 0; the
-// motors' gear reduction holds them, so no active braking is needed.
+// motors via the ESP32 LEDC peripheral. Stopping is just PWM 0; with R_EN/L_EN
+// hardwired enabled, that holds both motor terminals near ground through the
+// BTS7960 low-side switches, which actively (dynamically) brakes the motor.
 
 #include <WiFi.h>
 #include <esp_now.h>
