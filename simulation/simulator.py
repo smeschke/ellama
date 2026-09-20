@@ -14,6 +14,12 @@ drive the resulting path. Click EXPORT CSV to write the current command
 list to exported_path.csv (next to this script), ready to hand to
 send_csv.py so it can be replayed on the real robot without retyping.
 
+MAX PWM (top-left) is required before RUN or EXPORT CSV will do anything.
+It's a hard ceiling -- every command's (pwml, pwmr) pair is scaled down,
+preserving their ratio, so neither wheel exceeds it. There is no default
+on purpose: start low (40-80) and raise it once you trust the path,
+rather than trusting a number picked for you. See simulation/README.md.
+
 Speed model: PWM magnitude -> ft/s, piecewise-linear, calibrated against
 real straight-line runs (see the _SPEED_PTS comment below). Pivot turns
 use an inflated effective track width (see TURN_SCRUB_FACTOR) to account
@@ -91,6 +97,20 @@ def simulate(commands):
     return poses
 
 
+def clamp_commands(commands, max_pwm):
+    """Scale each command's (pwml, pwmr) pair down, preserving their ratio (so
+    turn shape/curvature is unaffected), so neither wheel exceeds max_pwm."""
+    out = []
+    for pwml, pwmr, time_ms in commands:
+        mag = max(abs(pwml), abs(pwmr))
+        if mag > max_pwm and mag > 0:
+            scale = max_pwm / mag
+            pwml = int(round(pwml * scale))
+            pwmr = int(round(pwmr * scale))
+        out.append((pwml, pwmr, time_ms))
+    return out
+
+
 # ----------------------------------------------------------------------
 # UI layout
 # ----------------------------------------------------------------------
@@ -99,7 +119,14 @@ VIEW_W, VIEW_H = 800, 760
 PANEL_W = 380
 WIN_W, WIN_H = VIEW_W + PANEL_W, VIEW_H
 
-TEXTBOX_RECT = (VIEW_W + 15, 60, WIN_W - 15, 520)          # x0,y0,x1,y1
+# Required safety ceiling: RUN and EXPORT CSV refuse to act until this is
+# set, and then scale every command's PWM pair down (preserving the L/R
+# ratio, so turn shape is unaffected) so neither wheel exceeds it. There is
+# deliberately no default -- see simulation/README.md on why.
+MAX_PWM_LABEL_POS = (VIEW_W + 15, 78)
+MAX_PWM_RECT = (VIEW_W + 15, 84, VIEW_W + 120, 114)
+
+TEXTBOX_RECT = (VIEW_W + 15, 120, WIN_W - 15, 520)         # x0,y0,x1,y1
 RUN_BUTTON_RECT = (VIEW_W + 15, 535, VIEW_W + 185, 580)
 CLEAR_BUTTON_RECT = (VIEW_W + 195, 535, VIEW_W + 365, 580)
 RESET_VIEW_RECT = (VIEW_W + 15, 595, VIEW_W + 365, 640)
@@ -121,7 +148,9 @@ class Simulator:
     def __init__(self):
         self.lines = [""]          # MDI text buffer, list of lines
         self.focused = False
-        self.status = "Click the MDI box, type commands, then RUN."
+        self.max_pwm_str = ""      # required; no default, see MAX_PWM_RECT
+        self.max_pwm_focused = False
+        self.status = "Set MAX PWM, click the MDI box, type commands, then RUN."
         self.poses = simulate([])  # trajectory currently shown (starts at origin)
         self.anim_index = 0
         self.animating = False
@@ -135,7 +164,11 @@ class Simulator:
     def on_mouse(self, event, mx, my, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN:
             return
-        if _in_rect(mx, my, TEXTBOX_RECT):
+        self.max_pwm_focused = False
+        if _in_rect(mx, my, MAX_PWM_RECT):
+            self.focused = False
+            self.max_pwm_focused = True
+        elif _in_rect(mx, my, TEXTBOX_RECT):
             self.focused = True
         elif _in_rect(mx, my, RUN_BUTTON_RECT):
             self.focused = False
@@ -161,6 +194,13 @@ class Simulator:
     def handle_key(self, key):
         if key == -1:
             return
+        if self.max_pwm_focused:
+            k = key & 0xFF
+            if k in (8, 127):       # Backspace
+                self.max_pwm_str = self.max_pwm_str[:-1]
+            elif 48 <= k <= 57 and len(self.max_pwm_str) < 3:  # digits 0-9
+                self.max_pwm_str += chr(k)
+            return
         if not self.focused:
             return
         if key in (13, 10):        # Enter
@@ -172,6 +212,17 @@ class Simulator:
                 self.lines.pop()
         elif 32 <= key <= 126:     # printable ASCII
             self.lines[-1] += chr(key)
+
+    # -------------------- MAX PWM safety ceiling --------------------
+    def _get_max_pwm(self):
+        """Returns (max_pwm, err). max_pwm is None on err -- blank or out of 1..255."""
+        s = self.max_pwm_str.strip()
+        if not s:
+            return None, "Set MAX PWM first -- start low, e.g. 40-80, and raise it once you trust the path."
+        val = int(s)
+        if not (1 <= val <= 255):
+            return None, "MAX PWM must be 1-255."
+        return val, None
 
     # -------------------- command parsing / simulation --------------------
     def _parse_commands(self):
@@ -197,23 +248,33 @@ class Simulator:
         if err:
             self.status = err
             return
+        max_pwm, err = self._get_max_pwm()
+        if err:
+            self.status = err
+            return
+        commands = clamp_commands(commands, max_pwm)
 
         self.poses = simulate(commands)
         self._fit_view()
         self.anim_index = 0
         self.animating = True
-        self.status = f"Running {len(commands)} command(s)..."
+        self.status = f"Running {len(commands)} command(s), capped at {max_pwm} PWM..."
 
     def export_csv(self):
         commands, err = self._parse_commands()
         if err:
             self.status = err
             return
+        max_pwm, err = self._get_max_pwm()
+        if err:
+            self.status = err
+            return
+        commands = clamp_commands(commands, max_pwm)
         with open(EXPORT_PATH, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["pwml", "pwmr", "time_ms"])
             writer.writerows(commands)
-        self.status = f"Exported {len(commands)} command(s) to {EXPORT_PATH}"
+        self.status = f"Exported {len(commands)} command(s), capped at {max_pwm} PWM, to {EXPORT_PATH}"
 
     def _fit_view(self):
         xs = [p[0] for p in self.poses]
@@ -275,6 +336,22 @@ class Simulator:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, TEXT_COLOR, 2)
         cv2.putText(frame, "format: pwml pwmr time_ms", (x0 + 15, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
+
+        lx, ly = MAX_PWM_LABEL_POS
+        cv2.putText(frame, "MAX PWM (required, start low):", (lx, ly),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
+        mx0, my0, mx1, my1 = MAX_PWM_RECT
+        if self.max_pwm_focused:
+            mborder = ACCENT
+        elif not self.max_pwm_str.strip():
+            mborder = (0, 140, 255)  # unset -- flagged in orange, RUN/EXPORT are blocked
+        else:
+            mborder = (100, 100, 100)
+        cv2.rectangle(frame, (mx0, my0), (mx1, my1), TEXTBOX_BG, -1)
+        cv2.rectangle(frame, (mx0, my0), (mx1, my1), mborder, 2 if self.max_pwm_focused else 1)
+        mtext = self.max_pwm_str + ("_" if self.max_pwm_focused else "")
+        cv2.putText(frame, mtext, (mx0 + 8, my1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, TEXT_COLOR, 1)
 
         tb = TEXTBOX_RECT
         border = ACCENT if self.focused else (100, 100, 100)

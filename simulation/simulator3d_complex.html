@@ -15,6 +15,12 @@
            display: flex; flex-direction: column; overflow: hidden; }
   #panel h1 { font-size: 18px; margin: 0 0 4px 0; }
   #panel .hint { font-size: 11px; color: #a0a0a0; margin-bottom: 4px; line-height: 1.4; }
+  #maxpwm-row { display: flex; align-items: center; gap: 8px; margin: 8px 0 4px; }
+  #maxpwm-row label { font-size: 11px; color: #a0a0a0; }
+  #maxpwm { width: 60px; background: #191919; color: #e6e6e6; border: 2px solid #ff8c00;
+            font-family: monospace; font-size: 13px; padding: 4px 6px; box-sizing: border-box; }
+  #maxpwm:focus { border-color: #3cb4ff; outline: none; }
+  #maxpwm.set { border-color: #646464; }
   #gridWrap { flex: 1; min-height: 220px; margin-top: 8px; overflow-y: auto; border: 2px solid #646464; background: #191919; }
   table#grid { width: 100%; border-collapse: collapse; font-family: monospace; font-size: 13px; }
   table#grid th { color: #bbb; font-weight: normal; padding: 4px 2px; border-bottom: 1px solid #555;
@@ -52,6 +58,10 @@
     <div class="hint">Click a cell, type digits, Tab to move to the next one.</div>
     <div class="hint">Click the 3D ground to add a waypoint (drag/scroll still orbits/zooms).</div>
     <div class="hint">MODE below switches how a click becomes a command.</div>
+    <div id="maxpwm-row">
+      <label for="maxpwm">MAX PWM (required, start low):</label>
+      <input id="maxpwm" type="text" inputmode="numeric" placeholder="">
+    </div>
     <div id="gridWrap">
       <table id="grid">
         <thead><tr><th></th><th>PWM&nbsp;L</th><th>PWM&nbsp;R</th><th>TIME&nbsp;(ms)</th></tr></thead>
@@ -69,7 +79,7 @@
     <button id="modetoggle" class="fullbtn">MODE: ARC</button>
     <button id="exportcsv" class="fullbtn">EXPORT CSV</button>
     <div id="status-label">Status:</div>
-    <div id="status">Click a cell or the ground, then RUN.</div>
+    <div id="status">Set MAX PWM, click a cell or the ground, then RUN.</div>
   </div>
 </div>
 
@@ -175,6 +185,20 @@ function simulate(commands) {
     }
   }
   return poses;
+}
+
+// Scales each command's (pwml, pwmr) pair down, preserving their ratio (so
+// turn shape/curvature is unaffected), so neither wheel exceeds maxPwm.
+function clampCommands(commands, maxPwm) {
+  return commands.map(([pwml, pwmr, timeMs]) => {
+    const mag = Math.max(Math.abs(pwml), Math.abs(pwmr));
+    if (mag > maxPwm && mag > 0) {
+      const scale = maxPwm / mag;
+      pwml = Math.round(pwml * scale);
+      pwmr = Math.round(pwmr * scale);
+    }
+    return [pwml, pwmr, timeMs];
+  });
 }
 
 // ----------------------------------------------------------------------
@@ -643,6 +667,7 @@ function parseGrid() {
 // ----------------------------------------------------------------------
 const statusEl = document.getElementById("status");
 const modeBtn = document.getElementById("modetoggle");
+const maxPwmInput = document.getElementById("maxpwm");
 let poses = simulate([]);
 let playStartMs = null;
 let playing = false;
@@ -650,11 +675,29 @@ let planPose = [...INITIAL_POSE];
 let waypointRowGroups = [];
 let pointMode = "arc";
 
+// No default on purpose -- see simulation/README.md. RUN/EXPORT CSV refuse
+// to act until this is set; the orange border is the "not set yet" flag.
+function getMaxPwm() {
+  const s = maxPwmInput.value.trim();
+  if (!s || !/^\d+$/.test(s)) return null;
+  const val = Number(s);
+  return val >= 1 && val <= 255 ? val : null;
+}
+maxPwmInput.addEventListener("input", () => {
+  maxPwmInput.classList.toggle("set", getMaxPwm() !== null);
+});
+
 function runCommands() {
   const { commands, error } = parseGrid();
   if (error) { statusEl.textContent = error; return; }
+  const maxPwm = getMaxPwm();
+  if (maxPwm === null) {
+    statusEl.textContent = "Set MAX PWM first (1-255) -- start low, e.g. 40-80, and raise it once you trust the path.";
+    return;
+  }
+  const clamped = clampCommands(commands, maxPwm);
 
-  poses = simulate(commands);
+  poses = simulate(clamped);
   fitCamera(poses);
   const pathThreePts = poses.map((p) => {
     const g = poseTo3D(p.x, p.y, p.theta);
@@ -663,7 +706,7 @@ function runCommands() {
   setPathPoints(pathThreePts);
   playStartMs = performance.now();
   playing = true;
-  statusEl.textContent = `Running ${commands.length} command(s)...`;
+  statusEl.textContent = `Running ${commands.length} command(s), capped at ${maxPwm} PWM...`;
 }
 
 function clearAll() {
@@ -699,7 +742,13 @@ function toggleMode() {
 function exportCsv() {
   const { commands, error } = parseGrid();
   if (error) { statusEl.textContent = error; return; }
-  const csv = "pwml,pwmr,time_ms\n" + commands.map((c) => c.join(",")).join("\n") + "\n";
+  const maxPwm = getMaxPwm();
+  if (maxPwm === null) {
+    statusEl.textContent = "Set MAX PWM first (1-255) -- start low, e.g. 40-80, and raise it once you trust the path.";
+    return;
+  }
+  const clamped = clampCommands(commands, maxPwm);
+  const csv = "pwml,pwmr,time_ms\n" + clamped.map((c) => c.join(",")).join("\n") + "\n";
   const blob = new Blob([csv], { type: "text/csv" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -709,7 +758,7 @@ function exportCsv() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
-  statusEl.textContent = `Exported ${commands.length} command(s) -- check your downloads for exported_path.csv, then run send_csv.py on it.`;
+  statusEl.textContent = `Exported ${clamped.length} command(s), capped at ${maxPwm} PWM -- check your downloads for exported_path.csv, then run send_csv.py on it.`;
 }
 
 function collectPoint(tx, ty) {

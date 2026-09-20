@@ -16,6 +16,14 @@ path. Click EXPORT CSV to write the current grid to exported_path.csv
 (next to this script), ready to hand to send_csv.py so it can be replayed
 on the real robot without retyping.
 
+MAX PWM (top of panel) is required before RUN or EXPORT CSV will do
+anything. It's a hard ceiling -- every command's (pwml, pwmr) pair is
+scaled down, preserving their ratio, so neither wheel exceeds it. There is
+no default on purpose: start low (40-80) and raise it once you trust the
+path, rather than trusting a number picked for you. Click-to-waypoint
+planning in particular tends to reach for full-speed PWM to hit a point
+quickly -- see simulation/README.md.
+
 Speed model: PWM magnitude -> ft/s, piecewise-linear, calibrated against
 real straight-line runs (see the _SPEED_PTS comment below). Pivot turns
 use an inflated effective track width (see TURN_SCRUB_FACTOR) to account
@@ -123,6 +131,20 @@ def simulate(commands):
     return poses
 
 
+def clamp_commands(commands, max_pwm):
+    """Scale each command's (pwml, pwmr) pair down, preserving their ratio (so
+    turn shape/curvature is unaffected), so neither wheel exceeds max_pwm."""
+    out = []
+    for pwml, pwmr, time_ms in commands:
+        mag = max(abs(pwml), abs(pwmr))
+        if mag > max_pwm and mag > 0:
+            scale = max_pwm / mag
+            pwml = int(round(pwml * scale))
+            pwmr = int(round(pwmr * scale))
+        out.append((pwml, pwmr, time_ms))
+    return out
+
+
 # ----------------------------------------------------------------------
 # UI layout (sized for a 4K/hi-DPI display)
 # ----------------------------------------------------------------------
@@ -140,10 +162,17 @@ ROW_NUM_W = 50
 CELL_H = 30
 GRID_X0 = VIEW_W + 20
 GRID_X1 = WIN_W - 20
-GRID_Y0 = 145
+GRID_Y0 = 190
 GRID_Y1 = GRID_Y0 + GRID_ROWS * CELL_H
 DATA_X0 = GRID_X0 + ROW_NUM_W
 COL_W = (GRID_X1 - DATA_X0) // GRID_COLS
+
+# Required safety ceiling: RUN and EXPORT CSV refuse to act until this is
+# set, and then scale every command's PWM pair down (preserving the L/R
+# ratio, so turn shape is unaffected) so neither wheel exceeds it. There is
+# deliberately no default -- see simulation/README.md on why.
+MAX_PWM_LABEL_POS = (GRID_X0, 155)
+MAX_PWM_RECT = (GRID_X0 + 470, 133, GRID_X0 + 620, 163)
 
 RUN_BUTTON_RECT = (GRID_X0, GRID_Y1 + 25, GRID_X0 + 170, GRID_Y1 + 75)
 CLEAR_BUTTON_RECT = (GRID_X0 + 190, GRID_Y1 + 25, GRID_X0 + 360, GRID_Y1 + 75)
@@ -184,7 +213,9 @@ class Simulator:
         self.grid = [["" for _ in range(GRID_COLS)] for _ in range(GRID_ROWS)]
         self.cur_row, self.cur_col = 0, 0
         self.focused = False
-        self.status = "Click a grid cell, type commands, then RUN."
+        self.max_pwm_str = ""       # required; no default, see MAX_PWM_RECT
+        self.max_pwm_focused = False
+        self.status = "Set MAX PWM (top of panel), then click a grid cell, type commands, and RUN."
         self.poses = simulate([])  # trajectory currently shown (starts at origin)
         self.anim_index = 0
         self.animating = False
@@ -211,8 +242,12 @@ class Simulator:
     def on_mouse(self, event, mx, my, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN:
             return
+        self.max_pwm_focused = False
         row, col = self._cell_at(mx, my)
-        if row is not None:
+        if _in_rect(mx, my, MAX_PWM_RECT):
+            self.focused = False
+            self.max_pwm_focused = True
+        elif row is not None:
             self.focused = True
             self.cur_row, self.cur_col = row, col
         elif _in_rect(mx, my, RUN_BUTTON_RECT):
@@ -397,6 +432,13 @@ class Simulator:
     def handle_key(self, key):
         if key == -1:
             return
+        if self.max_pwm_focused:
+            k = key & 0xFF
+            if k in (8, 127):           # Backspace
+                self.max_pwm_str = self.max_pwm_str[:-1]
+            elif 48 <= k <= 57 and len(self.max_pwm_str) < 3:   # digits 0-9
+                self.max_pwm_str += chr(k)
+            return
         if not self.focused:
             return
         if key == KEY_TAB:
@@ -416,6 +458,17 @@ class Simulator:
                 self.grid[self.cur_row][self.cur_col] = '-'
         elif 48 <= k <= 57:         # digits 0-9
             self.grid[self.cur_row][self.cur_col] = cell + chr(k)
+
+    # -------------------- MAX PWM safety ceiling --------------------
+    def _get_max_pwm(self):
+        """Returns (max_pwm, err). max_pwm is None on err -- blank or out of 1..255."""
+        s = self.max_pwm_str.strip()
+        if not s:
+            return None, "Set MAX PWM first (top of panel) -- start low, e.g. 40-80, and raise it once you trust the path."
+        val = int(s)
+        if not (1 <= val <= 255):
+            return None, "MAX PWM must be 1-255."
+        return val, None
 
     # -------------------- command parsing / simulation --------------------
     def _parse_commands(self):
@@ -440,23 +493,33 @@ class Simulator:
         if err:
             self.status = err
             return
+        max_pwm, err = self._get_max_pwm()
+        if err:
+            self.status = err
+            return
+        commands = clamp_commands(commands, max_pwm)
 
         self.poses = simulate(commands)
         self._fit_view()
         self.anim_index = 0
         self.animating = True
-        self.status = f"Running {len(commands)} command(s)..."
+        self.status = f"Running {len(commands)} command(s), capped at {max_pwm} PWM..."
 
     def export_csv(self):
         commands, err = self._parse_commands()
         if err:
             self.status = err
             return
+        max_pwm, err = self._get_max_pwm()
+        if err:
+            self.status = err
+            return
+        commands = clamp_commands(commands, max_pwm)
         with open(EXPORT_PATH, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["pwml", "pwmr", "time_ms"])
             writer.writerows(commands)
-        self.status = f"Exported {len(commands)} command(s) to {EXPORT_PATH}"
+        self.status = f"Exported {len(commands)} command(s), capped at {max_pwm} PWM, to {EXPORT_PATH}"
 
     def _fit_view(self):
         xs = [p[0] for p in self.poses]
@@ -536,6 +599,22 @@ class Simulator:
                     (x0 + 20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 160, 160), 1)
         cv2.putText(frame, "MODE button below switches how a click becomes a command",
                     (x0 + 20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 160, 160), 1)
+
+        lx, ly = MAX_PWM_LABEL_POS
+        cv2.putText(frame, "MAX PWM (required, start low):", (lx, ly),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160, 160, 160), 1)
+        mx0, my0, mx1, my1 = MAX_PWM_RECT
+        if self.max_pwm_focused:
+            mborder = ACCENT
+        elif not self.max_pwm_str.strip():
+            mborder = (0, 140, 255)  # unset -- flagged in orange, RUN/EXPORT are blocked
+        else:
+            mborder = (90, 90, 90)
+        cv2.rectangle(frame, (mx0, my0), (mx1, my1), TEXTBOX_BG, -1)
+        cv2.rectangle(frame, (mx0, my0), (mx1, my1), mborder, 2 if self.max_pwm_focused else 1)
+        mtext = self.max_pwm_str + ("_" if self.max_pwm_focused else "")
+        cv2.putText(frame, mtext, (mx0 + 8, my1 - 9),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, TEXT_COLOR, 1)
 
         for c, label in enumerate(COL_HEADERS):
             cx = DATA_X0 + c * COL_W + COL_W // 2

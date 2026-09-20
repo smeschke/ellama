@@ -20,6 +20,14 @@ eLlama has no wheel encoders or other odometry feedback — commands are pure op
 
 Because there's no feedback, error still accumulates over a run, and it shows up most on turns (skid-steer scrubs unpredictably). Straight-line forward/back commands are the reliable case — under about 8 ft of travel, the robot usually lands within a fraction of an inch of the simulated endpoint. That's good enough to plan multi-step paths in the simulator, export them, and expect the real robot to follow along.
 
+## Safety: MAX PWM is required, and there's no default on purpose
+
+Every UI has a **MAX PWM** field. RUN and EXPORT CSV both refuse to act until it's set, and once it is, every command's `(pwml, pwmr)` pair is scaled down — preserving the ratio between them, so a turn's shape doesn't change, only its speed — so neither wheel exceeds it.
+
+There's deliberately no baked-in default. The first version of this tool didn't have this control, and the click-to-waypoint arc planner (which picks whatever PWM gets to the clicked point at a steady speed) happily wrote out full-throttle 255 commands on tight turns — accurate to what the robot actually did, just much faster than expected the first time it ran unattended. That's a general risk, not specific to this planner: AI-assisted or auto-generated motion code tends to reach for whatever value produces the desired motion fastest, which in an unconstrained PWM range usually means near-maximum. **Start with the lowest PWM that's still effective for what you're testing, watch it run, and only raise the ceiling once you trust the path** — don't hand a fresh command list to the real robot at whatever PWM it happened to be written with.
+
+Separately: PWM magnitudes much below ~40 tend not to produce any real motion at all — that's mechanical (motor/gearbox static friction), not a firmware-enforced deadband, so the simulator won't warn you about it. A command with `|pwm|` in the single or low double digits may look fine in the preview and simply do nothing on the real robot.
+
 ## Workflow
 
 1. Build a path in the simulator — type commands directly, or click the ground to drop waypoints (complex versions plan the turn+drive or arc command for you).

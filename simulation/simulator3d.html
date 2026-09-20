@@ -15,6 +15,12 @@
   #mdi { flex: 1; min-height: 300px; background: #191919; color: #e6e6e6; border: 2px solid #646464;
          font-family: monospace; font-size: 14px; padding: 8px; resize: none; box-sizing: border-box; }
   #mdi:focus { border-color: #3cb4ff; outline: none; }
+  #maxpwm-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  #maxpwm-row label { font-size: 12px; color: #a0a0a0; }
+  #maxpwm { width: 70px; background: #191919; color: #e6e6e6; border: 2px solid #ff8c00;
+            font-family: monospace; font-size: 14px; padding: 4px 6px; box-sizing: border-box; }
+  #maxpwm:focus { border-color: #3cb4ff; outline: none; }
+  #maxpwm.set { border-color: #646464; }
   .buttons { display: flex; gap: 10px; margin-top: 10px; }
   .buttons button { flex: 1; padding: 12px 0; font-size: 15px; font-weight: bold; color: #fff;
                      border: 1px solid #ccc; border-radius: 3px; cursor: pointer; }
@@ -33,6 +39,10 @@
     <h1>MDI Command Input</h1>
     <div class="hint">format: pwml pwmr time_ms (one command per line)</div>
     <div class="hint">Click the ground to add a turn+drive command there; drag to orbit, scroll to zoom.</div>
+    <div id="maxpwm-row">
+      <label for="maxpwm">MAX PWM (required, start low):</label>
+      <input id="maxpwm" type="text" inputmode="numeric" placeholder="">
+    </div>
     <textarea id="mdi" spellcheck="false" placeholder="150 150 1000&#10;-100 100 500&#10;200 255 800"></textarea>
     <div class="buttons">
       <button id="run">RUN</button>
@@ -40,7 +50,7 @@
     </div>
     <button id="resetview">RESET VIEW</button>
     <div id="status-label">Status:</div>
-    <div id="status">Type commands, then RUN. Drag to orbit, scroll to zoom.</div>
+    <div id="status">Set MAX PWM, type commands, then RUN. Drag to orbit, scroll to zoom.</div>
   </div>
 </div>
 
@@ -130,6 +140,20 @@ function simulate(commands) {
     }
   }
   return poses;
+}
+
+// Scales each command's (pwml, pwmr) pair down, preserving their ratio (so
+// turn shape/curvature is unaffected), so neither wheel exceeds maxPwm.
+function clampCommands(commands, maxPwm) {
+  return commands.map(([pwml, pwmr, timeMs]) => {
+    const mag = Math.max(Math.abs(pwml), Math.abs(pwmr));
+    if (mag > maxPwm && mag > 0) {
+      const scale = maxPwm / mag;
+      pwml = Math.round(pwml * scale);
+      pwmr = Math.round(pwmr * scale);
+    }
+    return [pwml, pwmr, timeMs];
+  });
 }
 
 // ----------------------------------------------------------------------
@@ -397,10 +421,23 @@ function fitCamera(poses) {
 // UI wiring
 // ----------------------------------------------------------------------
 const mdi = document.getElementById("mdi");
+const maxPwmInput = document.getElementById("maxpwm");
 const statusEl = document.getElementById("status");
 let poses = simulate([]);
 let playStartMs = null;
 let playing = false;
+
+// No default on purpose -- see simulation/README.md. RUN refuses to act
+// until this is set; the orange border is the "not set yet" flag.
+function getMaxPwm() {
+  const s = maxPwmInput.value.trim();
+  if (!s || !/^\d+$/.test(s)) return null;
+  const val = Number(s);
+  return val >= 1 && val <= 255 ? val : null;
+}
+maxPwmInput.addEventListener("input", () => {
+  maxPwmInput.classList.toggle("set", getMaxPwm() !== null);
+});
 
 function setPathPoints(pts) {
   const n = Math.min(pts.length, MAX_PATH_POINTS);
@@ -432,8 +469,14 @@ function runCommands() {
     statusEl.textContent = "No commands entered.";
     return;
   }
+  const maxPwm = getMaxPwm();
+  if (maxPwm === null) {
+    statusEl.textContent = "Set MAX PWM first (1-255) -- start low, e.g. 40-80, and raise it once you trust the path.";
+    return;
+  }
+  const clamped = clampCommands(commands, maxPwm);
 
-  poses = simulate(commands);
+  poses = simulate(clamped);
   fitCamera(poses);
   pathThreePts = poses.map((p) => {
     const g = poseTo3D(p.x, p.y, p.theta);
@@ -442,7 +485,7 @@ function runCommands() {
   setPathPoints(pathThreePts);
   playStartMs = performance.now();
   playing = true;
-  statusEl.textContent = `Running ${commands.length} command(s)...`;
+  statusEl.textContent = `Running ${commands.length} command(s), capped at ${maxPwm} PWM...`;
 }
 
 document.getElementById("run").addEventListener("click", runCommands);
