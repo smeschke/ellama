@@ -9,7 +9,7 @@ Path planning and dry-run simulators for eLlama's open-loop drive commands (`pwm
 | [`simulator3d.html`](simulator3d.html) | Browser, 3D (three.js) | Same free-text MDI box as `simulator.py` |
 | [`simulator3d_complex.html`](simulator3d_complex.html) | Browser, 3D (three.js) | Same grid + click-to-waypoint planning as `simulator_complex.py` |
 
-Run a Python one with `python3 simulator_complex.py`; open an `.html` one directly in a browser, no server needed.
+Run a Python one with `python3 simulator_complex.py`; open an `.html` one directly in a browser, no server needed. You can also try the 3D simulator without installing anything, hosted on Hugging Face Spaces: **[huggingface.co/spaces/r5d2/ellama-simulator](https://huggingface.co/spaces/r5d2/ellama-simulator)**.
 
 ![Top-down MDI grid simulator with a planned path](simulator_complex.png)
 ![3D browser simulator with click-to-waypoint arc planning](simulator_complex_html.png)
