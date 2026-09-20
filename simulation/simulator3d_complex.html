@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>eLlama 3D Complex Simulator</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1a1a1a; font-family: sans-serif; }
+  #app { display: flex; height: 100%; }
+  #view { flex: 1; position: relative; }
+  #view canvas { display: block; }
+  #zoomctl { position: absolute; top: 12px; right: 12px; display: flex; flex-direction: column; gap: 6px; z-index: 2; }
+  #zoomctl button { width: 38px; height: 38px; font-size: 20px; font-weight: bold; color: #fff;
+                     background: #46648c; border: 1px solid #ccc; border-radius: 3px; cursor: pointer; }
+  #panel { width: 400px; background: #373737; color: #e6e6e6; padding: 15px; box-sizing: border-box;
+           display: flex; flex-direction: column; overflow: hidden; }
+  #panel h1 { font-size: 18px; margin: 0 0 4px 0; }
+  #panel .hint { font-size: 11px; color: #a0a0a0; margin-bottom: 4px; line-height: 1.4; }
+  #gridWrap { flex: 1; min-height: 220px; margin-top: 8px; overflow-y: auto; border: 2px solid #646464; background: #191919; }
+  table#grid { width: 100%; border-collapse: collapse; font-family: monospace; font-size: 13px; }
+  table#grid th { color: #bbb; font-weight: normal; padding: 4px 2px; border-bottom: 1px solid #555;
+                  position: sticky; top: 0; background: #191919; }
+  table#grid td { padding: 0; border-bottom: 1px solid #2d2d2d; }
+  table#grid td.rownum { color: #777; text-align: right; padding-right: 4px; width: 22px; font-size: 11px; }
+  table#grid input { width: 100%; box-sizing: border-box; background: #191919; color: #e6e6e6; border: none;
+                      padding: 4px; font-family: monospace; font-size: 13px; }
+  table#grid input:focus { background: #0d2233; outline: 1px solid #3cb4ff; }
+  .buttons { display: flex; gap: 10px; margin-top: 10px; }
+  .buttons button { flex: 1; padding: 11px 0; font-size: 14px; font-weight: bold; color: #fff;
+                     border: 1px solid #ccc; border-radius: 3px; cursor: pointer; }
+  #run { background: #3ca03c; }
+  #clear { background: #963c3c; }
+  #resetview { background: #46648c; }
+  #clearpts { background: #8c6428; }
+  .fullbtn { width: 100%; margin-top: 10px; padding: 10px 0; font-size: 14px; font-weight: bold; color: #fff;
+             border: 1px solid #ccc; border-radius: 3px; cursor: pointer; }
+  #modetoggle { background: #96601a; }
+  #exportcsv { background: #5a5a9e; }
+  #status-label { font-size: 12px; color: #a0a0a0; margin-top: 14px; }
+  #status { font-size: 13px; min-height: 32px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="view">
+    <div id="zoomctl">
+      <button id="zoomin">+</button>
+      <button id="zoomout">&minus;</button>
+    </div>
+  </div>
+  <div id="panel">
+    <h1>MDI Command Grid</h1>
+    <div class="hint">Click a cell, type digits, Tab to move to the next one.</div>
+    <div class="hint">Click the 3D ground to add a waypoint (drag/scroll still orbits/zooms).</div>
+    <div class="hint">MODE below switches how a click becomes a command.</div>
+    <div id="gridWrap">
+      <table id="grid">
+        <thead><tr><th></th><th>PWM&nbsp;L</th><th>PWM&nbsp;R</th><th>TIME&nbsp;(ms)</th></tr></thead>
+        <tbody id="gridBody"></tbody>
+      </table>
+    </div>
+    <div class="buttons">
+      <button id="run">RUN</button>
+      <button id="clear">CLEAR</button>
+    </div>
+    <div class="buttons">
+      <button id="resetview">RESET VIEW</button>
+      <button id="clearpts">CLEAR PTS</button>
+    </div>
+    <button id="modetoggle" class="fullbtn">MODE: ARC</button>
+    <button id="exportcsv" class="fullbtn">EXPORT CSV</button>
+    <div id="status-label">Status:</div>
+    <div id="status">Click a cell or the ground, then RUN.</div>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+// ----------------------------------------------------------------------
+// eLlama 3D "complex" simulator: same ground-track model as
+// simulator3d.html, plus simulator_complex.py's feature set ported to the
+// browser -- an editable MDI command grid, click-to-waypoint path planning
+// (arc or turn+drive), pan/zoom controls, and CSV export (a browser
+// download, since a static page can't write to disk) that a copy of
+// send_csv.py can replay on the real robot. Terrain also grows a second
+// (diagonal) ramp, a dome hill, a pit, and a few static obstacles, so
+// there's more ground to actually drive over/around.
+// ----------------------------------------------------------------------
+
+// ----------------------------------------------------------------------
+// Robot geometry (from images/chassis_dimensions_isometric.png), inches
+// ----------------------------------------------------------------------
+const BODY_LENGTH_IN = 18.5;
+const BODY_WIDTH_IN = 15.0;
+const WHEELBASE_IN = 14.0;
+const TRACK_WIDTH_IN = 18.0;
+const WHEEL_DIAMETER_IN = 10.0;
+const WHEEL_WIDTH_IN = 3.5;
+const BODY_DECK_IN = 6.0;
+
+const IN_PER_FT = 12.0;
+const TRACK_WIDTH_FT = TRACK_WIDTH_IN / IN_PER_FT;
+const WHEEL_RADIUS_FT = (WHEEL_DIAMETER_IN / IN_PER_FT) / 2.0;
+const HALF_WB = (WHEELBASE_IN / IN_PER_FT) / 2.0;
+const HALF_TW = TRACK_WIDTH_FT / 2.0;
+
+// ----------------------------------------------------------------------
+// Speed model: PWM magnitude -> ft/s, piecewise-linear, calibrated against
+// real straight-line runs (120,120/1000ms->20in, 80,80/1000ms->12.5in,
+// 80,80/2000ms->24in), ~0.335x the originally guessed curve.
+// ----------------------------------------------------------------------
+const PWM_PTS = [0, 100, 255];
+const SPEED_PTS = [0.0, 1.339, 3.349]; // ft/s
+
+// Pivot/differential turns scrub noticeably more than straight-line
+// rolling resistance predicts (4-wheel skid-steer drags all four wheels
+// sideways). Calibrated from a real 123,-123/1800ms command turning 90
+// degrees: the effective track width for turn-rate purposes is ~2.5x
+// the physical one.
+const TURN_SCRUB_FACTOR = 2.5;
+const EFFECTIVE_TRACK_WIDTH_FT = TRACK_WIDTH_FT * TURN_SCRUB_FACTOR;
+
+function lerp(pts, vals, x) {
+  if (x <= pts[0]) return vals[0];
+  for (let i = 1; i < pts.length; i++) {
+    if (x <= pts[i]) {
+      const t = (x - pts[i - 1]) / (pts[i] - pts[i - 1]);
+      return vals[i - 1] + t * (vals[i] - vals[i - 1]);
+    }
+  }
+  return vals[vals.length - 1];
+}
+
+function pwmToSpeedFps(pwm) {
+  pwm = Math.max(-255, Math.min(255, pwm));
+  const s = lerp(PWM_PTS, SPEED_PTS, Math.abs(pwm));
+  return pwm >= 0 ? s : -s;
+}
+
+// Inverse of pwmToSpeedFps (valid since the speed curve is monotonic, so
+// swapping the interp tables works).
+function speedToPwm(speed) {
+  const maxSpeed = SPEED_PTS[SPEED_PTS.length - 1];
+  speed = Math.max(-maxSpeed, Math.min(maxSpeed, speed));
+  const pwm = lerp(SPEED_PTS, PWM_PTS, Math.abs(speed));
+  return speed >= 0 ? pwm : -pwm;
+}
+
+const SIM_DT = 0.02;
+const INITIAL_POSE = [0.0, 0.0, Math.PI / 2];
+
+function simulate(commands) {
+  let [x, y, theta] = INITIAL_POSE;
+  const poses = [{ x, y, theta }];
+  for (const [pwml, pwmr, timeMs] of commands) {
+    const vl = pwmToSpeedFps(pwml);
+    const vr = pwmToSpeedFps(pwmr);
+    const v = (vl + vr) / 2.0;
+    const omega = (vr - vl) / EFFECTIVE_TRACK_WIDTH_FT;
+    const steps = Math.max(1, Math.round(timeMs / 1000.0 / SIM_DT));
+    for (let i = 0; i < steps; i++) {
+      x += v * Math.cos(theta) * SIM_DT;
+      y += v * Math.sin(theta) * SIM_DT;
+      theta += omega * SIM_DT;
+      poses.push({ x, y, theta });
+    }
+  }
+  return poses;
+}
+
+// ----------------------------------------------------------------------
+// Terrain: a handful of independent, spatially-separated features summed
+// together -- the original ramp/plateau hill, a second ramp at an angle,
+// a dome hill, and a pit -- plus a few static (non-height-affecting)
+// obstacles for a more interesting course.
+// ----------------------------------------------------------------------
+const HILL_Y0 = 6.0, HILL_Y1 = 9.0, HILL_Y2 = 12.0, HILL_Y3 = 15.0;
+const HILL_HEIGHT_FT = 2.0;
+const HILL_HALF_WIDTH_FT = 15.0;
+
+function rampProfile(u, u0, u1, u2, u3, height) {
+  if (u <= u0 || u >= u3) return 0.0;
+  if (u <= u1) return height * (u - u0) / (u1 - u0);
+  if (u <= u2) return height;
+  return height * (1.0 - (u - u2) / (u3 - u2));
+}
+
+function smoothstep(t) {
+  t = Math.max(0, Math.min(1, t));
+  return t * t * (3 - 2 * t);
+}
+
+function radialBump(x, y, cx, cy, radius, height) {
+  const d = Math.hypot(x - cx, y - cy);
+  if (d >= radius) return 0.0;
+  return height * smoothstep(1 - d / radius);
+}
+
+// Second ramp, angled 45 degrees, off to the east of the main hill.
+const RAMP2_CX = 26.0, RAMP2_CY = 10.0, RAMP2_ANGLE = Math.PI / 4;
+const RAMP2_HALF_WIDTH = 6.0, RAMP2_HEIGHT = 2.5;
+
+function diagonalRampHeight(x, y) {
+  const dx = x - RAMP2_CX, dy = y - RAMP2_CY;
+  const ca = Math.cos(RAMP2_ANGLE), sa = Math.sin(RAMP2_ANGLE);
+  const u = dx * ca + dy * sa;
+  const v = -dx * sa + dy * ca;
+  if (Math.abs(v) > RAMP2_HALF_WIDTH) return 0.0;
+  return rampProfile(u, -6.0, -2.0, 2.0, 6.0, RAMP2_HEIGHT);
+}
+
+// Dome hill to the northwest, and a pit to the south.
+const DOME_CX = -24.0, DOME_CY = 20.0, DOME_RADIUS = 9.0, DOME_HEIGHT = 3.0;
+const PIT_CX = 0.0, PIT_CY = -18.0, PIT_RADIUS = 7.0, PIT_DEPTH = 1.8;
+
+function terrainHeight(x, y) {
+  let h = 0.0;
+  if (Math.abs(x) <= HILL_HALF_WIDTH_FT) {
+    h += rampProfile(y, HILL_Y0, HILL_Y1, HILL_Y2, HILL_Y3, HILL_HEIGHT_FT);
+  }
+  h += diagonalRampHeight(x, y);
+  h += radialBump(x, y, DOME_CX, DOME_CY, DOME_RADIUS, DOME_HEIGHT);
+  h -= radialBump(x, y, PIT_CX, PIT_CY, PIT_RADIUS, PIT_DEPTH);
+  return h;
+}
+
+// Static obstacles: visual/navigational only, not collision-checked.
+const OBSTACLES = [
+  { type: "box", x: 10, y: -6, w: 1.5, d: 1.5, h: 1.2, color: 0xb5651d },
+  { type: "box", x: 10, y: -3, w: 1.5, d: 1.5, h: 1.2, color: 0xb5651d },
+  { type: "cylinder", x: 6, y: -14, r: 0.5, h: 1.0, color: 0xff8c00 },
+  { type: "cylinder", x: 9.5, y: -16.5, r: 0.5, h: 1.0, color: 0xff8c00 },
+  { type: "cylinder", x: 13, y: -14, r: 0.5, h: 1.0, color: 0xff8c00 },
+  { type: "wall_y", x: -14, y0: -2, y1: 6, h: 1.4, thickness: 0.3, color: 0x777777 },
+];
+
+function poseTo3D(x, y, theta) {
+  const fx = x + HALF_WB * Math.cos(theta), fy = y + HALF_WB * Math.sin(theta);
+  const rx = x - HALF_WB * Math.cos(theta), ry = y - HALF_WB * Math.sin(theta);
+  const lx = x - HALF_TW * Math.sin(theta), ly = y + HALF_TW * Math.cos(theta);
+  const gx = x + HALF_TW * Math.sin(theta), gy = y - HALF_TW * Math.cos(theta); // right side
+
+  const hF = terrainHeight(fx, fy), hR = terrainHeight(rx, ry);
+  const hL = terrainHeight(lx, ly), hG = terrainHeight(gx, gy);
+
+  const pitch = Math.atan2(hF - hR, 2 * HALF_WB);
+  const roll = Math.atan2(hL - hG, 2 * HALF_TW);
+  const groundZ = (hF + hR + hL + hG) / 4.0;
+  return { origin: [x, y, groundZ + WHEEL_RADIUS_FT], yaw: theta, pitch, roll };
+}
+
+// world math frame (x=east, y=north, z=up) -> Three.js frame (X, Y=up, Z)
+function toThree(v) {
+  return new THREE.Vector3(v[0], v[2], -v[1]);
+}
+
+function rotZYX(yaw, pitch, roll) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const cr = Math.cos(roll), sr = Math.sin(roll);
+  // R = Rz(yaw) * Ry(pitch) * Rx(roll). Signs chosen so a local +x
+  // (forward) point gains +z for positive pitch, matching poseTo3D's
+  // "nose-up positive" convention.
+  const rz = [[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]];
+  const ry = [[cp, 0, -sp], [0, 1, 0], [sp, 0, cp]];
+  const rx = [[1, 0, 0], [0, cr, -sr], [0, sr, cr]];
+  const mul = (A, B) => {
+    const C = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    for (let i = 0; i < 3; i++)
+      for (let j = 0; j < 3; j++)
+        for (let k = 0; k < 3; k++) C[i][j] += A[i][k] * B[k][j];
+    return C;
+  };
+  return mul(mul(rz, ry), rx);
+}
+
+// ----------------------------------------------------------------------
+// Click-to-waypoint planning (ported from simulator_complex.py). Two
+// modes: "turn_drive" pivots to face the point then drives straight;
+// "arc" traces the tangent-chord circle through the point in one command.
+// ----------------------------------------------------------------------
+const WAYPOINT_TURN_PWM = 120;
+const WAYPOINT_DRIVE_PWM = 150;
+const WAYPOINT_TURN_OMEGA = 2.0 * pwmToSpeedFps(WAYPOINT_TURN_PWM) / EFFECTIVE_TRACK_WIDTH_FT;
+const WAYPOINT_DRIVE_SPEED = pwmToSpeedFps(WAYPOINT_DRIVE_PWM);
+const MIN_TURN_RAD = (2.0 * Math.PI) / 180.0;
+
+const ARC_NOMINAL_SPEED = WAYPOINT_DRIVE_SPEED;
+const MAX_SPEED_FPS = SPEED_PTS[SPEED_PTS.length - 1];
+const MIN_ARC_LATERAL_FT = 0.05;
+const MIN_ARC_FORWARD_FT = 0.05;
+
+function planTurnDrive(ptheta, dx, dy, dist) {
+  const targetHeading = Math.atan2(dy, dx);
+  const dtheta = Math.atan2(Math.sin(targetHeading - ptheta), Math.cos(targetHeading - ptheta));
+
+  const commands = [];
+  if (Math.abs(dtheta) > MIN_TURN_RAD) {
+    const turnMs = Math.round((Math.abs(dtheta) / WAYPOINT_TURN_OMEGA) * 1000.0);
+    const sign = dtheta > 0 ? 1.0 : -1.0;
+    commands.push([-sign * WAYPOINT_TURN_PWM, sign * WAYPOINT_TURN_PWM, turnMs]);
+  }
+  const driveMs = Math.round((dist / WAYPOINT_DRIVE_SPEED) * 1000.0);
+  commands.push([WAYPOINT_DRIVE_PWM, WAYPOINT_DRIVE_PWM, driveMs]);
+  return { commands, finalHeading: targetHeading };
+}
+
+function planArc(ptheta, dx, dy, dist) {
+  const xl = dx * Math.cos(ptheta) + dy * Math.sin(ptheta);
+  const yl = -dx * Math.sin(ptheta) + dy * Math.cos(ptheta);
+
+  if (xl <= MIN_ARC_FORWARD_FT) {
+    statusEl.textContent = "Point is behind the current heading; arc mode needs a point roughly ahead.";
+    return null;
+  }
+  if (Math.abs(yl) < MIN_ARC_LATERAL_FT) {
+    const timeMs = Math.round((dist / ARC_NOMINAL_SPEED) * 1000.0);
+    const pwm = speedToPwm(ARC_NOMINAL_SPEED);
+    return { commands: [[pwm, pwm, timeMs]], finalHeading: ptheta };
+  }
+
+  const alpha = Math.atan2(yl, xl);
+  const phi = 2.0 * alpha;
+  const radius = (dist * dist) / (2.0 * yl);
+  const omega = ARC_NOMINAL_SPEED / radius;
+  let vl = ARC_NOMINAL_SPEED - (omega * EFFECTIVE_TRACK_WIDTH_FT) / 2.0;
+  let vr = ARC_NOMINAL_SPEED + (omega * EFFECTIVE_TRACK_WIDTH_FT) / 2.0;
+
+  const fastest = Math.max(Math.abs(vl), Math.abs(vr));
+  if (fastest > MAX_SPEED_FPS) {
+    const scale = MAX_SPEED_FPS / fastest;
+    vl *= scale;
+    vr *= scale;
+  }
+
+  const vAvg = (vl + vr) / 2.0;
+  const arcLen = Math.abs(radius * phi);
+  const timeMs = Math.round((arcLen / Math.abs(vAvg)) * 1000.0);
+  if (timeMs <= 0) {
+    statusEl.textContent = "Arc command would be instantaneous; ignored.";
+    return null;
+  }
+
+  const pwml = speedToPwm(vl);
+  const pwmr = speedToPwm(vr);
+  return { commands: [[pwml, pwmr, timeMs]], finalHeading: ptheta + phi };
+}
+
+// ----------------------------------------------------------------------
+// Three.js scene
+// ----------------------------------------------------------------------
+const viewEl = document.getElementById("view");
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a2233);
+scene.fog = new THREE.Fog(0x1a2233, 40, 130);
+
+const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 600);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+viewEl.insertBefore(renderer.domElement, viewEl.firstChild);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+sun.position.set(-10, 25, 15);
+scene.add(sun);
+
+function resize() {
+  const w = viewEl.clientWidth, h = viewEl.clientHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+}
+window.addEventListener("resize", resize);
+
+// ---- terrain mesh (heightmap grid, also used for click raycasting) ----
+const TERRAIN_X0 = -40, TERRAIN_X1 = 40, TERRAIN_Y0 = -30, TERRAIN_Y1 = 38, TERRAIN_CELL = 1.0;
+
+function terrainColorAt(h) {
+  if (h < -0.05) return new THREE.Color(0x6b5a3a);
+  if (h < 0.05) return new THREE.Color(0x557a52);
+  if (h < 1.6) return new THREE.Color(0x6e8f4f);
+  return new THREE.Color(0x9c9a4a);
+}
+
+function buildTerrainMesh() {
+  const positions = [];
+  const colors = [];
+  for (let gx = TERRAIN_X0; gx < TERRAIN_X1; gx += TERRAIN_CELL) {
+    for (let gy = TERRAIN_Y0; gy < TERRAIN_Y1; gy += TERRAIN_CELL) {
+      const x0 = gx, x1 = gx + TERRAIN_CELL, y0 = gy, y1 = gy + TERRAIN_CELL;
+      const h00 = terrainHeight(x0, y0), h10 = terrainHeight(x1, y0);
+      const h11 = terrainHeight(x1, y1), h01 = terrainHeight(x0, y1);
+      const p00 = toThree([x0, y0, h00]), p10 = toThree([x1, y0, h10]);
+      const p11 = toThree([x1, y1, h11]), p01 = toThree([x0, y1, h01]);
+      const c00 = terrainColorAt(h00), c10 = terrainColorAt(h10);
+      const c11 = terrainColorAt(h11), c01 = terrainColorAt(h01);
+      for (const [p, c] of [[p00, c00], [p10, c10], [p11, c11]]) {
+        positions.push(p.x, p.y, p.z);
+        colors.push(c.r, c.g, c.b);
+      }
+      for (const [p, c] of [[p00, c00], [p11, c11], [p01, c01]]) {
+        positions.push(p.x, p.y, p.z);
+        colors.push(c.r, c.g, c.b);
+      }
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  const mat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, side: THREE.DoubleSide });
+  return new THREE.Mesh(geo, mat);
+}
+
+const terrainMesh = buildTerrainMesh();
+scene.add(terrainMesh);
+
+const refGrid = new THREE.GridHelper(90, 90, 0x8fae8a, 0x3f5a3d);
+refGrid.position.y = 0.02;
+scene.add(refGrid);
+
+// ---- static obstacles ----
+const obstacleGroup = new THREE.Group();
+scene.add(obstacleGroup);
+for (const o of OBSTACLES) {
+  const groundH = terrainHeight(o.x, o.y);
+  let mesh;
+  if (o.type === "box") {
+    mesh = new THREE.Mesh(new THREE.BoxGeometry(o.w, o.h, o.d), new THREE.MeshStandardMaterial({ color: o.color }));
+    mesh.position.copy(toThree([o.x, o.y, groundH + o.h / 2]));
+  } else if (o.type === "cylinder") {
+    mesh = new THREE.Mesh(new THREE.CylinderGeometry(o.r, o.r, o.h, 16), new THREE.MeshStandardMaterial({ color: o.color }));
+    mesh.position.copy(toThree([o.x, o.y, groundH + o.h / 2]));
+  } else if (o.type === "wall_y") {
+    const midY = (o.y0 + o.y1) / 2;
+    mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(o.thickness, o.h, Math.abs(o.y1 - o.y0)),
+      new THREE.MeshStandardMaterial({ color: o.color })
+    );
+    mesh.position.copy(toThree([o.x, midY, groundH + o.h / 2]));
+  }
+  if (mesh) obstacleGroup.add(mesh);
+}
+
+// ---- robot ----
+const robot = new THREE.Group();
+robot.matrixAutoUpdate = false;
+scene.add(robot);
+
+const bodyMat = new THREE.MeshStandardMaterial({ color: 0xd6d6d6 });
+const wheelMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a });
+const sensorMat = new THREE.MeshStandardMaterial({ color: 0xcc1414 });
+
+const bodyL = BODY_LENGTH_IN / IN_PER_FT;
+const bodyW = BODY_WIDTH_IN / IN_PER_FT;
+const deck = BODY_DECK_IN / IN_PER_FT;
+
+const body = new THREE.Mesh(new THREE.BoxGeometry(bodyL, bodyW, deck), bodyMat);
+body.position.set(0, 0, deck / 2);
+robot.add(body);
+
+for (const cf of [HALF_WB, -HALF_WB]) {
+  for (const cl of [HALF_TW, -HALF_TW]) {
+    const wheel = new THREE.Mesh(
+      new THREE.CylinderGeometry(WHEEL_RADIUS_FT, WHEEL_RADIUS_FT, WHEEL_WIDTH_IN / IN_PER_FT, 20),
+      wheelMat
+    );
+    wheel.position.set(cf, cl, 0);
+    robot.add(wheel);
+  }
+}
+
+const sensorY = bodyW * 0.18;
+for (const sign of [1, -1]) {
+  const sensor = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.12, 0.08), sensorMat);
+  sensor.position.set(bodyL / 2 - 0.12, sign * sensorY, deck * 0.6);
+  robot.add(sensor);
+}
+
+const arrow = new THREE.ArrowHelper(
+  new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0, deck * 0.6),
+  bodyL * 0.7, 0x3cb4ff, 0.25, 0.15
+);
+robot.add(arrow);
+
+function setRobotPose(x, y, theta, pitch, roll) {
+  const R = rotZYX(theta, pitch, roll);
+  const col = (j) => [R[0][j], R[1][j], R[2][j]];
+  const xAxis = toThree(col(0)), yAxis = toThree(col(1)), zAxis = toThree(col(2));
+  const m = new THREE.Matrix4().makeBasis(xAxis, yAxis, zAxis);
+  const ground = poseTo3D(x, y, theta);
+  m.setPosition(toThree(ground.origin));
+  robot.matrix.copy(m);
+}
+
+// ---- path trace ----
+const MAX_PATH_POINTS = 20000;
+const pathGeo = new THREE.BufferGeometry();
+const pathPositions = new Float32Array(MAX_PATH_POINTS * 3);
+pathGeo.setAttribute("position", new THREE.BufferAttribute(pathPositions, 3));
+pathGeo.setDrawRange(0, 0);
+const pathLine = new THREE.Line(pathGeo, new THREE.LineBasicMaterial({ color: 0x3cb4ff, linewidth: 2 }));
+scene.add(pathLine);
+
+function setPathPoints(pts) {
+  const n = Math.min(pts.length, MAX_PATH_POINTS);
+  for (let i = 0; i < n; i++) {
+    pathPositions[i * 3] = pts[i].x;
+    pathPositions[i * 3 + 1] = pts[i].y;
+    pathPositions[i * 3 + 2] = pts[i].z;
+  }
+  pathGeo.attributes.position.needsUpdate = true;
+  pathGeo.setDrawRange(0, 0);
+}
+
+// ---- waypoint markers (click-to-waypoint preview) ----
+const waypointGroup = new THREE.Group();
+scene.add(waypointGroup);
+let waypoints = []; // [[x,y], ...]
+
+function rebuildWaypointVisuals() {
+  while (waypointGroup.children.length) waypointGroup.remove(waypointGroup.children[0]);
+  if (!waypoints.length) return;
+  const chain = [[INITIAL_POSE[0], INITIAL_POSE[1]], ...waypoints];
+  const pts = chain.map(([wx, wy]) => toThree([wx, wy, terrainHeight(wx, wy) + 0.05]));
+  waypointGroup.add(new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.LineBasicMaterial({ color: 0x00c8ff })
+  ));
+  for (let i = 1; i < pts.length; i++) {
+    const marker = new THREE.Mesh(new THREE.SphereGeometry(0.12, 10, 8), new THREE.MeshBasicMaterial({ color: 0x00c8ff }));
+    marker.position.copy(pts[i]);
+    waypointGroup.add(marker);
+  }
+}
+
+// ----------------------------------------------------------------------
+// camera framing
+// ----------------------------------------------------------------------
+function frameBounds(minX, maxX, minY, maxY, elevation) {
+  const span = Math.max(maxX - minX, maxY - minY, 10.0);
+  const dist = span * 0.75 + 8.0;
+  const centerWorld = [(minX + maxX) / 2, (minY + maxY) / 2, elevation];
+  const dir = new THREE.Vector3(-0.4, -1.0, 0.55).normalize(); // world-frame offset (x,y,z)
+  const eyeWorld = [
+    centerWorld[0] + dir.x * dist,
+    centerWorld[1] + dir.y * dist,
+    centerWorld[2] + dir.z * dist,
+  ];
+  camera.position.copy(toThree(eyeWorld));
+  controls.target.copy(toThree(centerWorld));
+  controls.update();
+}
+
+function defaultCamera() {
+  frameBounds(TERRAIN_X0, TERRAIN_X1, TERRAIN_Y0, TERRAIN_Y1, 1.0);
+}
+
+function fitCamera(poses) {
+  let minX = -3, maxX = 3, minY = -3, maxY = 10;
+  for (const p of poses) {
+    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+  }
+  frameBounds(minX, maxX, minY, maxY, 1.0);
+}
+
+function zoomBy(factor) {
+  const dir = new THREE.Vector3().subVectors(camera.position, controls.target);
+  dir.multiplyScalar(1 / factor);
+  camera.position.copy(controls.target).add(dir);
+  controls.update();
+}
+document.getElementById("zoomin").addEventListener("click", () => zoomBy(1.25));
+document.getElementById("zoomout").addEventListener("click", () => zoomBy(1 / 1.25));
+
+// ----------------------------------------------------------------------
+// MDI command grid (real DOM inputs -- Tab/Shift+Tab navigation is free)
+// ----------------------------------------------------------------------
+const GRID_ROWS = 40;
+const gridBody = document.getElementById("gridBody");
+const gridInputs = [];
+for (let r = 0; r < GRID_ROWS; r++) {
+  const tr = document.createElement("tr");
+  const rowNumTd = document.createElement("td");
+  rowNumTd.className = "rownum";
+  rowNumTd.textContent = String(r + 1);
+  tr.appendChild(rowNumTd);
+  const cells = [];
+  for (let c = 0; c < 3; c++) {
+    const td = document.createElement("td");
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.autocomplete = "off";
+    inp.spellcheck = false;
+    td.appendChild(inp);
+    tr.appendChild(td);
+    cells.push(inp);
+  }
+  gridBody.appendChild(tr);
+  gridInputs.push(cells);
+}
+
+function appendRow(pwml, pwmr, timeMs) {
+  for (let i = 0; i < GRID_ROWS; i++) {
+    if (gridInputs[i].every((inp) => inp.value.trim() === "")) {
+      gridInputs[i][0].value = String(Math.round(pwml));
+      gridInputs[i][1].value = String(Math.round(pwmr));
+      gridInputs[i][2].value = String(Math.round(timeMs));
+      return i;
+    }
+  }
+  return null;
+}
+
+function parseGrid() {
+  const commands = [];
+  for (let r = 0; r < GRID_ROWS; r++) {
+    const cells = gridInputs[r].map((inp) => inp.value.trim());
+    if (cells.every((c) => c === "")) continue;
+    if (cells.some((c) => c === "")) return { error: `Row ${r + 1}: fill in all three cells (pwml, pwmr, time_ms)` };
+    if (!cells.every((c) => /^-?\d+$/.test(c))) return { error: `Row ${r + 1}: values must be integers` };
+    commands.push(cells.map(Number));
+  }
+  if (!commands.length) return { error: "No commands entered." };
+  return { commands };
+}
+
+// ----------------------------------------------------------------------
+// UI wiring
+// ----------------------------------------------------------------------
+const statusEl = document.getElementById("status");
+const modeBtn = document.getElementById("modetoggle");
+let poses = simulate([]);
+let playStartMs = null;
+let playing = false;
+let planPose = [...INITIAL_POSE];
+let waypointRowGroups = [];
+let pointMode = "arc";
+
+function runCommands() {
+  const { commands, error } = parseGrid();
+  if (error) { statusEl.textContent = error; return; }
+
+  poses = simulate(commands);
+  fitCamera(poses);
+  const pathThreePts = poses.map((p) => {
+    const g = poseTo3D(p.x, p.y, p.theta);
+    return toThree([g.origin[0], g.origin[1], g.origin[2] - WHEEL_RADIUS_FT + 0.03]);
+  });
+  setPathPoints(pathThreePts);
+  playStartMs = performance.now();
+  playing = true;
+  statusEl.textContent = `Running ${commands.length} command(s)...`;
+}
+
+function clearAll() {
+  for (const cells of gridInputs) cells.forEach((inp) => (inp.value = ""));
+  waypoints = [];
+  waypointRowGroups = [];
+  planPose = [...INITIAL_POSE];
+  rebuildWaypointVisuals();
+  poses = simulate([]);
+  pathGeo.setDrawRange(0, 0);
+  playing = false;
+  statusEl.textContent = "Commands cleared.";
+}
+
+function clearPoints() {
+  for (const rows of waypointRowGroups) {
+    for (const i of rows) gridInputs[i].forEach((inp) => (inp.value = ""));
+  }
+  waypoints = [];
+  waypointRowGroups = [];
+  planPose = [...INITIAL_POSE];
+  rebuildWaypointVisuals();
+  statusEl.textContent = "Waypoints cleared.";
+}
+
+function toggleMode() {
+  pointMode = pointMode === "arc" ? "turn_drive" : "arc";
+  modeBtn.textContent = `MODE: ${pointMode === "arc" ? "ARC" : "TURN+DRIVE"}`;
+  modeBtn.style.background = pointMode === "arc" ? "#96601a" : "#5a5a9e";
+  statusEl.textContent = `Click mode: ${pointMode.replace("_", "+")}`;
+}
+
+function exportCsv() {
+  const { commands, error } = parseGrid();
+  if (error) { statusEl.textContent = error; return; }
+  const csv = "pwml,pwmr,time_ms\n" + commands.map((c) => c.join(",")).join("\n") + "\n";
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "exported_path.csv";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  statusEl.textContent = `Exported ${commands.length} command(s) -- check your downloads for exported_path.csv, then run send_csv.py on it.`;
+}
+
+function collectPoint(tx, ty) {
+  const [px, py, ptheta] = planPose;
+  const dx = tx - px, dy = ty - py;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 0.05) {
+    statusEl.textContent = "Point too close to the previous one; ignored.";
+    return;
+  }
+
+  const result = pointMode === "arc" ? planArc(ptheta, dx, dy, dist) : planTurnDrive(ptheta, dx, dy, dist);
+  if (!result) return; // planner already set statusEl on failure
+
+  const { commands, finalHeading } = result;
+  const rowsUsed = [];
+  for (const [pwml, pwmr, timeMs] of commands) {
+    const i = appendRow(pwml, pwmr, timeMs);
+    if (i === null) break;
+    rowsUsed.push(i);
+  }
+  if (!rowsUsed.length) {
+    statusEl.textContent = "MDI grid is full; couldn't add point.";
+    return;
+  }
+
+  waypointRowGroups.push(rowsUsed);
+  waypoints.push([tx, ty]);
+  planPose = [tx, ty, finalHeading];
+  rebuildWaypointVisuals();
+  const modeLabel = pointMode === "arc" ? "Arc" : "Point";
+  statusEl.textContent = `${modeLabel} ${waypoints.length}: ${rowsUsed.length} command(s) added.`;
+}
+
+document.getElementById("run").addEventListener("click", runCommands);
+document.getElementById("clear").addEventListener("click", clearAll);
+document.getElementById("resetview").addEventListener("click", () => { defaultCamera(); statusEl.textContent = "View reset."; });
+document.getElementById("clearpts").addEventListener("click", clearPoints);
+document.getElementById("modetoggle").addEventListener("click", toggleMode);
+document.getElementById("exportcsv").addEventListener("click", exportCsv);
+
+// ---- click-to-waypoint: raycast against the terrain only, and only on a
+// true click (no drag), so orbiting the camera doesn't drop waypoints ----
+const raycaster = new THREE.Raycaster();
+const pointerNdc = new THREE.Vector2();
+let downPos = null;
+
+renderer.domElement.addEventListener("pointerdown", (ev) => {
+  if (ev.button !== 0) return; // left button only; right/middle drive orbit-controls panning
+  downPos = { x: ev.clientX, y: ev.clientY };
+});
+renderer.domElement.addEventListener("pointerup", (ev) => {
+  if (ev.button !== 0 || !downPos) return;
+  const moved = Math.hypot(ev.clientX - downPos.x, ev.clientY - downPos.y);
+  downPos = null;
+  if (moved > 4) return; // was an orbit/pan drag, not a click
+
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointerNdc.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+  pointerNdc.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointerNdc, camera);
+  const hits = raycaster.intersectObject(terrainMesh, false);
+  if (!hits.length) return;
+  const p = hits[0].point;
+  collectPoint(p.x, -p.z); // inverse of toThree()
+});
+
+// ----------------------------------------------------------------------
+// render loop
+// ----------------------------------------------------------------------
+function animate() {
+  requestAnimationFrame(animate);
+  resize();
+
+  let idx = poses.length - 1;
+  if (playing) {
+    const elapsed = (performance.now() - playStartMs) / 1000.0;
+    idx = Math.min(poses.length - 1, Math.floor(elapsed / SIM_DT));
+    pathGeo.setDrawRange(0, Math.min(idx + 1, MAX_PATH_POINTS));
+    if (idx >= poses.length - 1) {
+      playing = false;
+      statusEl.textContent = "Done.";
+    }
+  }
+
+  const p = poses[Math.max(0, idx)];
+  const g = poseTo3D(p.x, p.y, p.theta);
+  setRobotPose(p.x, p.y, p.theta, g.pitch, g.roll);
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+resize();
+defaultCamera();
+setRobotPose(0, 0, Math.PI / 2, 0, 0);
+animate();
+</script>
+</body>
+</html>

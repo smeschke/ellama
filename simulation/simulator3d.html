@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>eLlama 3D Simulator</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1a1a1a; font-family: sans-serif; }
+  #app { display: flex; height: 100%; }
+  #view { flex: 1; position: relative; }
+  #view canvas { display: block; }
+  #panel { width: 380px; background: #373737; color: #e6e6e6; padding: 15px; box-sizing: border-box;
+           display: flex; flex-direction: column; }
+  #panel h1 { font-size: 18px; margin: 0 0 4px 0; }
+  #panel .hint { font-size: 12px; color: #a0a0a0; margin-bottom: 10px; }
+  #mdi { flex: 1; min-height: 300px; background: #191919; color: #e6e6e6; border: 2px solid #646464;
+         font-family: monospace; font-size: 14px; padding: 8px; resize: none; box-sizing: border-box; }
+  #mdi:focus { border-color: #3cb4ff; outline: none; }
+  .buttons { display: flex; gap: 10px; margin-top: 10px; }
+  .buttons button { flex: 1; padding: 12px 0; font-size: 15px; font-weight: bold; color: #fff;
+                     border: 1px solid #ccc; border-radius: 3px; cursor: pointer; }
+  #run { background: #3ca03c; }
+  #clear { background: #46469a; }
+  #resetview { width: 100%; margin-top: 10px; padding: 10px 0; background: #46648c; color: #fff;
+               font-size: 14px; border: 1px solid #ccc; border-radius: 3px; cursor: pointer; }
+  #status-label { font-size: 12px; color: #a0a0a0; margin-top: 16px; }
+  #status { font-size: 14px; min-height: 18px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="view"></div>
+  <div id="panel">
+    <h1>MDI Command Input</h1>
+    <div class="hint">format: pwml pwmr time_ms (one command per line)</div>
+    <div class="hint">Click the ground to add a turn+drive command there; drag to orbit, scroll to zoom.</div>
+    <textarea id="mdi" spellcheck="false" placeholder="150 150 1000&#10;-100 100 500&#10;200 255 800"></textarea>
+    <div class="buttons">
+      <button id="run">RUN</button>
+      <button id="clear">CLEAR</button>
+    </div>
+    <button id="resetview">RESET VIEW</button>
+    <div id="status-label">Status:</div>
+    <div id="status">Type commands, then RUN. Drag to orbit, scroll to zoom.</div>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+// ----------------------------------------------------------------------
+// Robot geometry (from images/chassis_dimensions_isometric.png), inches
+// ----------------------------------------------------------------------
+const BODY_LENGTH_IN = 18.5;
+const BODY_WIDTH_IN = 15.0;
+const WHEELBASE_IN = 14.0;
+const TRACK_WIDTH_IN = 18.0;
+const WHEEL_DIAMETER_IN = 10.0;
+const WHEEL_WIDTH_IN = 3.5;
+const BODY_DECK_IN = 6.0;
+
+const IN_PER_FT = 12.0;
+const TRACK_WIDTH_FT = TRACK_WIDTH_IN / IN_PER_FT;
+const WHEEL_RADIUS_FT = (WHEEL_DIAMETER_IN / IN_PER_FT) / 2.0;
+const HALF_WB = (WHEELBASE_IN / IN_PER_FT) / 2.0;
+const HALF_TW = TRACK_WIDTH_FT / 2.0;
+
+// ----------------------------------------------------------------------
+// Speed model: PWM magnitude -> ft/s, piecewise-linear, same as
+// simulator.py / simulator3d.py (motors have plenty of torque, so grade
+// does not change the ground-track speed -- only height/pitch/roll).
+// Calibrated 2026-09-19 against real straight-line runs
+// (120,120/1000ms->20in, 80,80/1000ms->12.5in, 80,80/2000ms->24in),
+// ~0.335x the originally guessed curve -- scaled the same
+// two-breakpoint shape down to match.
+// ----------------------------------------------------------------------
+const PWM_PTS = [0, 100, 255];
+const SPEED_PTS = [0.0, 1.339, 3.349]; // ft/s
+
+// Pivot/differential turns scrub noticeably more than straight-line
+// rolling resistance predicts (4-wheel skid-steer drags all four wheels
+// sideways). Calibrated from a real 123,-123/1800ms command turning 90
+// degrees: the effective track width for turn-rate purposes is ~2.5x
+// the physical one.
+const TURN_SCRUB_FACTOR = 2.5;
+const EFFECTIVE_TRACK_WIDTH_FT = TRACK_WIDTH_FT * TURN_SCRUB_FACTOR;
+
+function lerp(pts, vals, x) {
+  if (x <= pts[0]) return vals[0];
+  for (let i = 1; i < pts.length; i++) {
+    if (x <= pts[i]) {
+      const t = (x - pts[i - 1]) / (pts[i] - pts[i - 1]);
+      return vals[i - 1] + t * (vals[i] - vals[i - 1]);
+    }
+  }
+  return vals[vals.length - 1];
+}
+
+function pwmToSpeedFps(pwm) {
+  pwm = Math.max(-255, Math.min(255, pwm));
+  const s = lerp(PWM_PTS, SPEED_PTS, Math.abs(pwm));
+  return pwm >= 0 ? s : -s;
+}
+
+const SIM_DT = 0.02;
+const INITIAL_POSE = [0.0, 0.0, Math.PI / 2]; // start facing "up" (+Y)
+
+function simulate(commands) {
+  let [x, y, theta] = INITIAL_POSE;
+  const poses = [{ x, y, theta }];
+  for (const [pwml, pwmr, timeMs] of commands) {
+    const vl = pwmToSpeedFps(pwml);
+    const vr = pwmToSpeedFps(pwmr);
+    const v = (vl + vr) / 2.0;
+    const omega = (vr - vl) / EFFECTIVE_TRACK_WIDTH_FT;
+    const steps = Math.max(1, Math.round(timeMs / 1000.0 / SIM_DT));
+    for (let i = 0; i < steps; i++) {
+      x += v * Math.cos(theta) * SIM_DT;
+      y += v * Math.sin(theta) * SIM_DT;
+      theta += omega * SIM_DT;
+      poses.push({ x, y, theta });
+    }
+  }
+  return poses;
+}
+
+// ----------------------------------------------------------------------
+// Terrain: flat -> ramp up -> plateau -> ramp down -> flat, varying only
+// along world Y (forward axis), wide and flat across X so the side edges
+// stay out of frame.
+// ----------------------------------------------------------------------
+const HILL_Y0 = 6.0, HILL_Y1 = 9.0, HILL_Y2 = 12.0, HILL_Y3 = 15.0;
+const HILL_HEIGHT_FT = 2.0;
+const HILL_HALF_WIDTH_FT = 15.0;
+
+function terrainHeight(x, y) {
+  if (Math.abs(x) > HILL_HALF_WIDTH_FT || y <= HILL_Y0 || y >= HILL_Y3) return 0.0;
+  if (y <= HILL_Y1) return HILL_HEIGHT_FT * (y - HILL_Y0) / (HILL_Y1 - HILL_Y0);
+  if (y <= HILL_Y2) return HILL_HEIGHT_FT;
+  return HILL_HEIGHT_FT * (1.0 - (y - HILL_Y2) / (HILL_Y3 - HILL_Y2));
+}
+
+function poseTo3D(x, y, theta) {
+  const fx = x + HALF_WB * Math.cos(theta), fy = y + HALF_WB * Math.sin(theta);
+  const rx = x - HALF_WB * Math.cos(theta), ry = y - HALF_WB * Math.sin(theta);
+  const lx = x - HALF_TW * Math.sin(theta), ly = y + HALF_TW * Math.cos(theta);
+  const gx = x + HALF_TW * Math.sin(theta), gy = y - HALF_TW * Math.cos(theta); // right side
+
+  const hF = terrainHeight(fx, fy), hR = terrainHeight(rx, ry);
+  const hL = terrainHeight(lx, ly), hG = terrainHeight(gx, gy);
+
+  const pitch = Math.atan2(hF - hR, 2 * HALF_WB);
+  const roll = Math.atan2(hL - hG, 2 * HALF_TW);
+  const groundZ = (hF + hR + hL + hG) / 4.0;
+  return { origin: [x, y, groundZ + WHEEL_RADIUS_FT], yaw: theta, pitch, roll };
+}
+
+// world math frame (x=east, y=north, z=up) -> Three.js frame (X, Y=up, Z)
+function toThree(v) {
+  return new THREE.Vector3(v[0], v[2], -v[1]);
+}
+
+function rotZYX(yaw, pitch, roll) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const cr = Math.cos(roll), sr = Math.sin(roll);
+  // R = Rz(yaw) * Ry(pitch) * Rx(roll), columns returned as THREE.Vector3
+  // Signs chosen so a local +x (forward) point gains +z for positive pitch,
+  // matching poseTo3D's "nose-up positive" convention.
+  const rz = [[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]];
+  const ry = [[cp, 0, -sp], [0, 1, 0], [sp, 0, cp]];
+  const rx = [[1, 0, 0], [0, cr, -sr], [0, sr, cr]];
+  const mul = (A, B) => {
+    const C = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    for (let i = 0; i < 3; i++)
+      for (let j = 0; j < 3; j++)
+        for (let k = 0; k < 3; k++) C[i][j] += A[i][k] * B[k][j];
+    return C;
+  };
+  return mul(mul(rz, ry), rx);
+}
+
+// ----------------------------------------------------------------------
+// Click-to-waypoint: turn in place to face the clicked point, then drive
+// straight to it (ported from simulator_complex.py's "turn_drive" mode --
+// the simple version skips the arc option to keep the click-to-command
+// mapping obvious).
+// ----------------------------------------------------------------------
+const WAYPOINT_TURN_PWM = 120;
+const WAYPOINT_DRIVE_PWM = 150;
+const WAYPOINT_TURN_OMEGA = 2.0 * pwmToSpeedFps(WAYPOINT_TURN_PWM) / EFFECTIVE_TRACK_WIDTH_FT;
+const WAYPOINT_DRIVE_SPEED = pwmToSpeedFps(WAYPOINT_DRIVE_PWM);
+const MIN_TURN_RAD = (2.0 * Math.PI) / 180.0;
+
+function planTurnDrive(ptheta, dx, dy, dist) {
+  const targetHeading = Math.atan2(dy, dx);
+  const dtheta = Math.atan2(Math.sin(targetHeading - ptheta), Math.cos(targetHeading - ptheta));
+
+  const commands = [];
+  if (Math.abs(dtheta) > MIN_TURN_RAD) {
+    const turnMs = Math.round((Math.abs(dtheta) / WAYPOINT_TURN_OMEGA) * 1000.0);
+    const sign = dtheta > 0 ? 1.0 : -1.0;
+    commands.push([-sign * WAYPOINT_TURN_PWM, sign * WAYPOINT_TURN_PWM, turnMs]);
+  }
+  const driveMs = Math.round((dist / WAYPOINT_DRIVE_SPEED) * 1000.0);
+  commands.push([WAYPOINT_DRIVE_PWM, WAYPOINT_DRIVE_PWM, driveMs]);
+  return { commands, finalHeading: targetHeading };
+}
+
+// ----------------------------------------------------------------------
+// Three.js scene
+// ----------------------------------------------------------------------
+const viewEl = document.getElementById("view");
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a2233);
+scene.fog = new THREE.Fog(0x1a2233, 30, 90);
+
+const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 500);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+viewEl.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+sun.position.set(-10, 20, 10);
+scene.add(sun);
+
+function resize() {
+  const w = viewEl.clientWidth, h = viewEl.clientHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+}
+window.addEventListener("resize", resize);
+
+// ---- terrain mesh ----
+const TERRAIN_SEGMENTS = [
+  [-4.0, HILL_Y0, 0.0, 0.0, 0x557a52],
+  [HILL_Y0, HILL_Y1, 0.0, HILL_HEIGHT_FT, 0x6e8f4f],
+  [HILL_Y1, HILL_Y2, HILL_HEIGHT_FT, HILL_HEIGHT_FT, 0x6e8f4f],
+  [HILL_Y2, HILL_Y3, HILL_HEIGHT_FT, 0.0, 0x6e8f4f],
+  [HILL_Y3, HILL_Y3 + 20.0, 0.0, 0.0, 0x557a52],
+];
+const X0 = -HILL_HALF_WIDTH_FT, X1 = HILL_HALF_WIDTH_FT;
+const terrainGroup = new THREE.Group();
+const scaleLinePts = [];
+for (const [y0, y1, z0, z1, color] of TERRAIN_SEGMENTS) {
+  const p0 = [X0, y0, z0], p1 = [X1, y0, z0], p2 = [X1, y1, z1], p3 = [X0, y1, z1];
+  const geo = new THREE.BufferGeometry();
+  const verts = [p0, p1, p2, p0, p2, p3].flatMap((p) => toThree(p).toArray());
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
+  geo.computeVertexNormals();
+  const mat = new THREE.MeshStandardMaterial({ color, side: THREE.DoubleSide, flatShading: true });
+  terrainGroup.add(new THREE.Mesh(geo, mat));
+
+  const n = Math.max(1, Math.round((y1 - y0) / 3.0));
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const y = y0 + t * (y1 - y0), z = z0 + t * (z1 - z0);
+    scaleLinePts.push(toThree([X0, y, z]), toThree([X1, y, z]));
+  }
+  for (let xf = X0; xf <= X1 + 0.1; xf += 5.0) {
+    scaleLinePts.push(toThree([xf, y0, z0]), toThree([xf, y1, z1]));
+  }
+}
+scene.add(terrainGroup);
+const scaleLines = new THREE.LineSegments(
+  new THREE.BufferGeometry().setFromPoints(scaleLinePts),
+  new THREE.LineBasicMaterial({ color: 0x8fae8a, transparent: true, opacity: 0.5 })
+);
+scene.add(scaleLines);
+
+// ---- robot ----
+const robot = new THREE.Group();
+robot.matrixAutoUpdate = false;
+scene.add(robot);
+
+const bodyMat = new THREE.MeshStandardMaterial({ color: 0xd6d6d6 });
+const wheelMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a });
+const sensorMat = new THREE.MeshStandardMaterial({ color: 0xcc1414 });
+
+const bodyL = BODY_LENGTH_IN / IN_PER_FT;
+const bodyW = BODY_WIDTH_IN / IN_PER_FT;
+const deck = BODY_DECK_IN / IN_PER_FT;
+
+const body = new THREE.Mesh(new THREE.BoxGeometry(bodyL, bodyW, deck), bodyMat);
+body.position.set(0, 0, deck / 2);
+robot.add(body);
+
+for (const cf of [HALF_WB, -HALF_WB]) {
+  for (const cl of [HALF_TW, -HALF_TW]) {
+    const wheel = new THREE.Mesh(
+      new THREE.CylinderGeometry(WHEEL_RADIUS_FT, WHEEL_RADIUS_FT, WHEEL_WIDTH_IN / IN_PER_FT, 20),
+      wheelMat
+    );
+    // cylinder's default axis is local Y, which we've defined as "left" -- no extra rotation needed.
+    wheel.position.set(cf, cl, 0);
+    robot.add(wheel);
+  }
+}
+
+const sensorY = bodyW * 0.18;
+for (const sign of [1, -1]) {
+  const sensor = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.12, 0.08), sensorMat);
+  sensor.position.set(bodyL / 2 - 0.12, sign * sensorY, deck * 0.6);
+  robot.add(sensor);
+}
+
+const arrow = new THREE.ArrowHelper(
+  new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0, deck * 0.6),
+  bodyL * 0.7, 0x3cb4ff, 0.25, 0.15
+);
+robot.add(arrow);
+
+function setRobotPose(x, y, theta, pitch, roll) {
+  const R = rotZYX(theta, pitch, roll);
+  const col = (j) => [R[0][j], R[1][j], R[2][j]];
+  const xAxis = toThree(col(0)), yAxis = toThree(col(1)), zAxis = toThree(col(2));
+  const m = new THREE.Matrix4().makeBasis(xAxis, yAxis, zAxis);
+  const ground = poseTo3D(x, y, theta);
+  m.setPosition(toThree(ground.origin));
+  robot.matrix.copy(m);
+}
+
+// ---- path trace ----
+const MAX_PATH_POINTS = 20000;
+const pathGeo = new THREE.BufferGeometry();
+const pathPositions = new Float32Array(MAX_PATH_POINTS * 3);
+pathGeo.setAttribute("position", new THREE.BufferAttribute(pathPositions, 3));
+pathGeo.setDrawRange(0, 0);
+const pathLine = new THREE.Line(pathGeo, new THREE.LineBasicMaterial({ color: 0x3cb4ff, linewidth: 2 }));
+scene.add(pathLine);
+
+// ---- click-to-waypoint markers ----
+const waypointGroup = new THREE.Group();
+scene.add(waypointGroup);
+let waypoints = []; // [[x,y], ...] clicked so far
+
+function rebuildWaypointVisuals() {
+  while (waypointGroup.children.length) waypointGroup.remove(waypointGroup.children[0]);
+  if (!waypoints.length) return;
+  const chain = [[INITIAL_POSE[0], INITIAL_POSE[1]], ...waypoints];
+  const pts = chain.map(([wx, wy]) => toThree([wx, wy, terrainHeight(wx, wy) + 0.05]));
+  waypointGroup.add(new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.LineBasicMaterial({ color: 0x00c8ff })
+  ));
+  for (let i = 1; i < pts.length; i++) {
+    const marker = new THREE.Mesh(new THREE.SphereGeometry(0.12, 10, 8), new THREE.MeshBasicMaterial({ color: 0x00c8ff }));
+    marker.position.copy(pts[i]);
+    waypointGroup.add(marker);
+  }
+}
+
+// ----------------------------------------------------------------------
+// camera framing
+// ----------------------------------------------------------------------
+function defaultCamera() {
+  const center = new THREE.Vector3(0, HILL_HEIGHT_FT / 2, -8);
+  camera.position.set(center.x - 6, center.y + 8, center.z - 14);
+  controls.target.copy(center);
+  controls.update();
+}
+
+function fitCamera(poses) {
+  let minX = -3, maxX = 3, minY = 0, maxY = HILL_Y3 + 3;
+  for (const p of poses) {
+    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+  }
+  const span = Math.max(maxX - minX, maxY - minY, 10.0);
+  const dist = span * 0.9 + 6.0;
+  const centerWorld = [(minX + maxX) / 2, (minY + maxY) / 2, HILL_HEIGHT_FT / 2];
+  const dir = new THREE.Vector3(-0.35, -1.0, 0.5).normalize(); // world-frame offset (x,y,z)
+  const eyeWorld = [
+    centerWorld[0] + dir.x * dist,
+    centerWorld[1] + dir.y * dist,
+    centerWorld[2] + dir.z * dist,
+  ];
+  camera.position.copy(toThree(eyeWorld));
+  controls.target.copy(toThree(centerWorld));
+  controls.update();
+}
+
+// ----------------------------------------------------------------------
+// UI wiring
+// ----------------------------------------------------------------------
+const mdi = document.getElementById("mdi");
+const statusEl = document.getElementById("status");
+let poses = simulate([]);
+let playStartMs = null;
+let playing = false;
+
+function setPathPoints(pts) {
+  const n = Math.min(pts.length, MAX_PATH_POINTS);
+  for (let i = 0; i < n; i++) {
+    pathPositions[i * 3] = pts[i].x;
+    pathPositions[i * 3 + 1] = pts[i].y;
+    pathPositions[i * 3 + 2] = pts[i].z;
+  }
+  pathGeo.attributes.position.needsUpdate = true;
+  pathGeo.setDrawRange(0, 0);
+}
+
+let pathThreePts = [];
+
+function runCommands() {
+  const rawLines = mdi.value.split("\n");
+  const commands = [];
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i].trim().replace(/,/g, " ");
+    if (!line) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length !== 3 || parts.some((p) => !/^-?\d+$/.test(p))) {
+      statusEl.textContent = `Line ${i + 1}: expected 'pwml pwmr time_ms', got '${rawLines[i]}'`;
+      return;
+    }
+    commands.push(parts.map(Number));
+  }
+  if (commands.length === 0) {
+    statusEl.textContent = "No commands entered.";
+    return;
+  }
+
+  poses = simulate(commands);
+  fitCamera(poses);
+  pathThreePts = poses.map((p) => {
+    const g = poseTo3D(p.x, p.y, p.theta);
+    return toThree([g.origin[0], g.origin[1], g.origin[2] - WHEEL_RADIUS_FT + 0.03]);
+  });
+  setPathPoints(pathThreePts);
+  playStartMs = performance.now();
+  playing = true;
+  statusEl.textContent = `Running ${commands.length} command(s)...`;
+}
+
+document.getElementById("run").addEventListener("click", runCommands);
+document.getElementById("clear").addEventListener("click", () => {
+  mdi.value = "";
+  poses = simulate([]);
+  pathGeo.setDrawRange(0, 0);
+  playing = false;
+  planPose = [...INITIAL_POSE];
+  waypoints = [];
+  rebuildWaypointVisuals();
+  statusEl.textContent = "Commands cleared.";
+});
+document.getElementById("resetview").addEventListener("click", () => {
+  defaultCamera();
+  statusEl.textContent = "View reset.";
+});
+
+// ---- click-to-waypoint: raycast against the terrain only, and only on a
+// true click (no drag), so orbiting the camera doesn't drop a waypoint ----
+let planPose = [...INITIAL_POSE];
+const raycaster = new THREE.Raycaster();
+const pointerNdc = new THREE.Vector2();
+let downPos = null;
+
+function addLineToMdi(line) {
+  mdi.value = mdi.value.length && !mdi.value.endsWith("\n") ? mdi.value + "\n" + line : mdi.value + line;
+}
+
+function collectPoint(tx, ty) {
+  const [px, py, ptheta] = planPose;
+  const dx = tx - px, dy = ty - py;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 0.05) {
+    statusEl.textContent = "Point too close to the previous one; ignored.";
+    return;
+  }
+  const { commands, finalHeading } = planTurnDrive(ptheta, dx, dy, dist);
+  for (const [pwml, pwmr, timeMs] of commands) addLineToMdi(`${pwml} ${pwmr} ${timeMs}`);
+  planPose = [tx, ty, finalHeading];
+  waypoints.push([tx, ty]);
+  rebuildWaypointVisuals();
+  statusEl.textContent = `Point ${waypoints.length}: ${commands.length} command(s) added to the MDI.`;
+}
+
+renderer.domElement.addEventListener("pointerdown", (ev) => {
+  if (ev.button !== 0) return; // left button only; right/middle drive orbit-controls panning
+  downPos = { x: ev.clientX, y: ev.clientY };
+});
+renderer.domElement.addEventListener("pointerup", (ev) => {
+  if (ev.button !== 0 || !downPos) return;
+  const moved = Math.hypot(ev.clientX - downPos.x, ev.clientY - downPos.y);
+  downPos = null;
+  if (moved > 4) return; // was an orbit drag, not a click
+
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointerNdc.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+  pointerNdc.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointerNdc, camera);
+  const hits = raycaster.intersectObject(terrainGroup, true);
+  if (!hits.length) return;
+  const p = hits[0].point;
+  collectPoint(p.x, -p.z); // inverse of toThree()
+});
+
+// ----------------------------------------------------------------------
+// render loop
+// ----------------------------------------------------------------------
+function animate() {
+  requestAnimationFrame(animate);
+  resize();
+
+  let idx = poses.length - 1;
+  if (playing) {
+    const elapsed = (performance.now() - playStartMs) / 1000.0;
+    idx = Math.min(poses.length - 1, Math.floor(elapsed / SIM_DT));
+    pathGeo.setDrawRange(0, Math.min(idx + 1, MAX_PATH_POINTS));
+    if (idx >= poses.length - 1) {
+      playing = false;
+      statusEl.textContent = "Done.";
+    }
+  }
+
+  const p = poses[Math.max(0, idx)];
+  const g = poseTo3D(p.x, p.y, p.theta);
+  setRobotPose(p.x, p.y, p.theta, g.pitch, g.roll);
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+resize();
+defaultCamera();
+setRobotPose(0, 0, Math.PI / 2, 0, 0);
+animate();
+</script>
+</body>
+</html>
