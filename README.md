@@ -11,4 +11,5 @@ RS550 brushed motors with 100:1 gearboxes, 10 in pneumatic wheels, dual 12V 7Ah 
 | [`context-pack/`](context-pack/) | Design docs and the [user manual](<context-pack/eLlama User Manual.md>) |
 | [`firmware/`](firmware/) | ESP32 Arduino sketches (controller, motor board, bridge) |
 | [`teleop/`](teleop/) | Python client/server scripts for driving, video, and lidar over the network |
+| [`simulation/`](simulation/) | Calibrated 2D/3D drive-command simulators and a CSV replay script |
 | [`images/`](images/) | Photos and diagrams |

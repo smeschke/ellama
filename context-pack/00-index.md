@@ -14,6 +14,7 @@ expansion path.
 | `04-control-architecture.md` | Design principles only — protocol is in flux |
 | `05-docking.md` | The charging dock, and why the battery chemistry makes it trivial |
 | `06-manufacturing-cost.md` | BOM, in-house fabrication, batch plan |
+| `07-simulation.md` | The calibrated desktop simulator, sending commands from off-board compute, and the off-board-compute product vision (lawn mowing) |
 | `eLlama User Manual.md` | The product manual: specs, getting started, safety |
 | `bom.csv` | Current bill of materials |
 | `Testing.csv` | Test log |

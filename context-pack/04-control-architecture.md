@@ -24,6 +24,10 @@ teleoperation.
 The handheld path needs none of the others to exist. That ordering matters: the robot is
 complete without compute, and compute is an expansion rather than a dependency.
 
+Onboard compute doesn't have to be onboard, either: a desktop running the simulator and an
+ESP32 running the same `esp_bridge.ino` is the same sender, just relocated off the chassis
+entirely (`07-simulation.md`).
+
 ## One controller drives every robot — on purpose
 
 The controller does not pair to a robot. It broadcasts, and any motor board listening on
