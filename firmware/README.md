@@ -15,5 +15,3 @@ Arduino sketches for every ESP32 in the system — one for the controller, one f
 Standard ESP32 Arduino toolchain — install the ESP32 board package, pick your board, flash over USB. The controller flashes through the same USB-C port that powers it, no disassembly.
 
 The single stick controller broadcasts, so it drives any `motor_receiver.ino` listening on the same WiFi channel — no MAC address configuration needed. `esp_bridge.ino` also broadcasts, so it works the same way when driving from a computer instead of the stick.
-
-Wiring diagrams, BOMs, and protocol documents are in [`build_documents/`](../build_documents/).
