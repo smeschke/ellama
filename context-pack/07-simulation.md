@@ -31,8 +31,8 @@ The rule that earns: start with the lowest PWM that's still effective, watch it 
 only raise the ceiling once the path is trusted — whether it came from clicking
 waypoints, typed commands, or anything a person or an LLM wrote to drive the two-number
 interface. This is a property of the interface, not of the simulator specifically: the
-same caution applies to any code that ends up calling `esp_bridge.ino`,
-`motor_receiver.ino`, or the ESP-NOW link directly. Separately, PWM magnitudes much below
+same caution applies to any code that ends up calling `computer_bridge.ino`,
+`robot_motor_bts7960.ino`, or the ESP-NOW link directly. Separately, PWM magnitudes much below
 ~40 tend not to move the robot at all — mechanical static friction, not a firmware
 deadband — so a low-PWM command can look fine simulated and simply do nothing for real.
 
@@ -43,7 +43,7 @@ controller, and onboard compute talking to the motor board over ESP-NOW. The sim
 adds a third, off-board one — a laptop or desktop, not the robot, doing the sending.
 
 Plan a path visually in the simulator, export it as a CSV, then replay it with
-`send_csv.py`: an ESP32 flashed with the unmodified `esp_bridge.ino`, plugged into the
+`send_csv.py`: an ESP32 flashed with the unmodified `computer_bridge.ino`, plugged into the
 same computer, streams the commands straight to the robot's motor board over ESP-NOW,
 exactly as if a Pi onboard the robot had sent them. Nothing about the robot changes; as
 far as the motor board is concerned this is indistinguishable from any other sender.

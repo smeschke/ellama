@@ -13,5 +13,6 @@ Demo video: **[youtu.be/O5k8u-hmhis](https://youtu.be/O5k8u-hmhis)** — try the
 | [`context-pack/`](context-pack/) | Design docs and the [user manual](<context-pack/eLlama User Manual.md>) |
 | [`firmware/`](firmware/) | ESP32 Arduino sketches (controller, motor board, bridge) |
 | [`teleop/`](teleop/) | Python client/server scripts for driving, video, and lidar over the network |
+| [`calibration/`](calibration/) | Sensor validation and calibration tools that read the computer bridge: live encoder/IMU view and calibration |
 | [`simulation/`](simulation/) | Calibrated 2D/3D drive-command simulators and a CSV replay script |
 | [`images/`](images/) | Photos and diagrams |

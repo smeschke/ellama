@@ -37,7 +37,7 @@ a cable set baked into the PCB order, so a different cable run or a one-off harn
 matter of re-jumpering, not a new board spin.
 
 Hand-populating the DevKit also leaves its USB-C port sitting exposed at the board edge:
-the same port flashes the board and, with `esp_bridge.ino`, lets a bench PC drive the
+the same port flashes the board and, with `computer_bridge.ino`, lets a bench PC drive the
 robot directly over serial (`04-control-architecture.md`). A reflowed bare-module design
 would have buried that port inside the enclosure.
 

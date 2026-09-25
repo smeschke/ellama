@@ -25,7 +25,7 @@ The handheld path needs none of the others to exist. That ordering matters: the 
 complete without compute, and compute is an expansion rather than a dependency.
 
 Onboard compute doesn't have to be onboard, either: a desktop running the simulator and an
-ESP32 running the same `esp_bridge.ino` is the same sender, just relocated off the chassis
+ESP32 running the same `computer_bridge.ino` is the same sender, just relocated off the chassis
 entirely (`07-simulation.md`).
 
 ## One controller drives every robot — on purpose
@@ -101,5 +101,5 @@ The ESP32 DevKit is socketed and hand-populated onto the board rather than reflo
 bare module (`06-manufacturing-cost.md`), which keeps its USB-C port exposed at the edge
 of the board. That single port is what makes the three control paths above physically
 possible on the same hardware: flash new firmware over it, or plug it into a bench PC and
-drive the robot directly with `esp_bridge.ino` — the same port, no case to open, no
+drive the robot directly with `computer_bridge.ino` — the same port, no case to open, no
 programmer to attach.

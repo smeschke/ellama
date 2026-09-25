@@ -1,6 +1,6 @@
 # Simulation
 
-Path planning and dry-run simulators for eLlama's open-loop drive commands (`pwml pwmr time_ms`, the same three numbers the firmware's `DrivePacket{left, right}` and `esp_bridge.ino` expect). Two UIs, each with a "simple" and a "complex" version:
+Path planning and dry-run simulators for eLlama's open-loop drive commands (`pwml pwmr time_ms`, the same three numbers the firmware's `DrivePacket{left, right}` and `computer_bridge.ino` expect). Two UIs, each with a "simple" and a "complex" version:
 
 | Script | UI | Input |
 | --- | --- | --- |
@@ -32,13 +32,13 @@ Separately: PWM magnitudes much below ~40 tend not to produce any real motion at
 
 1. Build a path in the simulator — type commands directly, or click the ground to drop waypoints (complex versions plan the turn+drive or arc command for you).
 2. Click **EXPORT CSV** (Python) or the export button (3D) to write `pwml,pwmr,time_ms` rows to `exported_path.csv`.
-3. Replay it on the real robot with [`send_csv.py`](send_csv.py), which streams each row over serial to an ESP32 running `esp_bridge.ino` at the wire protocol described in [`firmware/README.md`](../firmware/README.md):
+3. Replay it on the real robot with [`send_csv.py`](send_csv.py), which streams each row over serial to an ESP32 running `computer_bridge.ino` at the wire protocol described in [`firmware/README.md`](../firmware/README.md):
 
    ```
    python3 send_csv.py exported_path.csv --port /dev/ttyUSB0
    ```
 
-   It always sends `stop` on exit, Ctrl+C, or error, since `esp_bridge.ino` repeats the last command forever until told otherwise.
+   It always sends `stop` on exit, Ctrl+C, or error, since `computer_bridge.ino` repeats the last command forever until told otherwise.
 
 ## Robot model
 

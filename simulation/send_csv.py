@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Send a CSV of drive commands to the ESP32 running
-firmware/esp_bridge/esp_bridge.ino, over serial. Same wire protocol as
+firmware/computer_bridge/computer_bridge.ino, over serial. Same wire protocol as
 sim_sender.py's SEND button ("<left> <right>\\n" held for time_ms, then
 "stop" at the end), just scriptable so a path doesn't need retyping into
 the MDI box.
@@ -17,7 +17,7 @@ Usage:
     python3 sim/send_csv.py my_path.csv --port /dev/ttyUSB0
 
 Safety: always sends "stop" when the script finishes, is interrupted
-(Ctrl+C), or errors out, since esp_bridge.ino repeats the last command
+(Ctrl+C), or errors out, since computer_bridge.ino repeats the last command
 forever until told otherwise.
 """
 
