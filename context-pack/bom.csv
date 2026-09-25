@@ -2,15 +2,15 @@
 ,,,,,,,,,,,
 Assembly,,Item,Description,Manufacturer,Qty,Unit $,Ext $,Current source,Mouser / CS-ecosystem option,Origin of Manufacture,Link
 "Robot, Controller",Electronic,ESP32 DevKit V1,MCU,Generic,2,$6.00,$12.00,Amazon,Yes — ESP32-DevKitC-32E,China,https://www.amazon.com/dp/B0DSZFD1SD?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1
-Robot,Electronics,Llama Driver Board,PCB that esp32’s and motor driver headers mount to,PCB Board Fab,1,$4.00,$4.00,JLCPCB,No (custom),Taiwan,jlc
-Robot,Structure,Electronics Carrier Board,Mounting board for all the electronics,self-made (printed),1,$2.00,$2.00,In House,No (custom),USA,
+Robot,Electronics,Llama Motor Board,PCB that carries the ESP32 and the headers that accept the ribbon cables to the motor driver modules,PCB Board Fab,1,$4.00,$4.00,JLCPCB,No (custom),Taiwan,jlc
+Robot,Structure,Motor driver mount,Holds the four BTS7960 driver modules,self-made (printed),1,$2.00,$2.00,In House,No (custom),USA,
 Robot,Powertrain,Hub Adapter,Adapts gearmotor to wheel barrow hub,self-made (printed),4,$1.00,$4.00,In House,No (custom),USA,
 Robot,Powertrain,Hub Bolts,5/16” x 1.5” long hex bolts with washer and nut,Generic,8,$0.60,$4.80,Lowe’s,No,China,
 Robot,Structure,Lug Nuts,½” nylock nut,Generic,4,$1.00,$4.00,Lowe’s,No,China,
 Robot,Structure,Axle Blocks,Blocks to retain ½” allthread axles,self-made (printed),4,$1.00,$4.00,In House,No (custom),USA,
 Robot,Electronic,BTS7960 43 A driver module,Motor Driver,Generic,4,$5.50,$22.00,Amazon,Partial – drivers are 4x the cost and ½ the capacity,China,https://www.amazon.com/dp/B09QKFFDQ3?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1
 Robot,Electronic,Battery Connectors,"F1 Style Terminal Connectors (two red, two blue) for 14g wire",Generic,4,$0.10,$0.40,Amazon,Yes,China,
-Robot,Electronic,2x4 IDC F-F ribbon cable,Cable to go from MCU it Motor drivers,Generic,4,$2.40,$9.60,Amazon,Yes,China,https://www.amazon.com/Pc-Accessories-Connectors-Sockets-8P-20cm-4PK/dp/B07DFBPZLJ/ref=sr_1_1?crid=4E1KKYIHTKBW&dib=eyJ2IjoiMSJ9.Dqu84r2FgQOkJ-BlcMtLEpG1K5KKJf14Oz16XPRx__tEK6MOxmMMGlzv3l2VHeopf3_nn7v7mj8rBcuYBFAOpCth_dqZ1szD6-2PmunHeg7mHg2TEtkrt0TYaUdTSEnc4My09KRcJ0Q9V7raj-ir4FTGimi0DXNvFl-7IvSz8mwCSGNVxX-s7xES6-3EDdJgApgSipqHpn4kTpF_j1xdDyFKkzffmqJm20woHndlM3C9Lyg_t0jYwFnCxiTb02mk9eKfksV9_62CBvfnEvPpVYMaCPt9N1q2amiftF-lV-A.q-cAuiZn0RhaGBPVQdLyr6ZZ5husXX4w7osrvVdWKGs&dib_tag=se&keywords=2x4%2Bidc&qid=1785362150&s=electronics&sprefix=2x4%2Bidc%2Celectronics%2C175&sr=1-1
+Robot,Electronic,2x4 IDC F-F ribbon cable,Cable to go from Llama Motor Board to BTS7960 driver modules,Generic,4,$2.40,$9.60,Amazon,Yes,China,https://www.amazon.com/Pc-Accessories-Connectors-Sockets-8P-20cm-4PK/dp/B07DFBPZLJ/ref=sr_1_1?crid=4E1KKYIHTKBW&dib=eyJ2IjoiMSJ9.Dqu84r2FgQOkJ-BlcMtLEpG1K5KKJf14Oz16XPRx__tEK6MOxmMMGlzv3l2VHeopf3_nn7v7mj8rBcuYBFAOpCth_dqZ1szD6-2PmunHeg7mHg2TEtkrt0TYaUdTSEnc4My09KRcJ0Q9V7raj-ir4FTGimi0DXNvFl-7IvSz8mwCSGNVxX-s7xES6-3EDdJgApgSipqHpn4kTpF_j1xdDyFKkzffmqJm20woHndlM3C9Lyg_t0jYwFnCxiTb02mk9eKfksV9_62CBvfnEvPpVYMaCPt9N1q2amiftF-lV-A.q-cAuiZn0RhaGBPVQdLyr6ZZ5husXX4w7osrvVdWKGs&dib_tag=se&keywords=2x4%2Bidc&qid=1785362150&s=electronics&sprefix=2x4%2Bidc%2Celectronics%2C175&sr=1-1
 Robot,Powertrain,RS550 motor + triple spur gear reduction,Gear motor,Generic,4,$12.00,$48.00,Amazon,No,China,
 Robot,Electronic,Fuse Holder,Inline blade fuse holder with 14awg leads,Generic,1,$1.50,$1.50,Amazon,Yes,China,
 Robot,Electronic,Main,40A blade fuse,Generic,1,$0.30,$0.30,Amazon,Yes,China,

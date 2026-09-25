@@ -1,6 +1,6 @@
 // ===== Llama Robot: Dual Wheel Encoder Sender (2x AS5600, ESP-NOW) =====
 //
-// Runs on the robot's encoder ESP32. Reads two AS5600 magnetic encoders and
+// Runs on the Llama Encoder Board (currently a breadboard prototype). Reads two AS5600 magnetic encoders and
 // broadcasts an EncoderPacket over ESP-NOW every SEND_DT_MS. The bridge
 // (computer_bridge.ino) relays it to the PC as "ENC <left> <right> <ms>".
 //

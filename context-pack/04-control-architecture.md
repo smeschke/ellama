@@ -81,7 +81,7 @@ for anything unattended or valuable. A bounded decision, not an oversight.
 
 ## Layered failsafes
 
-If the MCU receives no signal from the controller for a fraction of a second, it enters
+If the motor board receives no signal from the controller for a fraction of a second, it enters
 failsafe and commands PWM zero.
 
 PWM zero is not neutral: the BTS7960 drivers hold both terminals of each motor near
@@ -94,7 +94,7 @@ reduction holding the robot on a slope, though that helps too.
 ## Wiring is standardized
 
 The custom PCB is what makes every robot wire up identically. It is documented well
-enough that a user can reflash the MCU and change behaviour without tracing a harness
+enough that a user can reflash the motor board and change behaviour without tracing a harness
 first.
 
 The ESP32 DevKit is socketed and hand-populated onto the board rather than reflowed as a

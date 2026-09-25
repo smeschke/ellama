@@ -9,7 +9,7 @@ It is also a mount for compute. A box on the front deck takes a single-board com
 ### 1.1 Shipping Contents
 
 - eLlama robot platform
-- Onboard MCU
+- Onboard Llama Motor Board
 - User breakout panel with 12V power
 - Single-Stick Controller
 - Charging dock
@@ -21,15 +21,15 @@ It is also a mount for compute. A box on the front deck takes a single-board com
 
 #### 1.2.1 System Architecture
 
-eLlama is built around a modular design. The motor control unit (MCU) is an ESP32 DevKitV1 module soldered onto a custom carrier PCB. The bare PCB (traces and holes only) is manufactured by JLCPCB; the header pins and the ESP32 DevKitV1 are hand-soldered on afterward. The carrier PCB routes the DevKitV1's pins to the motor drivers' eight PWM channels, so the wiring is identical from robot to robot and the same firmware runs on every unit without per-robot pin remapping.
+eLlama is built around a modular design. The Llama Motor Board is a custom PCB that carries an ESP32 DevKitV1 module, soldered onto the board. The BTS7960 driver modules are separate boards, held on the motor driver mount. The bare PCB (traces and holes only) is manufactured by JLCPCB; the header pins and the ESP32 DevKitV1 are hand-soldered on afterward. The Llama Motor Board routes the DevKitV1's pins to the driver modules' eight PWM channels, so the wiring is identical from robot to robot and the same firmware runs on every unit without per-robot pin remapping.
 
-The MCU handles receiving motor commands and ramping motor current and speed to match the drive target. The MCU can receive command signals from the Single-Stick Controller or from a serial connection.
+The Llama Motor Board handles receiving motor commands and ramping motor current and speed to match the drive target. The Llama Motor Board can receive command signals from the Single-Stick Controller or from a serial connection.
 
 #### 1.2.2 Exterior Features
 
 eLlama is shown below and includes:
 
-- MCU power button
+- Llama Motor Board power button
 - Motion stop and lockout button (high-voltage switch)
 
 #### 1.2.3 Status Lights
@@ -38,7 +38,7 @@ There are LED indicators on the switches, as well as a battery status indicator 
 
 #### 1.2.4 Switches
 
-There are two switches on the robot. One switches the MCU and power for the motor drivers; if this is switched on, the robot can be driven with the Single-Stick Controller. A second switch powers the compute module.
+There are two switches on the robot. One switches the Llama Motor Board and power for the motor drivers; if this is switched on, the robot can be driven with the Single-Stick Controller. A second switch powers the compute module.
 
 #### 1.2.5 Payloads
 
@@ -87,9 +87,9 @@ Turn rate was measured via frame-by-frame video tracking of robot orientation ac
 
 The robot should be placed on a box so that the wheels can spin freely off the ground for initial testing. Ensure that no cords or wires can get wrapped up in the wheels.
 
-### 2.1 Onboard MCU
+### 2.1 Onboard Llama Motor Board
 
-The USB port on the onboard MCU is accessible, and users are encouraged to run custom firmware scripts.
+The USB port on the onboard Llama Motor Board is accessible, and users are encouraged to run custom firmware scripts.
 
 ### 2.2 Powering Up
 

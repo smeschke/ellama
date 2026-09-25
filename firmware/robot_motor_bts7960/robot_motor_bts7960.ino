@@ -1,5 +1,7 @@
 // ===== Llama Robot: Motor Receiver (ESP-NOW, LEDC PWM) =====
 //
+// Runs on the Llama Motor Board.
+//
 // Wire format: DrivePacket{left, right} -- signed PWM per side, -255..255.
 // Works with either a human joystick remote (which does its own arcade-
 // drive mixing before sending) or a computer plugged into an ESP32 bridge

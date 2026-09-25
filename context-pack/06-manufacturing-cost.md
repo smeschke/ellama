@@ -8,18 +8,18 @@ is the sourcing philosophy from `01-overview.md` applied to procurement: buy the
 ubiquitous part, and inherit its price, availability, and longevity.
 
 **Made in-house:** the parts that are specific to this robot and that nobody sells —
-motor mounts, hub adapters, axle blocks, battery holder, electronics carrier, and body
+motor mounts, hub adapters, axle blocks, battery holder, motor driver mount, and body
 shell (all FDM printed); the plywood deck and axle capture blocks (table saw and drill
-press); the fixed axles (bandsaw and bench grinder); and the Llama Carrier Board
+press); the fixed axles (bandsaw and bench grinder); and the Llama Motor Board
 (fabricated at JLCPCB, through-hole connectors hand-soldered).
 
 Every in-house part is documented with material, method, equipment, setup time, and cycle
 time in the Manufactured Parts sheet. Setup is 5–10 minutes per part; cycle times run
 0.1 h for a saw cut to 4 h for the body shell print.
 
-## The carrier board
+## The motor board
 
-The Llama Carrier Board is a 2-layer PCB carrying a socketed ESP32 DevKit, four keyed 2×4
+The Llama Motor Board is a 2-layer PCB carrying a socketed ESP32 DevKit, four keyed 2×4
 IDC headers for the motor drivers, and screw-terminal power.
 
 JLCPCB fabricates the bare board only — traces, pads, silkscreen, no assembly. Pricing at

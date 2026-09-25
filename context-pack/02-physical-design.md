@@ -103,7 +103,7 @@ forgiving, takes a screw anywhere, and can be re-cut by the owner with tools the
 have. It is repairable with a jigsaw rather than a purchase order.
 
 **3D-printed mounts, adapters, and body shell.** Motor mounts, hub adapters, axle blocks,
-battery holder, electronics carrier, and body — all intended to be reprinted and
+battery holder, motor driver mount, and body — all intended to be reprinted and
 modified, and the body shell in particular is meant to be reshaped by the owner.
 
 **½ in allthread axles in plywood capture blocks.** Cheap, straight enough, available
