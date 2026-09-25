@@ -3,12 +3,12 @@
 // Reads a KY-023-style dual-axis analog joystick (VRx, VRy, SW) and mixes
 // it into left/right drive values using arcade-style mixing, then sends a
 // DrivePacket{left, right} to the robot over ESP-NOW broadcast. This wire
-// format must exactly match motor_receiver.ino's DrivePacket -- that
+// format must exactly match robot_motor_bts7960.ino's DrivePacket -- that
 // receiver does no mixing of its own, it just ramps toward whatever
 // left/right values it's sent.
 //
 // Broadcast is used instead of pairing to a specific MAC address, so this
-// will drive ANY robot receiver running motor_receiver.ino that's
+// will drive ANY robot receiver running robot_motor_bts7960.ino that's
 // listening on the same WiFi channel. If you build more than one robot,
 // give each a distinct peer MAC and unicast instead.
 
@@ -32,7 +32,7 @@ const float TURBO_SCALE  = 0.8f;  // top speed while the switch is held down
 const bool INVERT_X = true; // turn axis
 const bool INVERT_Y = true; // throttle axis
 
-// ================= Wire format (must match motor_receiver.ino) =================
+// ================= Wire format (must match robot_motor_bts7960.ino) =================
 typedef struct __attribute__((packed)) {
   int16_t left;   // -255..255
   int16_t right;  // -255..255

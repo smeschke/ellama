@@ -1,1 +1,3 @@
 video_evidence/
+__pycache__/
+build/
