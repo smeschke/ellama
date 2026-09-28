@@ -1,0 +1,11 @@
+robot_id,pwm,direction,requested_in,actual_in,elapsed_s,speed_in_s,hit_timeout,ok
+unit1,50,forward,12.0,12.67,3.08,4.114,False,True
+unit1,50,reverse,12.0,12.66,3.08,4.11,False,True
+unit1,60,forward,12.0,13.44,2.18,6.165,False,True
+unit1,60,reverse,12.0,13.28,2.18,6.092,False,True
+unit1,80,forward,12.0,14.45,1.55,9.323,False,True
+unit1,80,reverse,12.0,14.85,1.58,9.399,False,True
+unit1,100,forward,12.0,15.8,1.31,12.061,False,True
+unit1,100,reverse,12.0,15.72,1.31,12.0,False,True
+unit1,125,forward,12.0,16.8,1.16,14.483,False,True
+unit1,125,reverse,12.0,17.18,1.19,14.437,False,True

@@ -1,0 +1,13 @@
+robot_id,pwm,direction,requested_degrees,actual_degrees_turned,encoder_degrees_estimate,elapsed_s,turn_rate_deg_s,hit_timeout,ok
+unit1,40,left,90.0,,,,,,False
+unit1,40,right,90.0,-1.7,-0.2,12.26,,True,False
+unit1,50,left,90.0,15.3,131.7,12.27,,True,False
+unit1,50,right,90.0,-3.0,-86.0,12.26,,True,False
+unit1,60,left,90.0,91.2,228.8,9.43,9.67,False,True
+unit1,60,right,90.0,-91.5,-144.5,6.24,14.66,False,True
+unit1,80,left,90.0,93.8,162.8,3.65,25.7,False,True
+unit1,80,right,90.0,-95.6,-146.5,3.26,29.33,False,True
+unit1,100,left,90.0,96.8,159.3,2.63,36.81,False,True
+unit1,100,right,90.0,-99.5,-151.2,2.48,40.12,False,True
+unit1,125,left,90.0,102.5,162.2,2.06,49.76,False,True
+unit1,125,right,90.0,-102.1,-153.6,1.94,52.63,False,True

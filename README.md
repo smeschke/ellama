@@ -14,5 +14,6 @@ Demo video: **[youtu.be/O5k8u-hmhis](https://youtu.be/O5k8u-hmhis)** — try the
 | [`firmware/`](firmware/) | ESP32 Arduino sketches (controller, motor board, bridge) |
 | [`teleop/`](teleop/) | Python client/server scripts for driving, video, and lidar over the network |
 | [`calibration/`](calibration/) | Sensor validation and calibration tools that read the computer bridge: live encoder/IMU view and calibration |
+| [`mcp_server/`](mcp_server/) | MCP server so an AI agent can drive the robot by encoder feedback ("go forward 10 inches") instead of guessing a duration |
 | [`simulation/`](simulation/) | Calibrated 2D/3D drive-command simulators and a CSV replay script |
 | [`images/`](images/) | Photos and diagrams |

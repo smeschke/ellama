@@ -31,6 +31,11 @@
 // fails safe after CMD_TIMEOUT_MS unless something else is driving).
 // Never send a drive command while the stick is also driving -- they'd
 // fight on the same channel.
+//
+// Fails safe to listen-only if no serial line arrives for SERIAL_IDLE_TIMEOUT_MS while
+// transmitting -- e.g. the controlling script/process dies or the USB link drops. Without
+// this, the last DrivePacket would repeat forever, since transmitting only changes when a
+// serial line comes in.
 
 #include <WiFi.h>
 #include <esp_now.h>
@@ -61,6 +66,14 @@ typedef struct __attribute__((packed)) {
 int cmdL = 0, cmdR = 0;
 bool transmitting = false; // false = listen-only; set by a serial drive command, cleared by "listen"
 uint32_t lastSendMs = 0;
+uint32_t lastRxMs = 0;
+
+// If we're transmitting and no serial line has arrived in this long, fail safe to
+// listen-only. Covers the case a controlling process (script, MCP server) dies or the
+// USB link drops while a drive command is still active -- without this, the bridge
+// would otherwise keep re-sending the last DrivePacket forever, since transmitting only
+// ever changes on a serial line coming in.
+const uint32_t SERIAL_IDLE_TIMEOUT_MS = 500;
 
 void onSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
   // no-op; add Serial.println(status) here if you need send-failure debugging
@@ -85,6 +98,7 @@ void readSerialCommand() {
 
   String line = Serial.readStringUntil('\n');
   line.trim();
+  lastRxMs = millis(); // any line at all counts as the link being alive
 
   if (line.equalsIgnoreCase("listen")) {
     transmitting = false;
@@ -138,12 +152,21 @@ void setup() {
   peer.encrypt = false;
   memcpy(peer.peer_addr, broadcastMac, 6);
   esp_now_add_peer(&peer);
+
+  lastRxMs = millis();
 }
 
 void loop() {
   readSerialCommand();
 
   uint32_t now = millis();
+
+  if (transmitting && now - lastRxMs > SERIAL_IDLE_TIMEOUT_MS) {
+    transmitting = false;
+    cmdL = 0; cmdR = 0;
+    Serial.println("-> serial idle timeout, falling back to listen-only");
+  }
+
   if (transmitting && now - lastSendMs >= SEND_INTERVAL_MS) {
     lastSendMs = now;
     DrivePacket p{ (int16_t)cmdL, (int16_t)cmdR };
