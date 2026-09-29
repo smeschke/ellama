@@ -70,8 +70,7 @@ logged run at 2.87 mph.
 ## Power
 
 **12 V 7 Ah sealed lead-acid, one or two wired in parallel, user-supplied.** The system
-runs on 12 V only — a second battery adds capacity, not voltage. There is no 24 V
-configuration.
+runs on 12 V only — a second battery adds capacity, not voltage.
 
 SLA is the unfashionable choice and the correct one here:
 
