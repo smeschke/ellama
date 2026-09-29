@@ -52,6 +52,7 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `connect(port=None)` | No | — |
 | `drive_distance(distance_inches, direction, pwm, confirmed_safe)` | Yes | Yes |
 | `turn_degrees(degrees, direction, pwm, confirmed_safe)` | Yes | Yes |
+| `drive_arc(radius_inches, degrees, direction, pwm, confirmed_safe)` | Yes (curved; 360° = full circle) | Yes |
 | `jog(left_pwm, right_pwm, duration_s, confirmed_safe)` | Yes (raw, time-based) | Yes |
 
 `drive_distance` and `turn_degrees` are closed-loop: they stop themselves once the

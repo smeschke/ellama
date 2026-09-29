@@ -77,6 +77,33 @@ MAX_SINGLE_TURN_DEG = 180.0
 # can run so a bad (left_pwm, right_pwm) can't run away unattended.
 MAX_JOG_DURATION_S = 10.0
 
+# computer_bridge.ino drops to listen-only if no serial line arrives for 500ms
+# (SERIAL_IDLE_TIMEOUT_MS), so every drive loop re-sends its command at least this often.
+# Verified 2026-09-28: without this, drive_distance(6in, pwm=50) stopped after ~3in.
+DRIVE_KEEPALIVE_S = 0.1
+
+# drive_arc() caps. A circle is one continuous closed-loop motion, so it gets its own
+# path-length cap instead of MAX_SINGLE_MOVE_IN; it still aborts the moment telemetry
+# goes stale. Radius floor keeps it from degenerating into an in-place spin (use
+# turn_degrees for that).
+MAX_SINGLE_ARC_DEG = 360.0
+MAX_SINGLE_ARC_IN = 160.0
+MIN_ARC_RADIUS_IN = 6.0
+# How often drive_arc re-measures curvature and corrects the wheel-speed split, and how
+# hard it corrects (fraction of pwm per unit of relative curvature error).
+ARC_CONTROL_DT_S = 0.1
+ARC_GAIN = 0.15
+# With the inner wheel stopped this robot can't curve tighter than ~12.5in radius
+# (measured 2026-09-28, pwm=60), so drive_arc lets the inner wheel run backwards, down to
+# this PWM, for tighter circles. The wheel split changes by at most ARC_MAX_STEP_PWM per
+# control step, so the inner wheel eases through zero into reverse instead of jumping.
+ARC_MAX_INNER_REVERSE_PWM = int(0.9 * MAX_PWM_CEILING)  # 112; at -60 it bottomed out at ~7.9in radius
+ARC_MAX_STEP_PWM = 5
+
+# Encoder count direction when that wheel rolls forward. Verified 2026-09-28: a 6in
+# forward drive_distance read left +6.77in, right -6.66in (right encoder is mirrored).
+ENCODER_FORWARD_SIGN = (1, -1)
+
 # Verified 2026-09-27, robot on blocks, wheels free to spin: direction="forward" at
 # +50 PWM on both sides drove all four wheels backwards, confirmed by eye. -1 makes
 # direction="forward" match real forward rotation. Re-check this after any change to
@@ -402,7 +429,11 @@ def drive_distance(
     hit_timeout = False
     try:
         link.send_drive(signed_pwm, signed_pwm)
+        last_send = time.monotonic()
         while True:
+            if time.monotonic() - last_send >= DRIVE_KEEPALIVE_S:
+                link.send_drive(signed_pwm, signed_pwm)
+                last_send = time.monotonic()
             cur = link.last_counts()
             traveled_ticks = (abs(cur[0] - start[0]) + abs(cur[1] - start[1])) / 2.0
             if traveled_ticks >= target_ticks:
@@ -508,7 +539,11 @@ def turn_degrees(
     hit_timeout = False
     try:
         link.send_drive(left_pwm, right_pwm)
+        last_send = time.monotonic()
         while True:
+            if time.monotonic() - last_send >= DRIVE_KEEPALIVE_S:
+                link.send_drive(left_pwm, right_pwm)
+                last_send = time.monotonic()
             with link.lock:
                 current_yaw = link.orient.yaw
             if abs(current_yaw - start_yaw) >= degrees:
@@ -545,6 +580,153 @@ def turn_degrees(
 
 
 @mcp.tool()
+def drive_arc(
+    radius_inches: float,
+    degrees: float,
+    direction: Literal["left", "right"],
+    pwm: int,
+    confirmed_safe: bool,
+) -> dict:
+    """Closed-loop curved drive: both wheels roll forward, the outer one faster, so the
+    robot drives an arc of `radius_inches` (measured to the robot's center) until the
+    IMU's gyro-integrated yaw reports `degrees` turned, then stops. degrees=360 drives a
+    full circle. Same confirmed_safe gate, live-telemetry requirement and
+    stop-before-moving behavior as drive_distance -- see DRIVING_POLICY.md.
+
+    `pwm` is the average wheel command; the outer wheel runs at pwm + d (never above
+    MAX_PWM_CEILING) and the inner at pwm - d. d starts from the nominal track-width
+    geometry, capped so the inner wheel starts at or above zero, then every
+    ARC_CONTROL_DT_S the measured curvature (IMU yaw change / signed encoder path length)
+    is compared with 1/radius and d is nudged to match, by at most ARC_MAX_STEP_PWM per
+    step -- skid-steer wheel scrub makes the geometric split alone wrong, so the loop,
+    not the geometry, sets the real radius. For radii tighter than the robot manages with
+    the inner wheel stopped (~12.5in), the loop eases the inner wheel through zero into
+    reverse, down to -ARC_MAX_INNER_REVERSE_PWM. Aborts immediately if encoder or IMU
+    telemetry goes stale mid-move.
+
+    direction uses the same wheel mapping as turn_degrees. Capped at
+    MAX_SINGLE_ARC_DEG=360 and MAX_SINGLE_ARC_IN=160 of path per call, radius at least
+    MIN_ARC_RADIUS_IN=6.
+    """
+    if link is None:
+        return _not_connected()
+    gate = _confirm_gate(confirmed_safe)
+    if gate:
+        return gate
+    if radius_inches < MIN_ARC_RADIUS_IN:
+        return {"ok": False, "error": f"radius_inches must be >= {MIN_ARC_RADIUS_IN} -- "
+                "use turn_degrees to spin in place"}
+    if not (0 < degrees <= MAX_SINGLE_ARC_DEG):
+        return {"ok": False, "error": f"degrees must be > 0 and <= {MAX_SINGLE_ARC_DEG}"}
+    arc_len = radius_inches * math.radians(degrees)
+    if arc_len > MAX_SINGLE_ARC_IN:
+        return {"ok": False, "error": f"arc length {arc_len:.1f}in exceeds the "
+                f"{MAX_SINGLE_ARC_IN}in per-call cap -- use a smaller radius or fewer degrees"}
+
+    snap = link.telemetry_snapshot()
+    if not snap["telemetry_live"]:
+        return {"ok": False, "error": "no live encoder telemetry -- refusing to drive "
+                "without feedback", "telemetry": snap}
+    if not snap["imu_live"]:
+        return {"ok": False, "error": "no live IMU telemetry -- drive_arc needs it to "
+                "measure how far around the arc it has gone", "telemetry": snap}
+
+    pwm = min(abs(int(pwm)), MAX_PWM_CEILING)
+    if pwm == 0:
+        return {"ok": False, "error": "pwm must be > 0"}
+
+    link.send_stop()
+    time.sleep(STOP_SETTLE_S)
+
+    in_per_tick = link.in_per_tick()
+    half_track = link.cfg["track_width_in"] / 2.0
+    diff = pwm * min(1.0, half_track / radius_inches)
+    target_curv = 1.0 / radius_inches  # rad per inch of path
+
+    def forward_path_in(a, b):
+        # Signed, so a reversing inner wheel subtracts from the path instead of adding.
+        l_fwd = (b[0] - a[0]) * ENCODER_FORWARD_SIGN[0]
+        r_fwd = (b[1] - a[1]) * ENCODER_FORWARD_SIGN[1]
+        return (l_fwd + r_fwd) / 2.0 * in_per_tick
+
+    max_diff = pwm + ARC_MAX_INNER_REVERSE_PWM
+
+    def wheel_cmd(d):
+        outer = min(MAX_PWM_CEILING, pwm + d)
+        inner = max(-ARC_MAX_INNER_REVERSE_PWM, pwm - d)
+        # "left" = right wheel on the outside, matching turn_degrees' mapping.
+        l_real, r_real = (inner, outer) if direction == "left" else (outer, inner)
+        return FORWARD_PWM_SIGN * l_real, FORWARD_PWM_SIGN * r_real
+
+    start = link.last_counts()
+    with link.lock:
+        start_yaw = link.orient.yaw
+    timeout_s = arc_len / 2.0 + 5.0  # generous: ~2 in/s average, well under PWM-50 speed
+
+    t_start = time.monotonic()
+    hit_timeout = False
+    abort_reason = None
+    win_counts, win_yaw = start, start_yaw
+    last_ctrl = t_start
+    try:
+        link.send_drive(*wheel_cmd(diff))
+        while True:
+            now = time.monotonic()
+            with link.lock:
+                cur_yaw = link.orient.yaw
+                enc_age = None if link.last_enc_wall is None else now - link.last_enc_wall
+                imu_age = None if link.last_imu_wall is None else now - link.last_imu_wall
+            if abs(cur_yaw - start_yaw) >= degrees:
+                break
+            if enc_age is None or enc_age > TELEMETRY_STALE_S or imu_age is None \
+                    or imu_age > TELEMETRY_STALE_S:
+                abort_reason = "telemetry went stale mid-arc"
+                break
+            if now - t_start > timeout_s:
+                hit_timeout = True
+                break
+            if now - last_ctrl >= ARC_CONTROL_DT_S:
+                cur = link.last_counts()
+                path = forward_path_in(win_counts, cur)
+                if path > 0.3:  # enough travel for a meaningful curvature estimate
+                    curv = math.radians(abs(cur_yaw - win_yaw)) / path
+                    step = ARC_GAIN * pwm * (target_curv - curv) / target_curv
+                    step = max(-ARC_MAX_STEP_PWM, min(ARC_MAX_STEP_PWM, step))
+                    diff = max(0.0, min(float(max_diff), diff + step))
+                    win_counts, win_yaw = cur, cur_yaw
+                link.send_drive(*wheel_cmd(diff))  # also the bridge keepalive
+                last_ctrl = now
+            time.sleep(0.03)
+    finally:
+        link.send_stop()
+        time.sleep(STOP_SETTLE_S)
+
+    end = link.last_counts()
+    with link.lock:
+        end_yaw = link.orient.yaw
+    path_in = forward_path_in(start, end)
+    turned = end_yaw - start_yaw
+    eff_radius = path_in / math.radians(abs(turned)) if abs(turned) > 1 else None
+    final_l, final_r = wheel_cmd(diff)
+
+    return {
+        "ok": not hit_timeout and abort_reason is None,
+        "requested_radius_in": radius_inches,
+        "requested_degrees": degrees,
+        "direction": direction,
+        "pwm_used": pwm,
+        "actual_degrees_turned": round(turned, 1),
+        "path_length_in": round(path_in, 2),
+        "effective_radius_in": None if eff_radius is None else round(eff_radius, 2),
+        "final_wheel_pwm": {"left": round(final_l), "right": round(final_r)},
+        "elapsed_s": round(time.monotonic() - t_start, 2),
+        "hit_timeout": hit_timeout,
+        "abort_reason": abort_reason,
+        "telemetry": link.telemetry_snapshot(),
+    }
+
+
+@mcp.tool()
 def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool) -> dict:
     """Raw open-loop command: drive at exactly (left_pwm, right_pwm) for duration_s
     seconds, then stop. No encoder target and no direction-aware sign correction (unlike
@@ -576,8 +758,9 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool) 
     start = link.last_counts()
     t_start = time.monotonic()
     try:
-        link.send_drive(left_pwm, right_pwm)
-        time.sleep(duration_s)
+        while time.monotonic() - t_start < duration_s:
+            link.send_drive(left_pwm, right_pwm)
+            time.sleep(min(DRIVE_KEEPALIVE_S, max(0.0, duration_s - (time.monotonic() - t_start))))
     finally:
         link.send_stop()
         time.sleep(STOP_SETTLE_S)
