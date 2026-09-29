@@ -24,15 +24,22 @@ Setup:
 Env:
     ELLAMA_SERIAL_PORT   explicit serial port (e.g. /dev/ttyUSB0); default auto-detects
                          via calibration/bridge.py's port picker.
+    ELLAMA_CAM_URL       explicit IP Webcam base URL (e.g. https://192.168.0.50:4444);
+                         default scans the local /24 subnet for the phone.
 """
 
 import atexit
 import math
 import os
 import signal
+import socket
+import ssl
 import sys
 import threading
 import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -42,6 +49,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "calibration"))
 import bridge  # noqa: E402  (calibration/bridge.py)
 
 from mcp.server.mcpserver import MCPServer as FastMCP  # mcp>=2.0 renamed FastMCP -> MCPServer
+from mcp.server.mcpserver import Image
+from PIL import Image as PILImage
 
 # ---------------------------------------------------------------------------
 # Safety constants -- sourced from DRIVING_POLICY.md, not guessed. If the policy
@@ -100,9 +109,14 @@ ARC_GAIN = 0.15
 ARC_MAX_INNER_REVERSE_PWM = int(0.9 * MAX_PWM_CEILING)  # 112; at -60 it bottomed out at ~7.9in radius
 ARC_MAX_STEP_PWM = 5
 
-# Encoder count direction when that wheel rolls forward. Verified 2026-09-28: a 6in
-# forward drive_distance read left +6.77in, right -6.66in (right encoder is mirrored).
-ENCODER_FORWARD_SIGN = (1, -1)
+# Encoder count direction when that wheel rolls forward. On 2026-09-28 this read (1, -1):
+# a 6in forward drive_distance gave left +6.77in, right -6.66in. Re-verified 2026-09-29 and
+# it is now (1, 1): a 22in forward drive_distance moved left +14617 ticks and right +14922
+# ticks, and reversing moved both negative -- the right encoder is no longer mirrored.
+# With the stale (1, -1), drive_arc's path estimate had the right wheel backwards, so its
+# curvature loop never engaged on a reverse arc. Only drive_arc uses this; re-check it
+# after any encoder wiring or firmware change.
+ENCODER_FORWARD_SIGN = (1, 1)
 
 # Verified 2026-09-27, robot on blocks, wheels free to spin: direction="forward" at
 # +50 PWM on both sides drove all four wheels backwards, confirmed by eye. -1 makes
@@ -276,6 +290,110 @@ except Exception:
     pass  # tools report the connection error; the server itself still starts
 
 
+# ---------------------------------------------------------------------------
+# Phone camera (Android IP-camera app) -- read-only vision, never moves the robot.
+# Camera images are advisory: they do NOT replace the confirmed_safe gate above.
+# ---------------------------------------------------------------------------
+
+CAM_PORTS = (8080, 4444)  # IP Webcam's default, and the one this phone is set to
+# Single-JPEG endpoints of the apps we know: "Android IP Camera" (what this phone runs, over
+# https on 4444; a snapshot takes ~5-8s) and Pavel Khlebovich's "IP Webcam".
+CAM_SNAPSHOT_PATHS = ("/video/snapshot", "/shot.jpg")
+CAM_TIMEOUT_S = 20
+CAM_MAX_WIDTH = 1280
+_cam = None  # cached (base_url, snapshot_path) once found
+# IP Webcam's optional TLS uses a self-signed cert, so verification is off -- acceptable
+# for a read-only camera on the home LAN, and this context is used for nothing else.
+_cam_ssl = ssl.create_default_context()
+_cam_ssl.check_hostname = False
+_cam_ssl.verify_mode = ssl.CERT_NONE
+
+
+def _cam_open(url, timeout):
+    return urllib.request.urlopen(url, timeout=timeout, context=_cam_ssl)
+
+_cam_lock = threading.Lock()
+
+
+def _local_ip():
+    """Primary LAN IP, via the connect-a-UDP-socket trick (sends no packets)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+def _probe(base):
+    """The snapshot path that returns a real JPEG on base, else None."""
+    for path in CAM_SNAPSHOT_PATHS:
+        try:
+            with _cam_open(base + path, CAM_TIMEOUT_S) as r:
+                if r.read(2) == b"\xff\xd8":
+                    return path
+        except Exception:
+            pass
+    return None
+
+
+def _discover_camera():
+    """Scan the local /24 for a phone camera server: cheap TCP connect on each candidate
+    port of every host first, then verify (http, then https) only the ones that answered.
+    Returns (base_url, snapshot_path)."""
+    prefix = _local_ip().rsplit(".", 1)[0]
+
+    def port_open(hp):
+        try:
+            with socket.create_connection(hp, timeout=1.5):  # phones on Wi-Fi are slow to wake
+                return hp
+        except OSError:
+            return None
+
+    targets = [(f"{prefix}.{i}", p) for i in range(1, 255) for p in CAM_PORTS]
+    with ThreadPoolExecutor(max_workers=128) as ex:
+        open_targets = [t for t in ex.map(port_open, targets) if t]
+    for host, port in open_targets:
+        for scheme in ("https", "http"):
+            base = f"{scheme}://{host}:{port}"
+            path = _probe(base)
+            if path:
+                return base, path
+    raise RuntimeError(
+        f"no phone camera found on {prefix}.0/24 ports {CAM_PORTS} -- is the app's server "
+        "started and the phone on the same Wi-Fi? Or set ELLAMA_CAM_URL."
+    )
+
+
+def _camera(rediscover=False):
+    """(base_url, snapshot_path), discovered once and cached."""
+    global _cam
+    with _cam_lock:
+        if rediscover:
+            _cam = None
+        if _cam is None:
+            explicit = os.environ.get("ELLAMA_CAM_URL", "").rstrip("/")
+            if explicit:
+                _cam = (explicit, _probe(explicit) or CAM_SNAPSHOT_PATHS[0])
+            else:
+                _cam = _discover_camera()
+        return _cam
+
+
+def _fetch_snapshot():
+    """GET a JPEG from the phone; if the cached address has gone stale (phone got a new
+    DHCP lease), rediscover once and retry."""
+    last = None
+    for attempt in (0, 1):
+        try:
+            base, path = _camera(rediscover=attempt == 1)
+            with _cam_open(base + path, CAM_TIMEOUT_S) as r:
+                return r.read()
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"camera fetch failed: {last}")
+
+
 mcp = FastMCP("ellama-robot")
 
 
@@ -362,6 +480,26 @@ def listen() -> dict:
         return _not_connected()
     link.send_listen()
     return {"ok": True, **link.telemetry_snapshot()}
+
+
+@mcp.tool()
+def look(width: int = 640):
+    """Read-only. Take a photo with the phone camera mounted on the robot and return it, so
+    you can see what the robot currently sees. Never moves the robot, no confirmation
+    needed. The phone is found automatically on the local network (or via ELLAMA_CAM_URL).
+    Slow: expect ~5-8 seconds. `width` downsizes the image (default 640, max 1280) to keep
+    it cheap. This is advisory vision only -- a JPEG glance is not an obstacle sensor, so it
+    does NOT replace asking the operator before any move."""
+    width = max(64, min(int(width), CAM_MAX_WIDTH))
+    try:
+        img = PILImage.open(BytesIO(_fetch_snapshot()))
+        if img.width > width:
+            img = img.resize((width, round(img.height * width / img.width)))
+        buf = BytesIO()
+        img.convert("RGB").save(buf, "JPEG", quality=80)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return Image(data=buf.getvalue(), format="jpeg")
 
 
 @mcp.tool()
@@ -586,9 +724,11 @@ def drive_arc(
     direction: Literal["left", "right"],
     pwm: int,
     confirmed_safe: bool,
+    max_wheel_pwm: int = MAX_PWM_CEILING,
+    travel: Literal["forward", "reverse"] = "forward",
 ) -> dict:
-    """Closed-loop curved drive: both wheels roll forward, the outer one faster, so the
-    robot drives an arc of `radius_inches` (measured to the robot's center) until the
+    """Closed-loop curved drive: both wheels roll forward (or backward, see `travel`), the
+    outer one faster, so the robot drives an arc of `radius_inches` (measured to the robot's center) until the
     IMU's gyro-integrated yaw reports `degrees` turned, then stops. degrees=360 drives a
     full circle. Same confirmed_safe gate, live-telemetry requirement and
     stop-before-moving behavior as drive_distance -- see DRIVING_POLICY.md.
@@ -607,6 +747,20 @@ def drive_arc(
     direction uses the same wheel mapping as turn_degrees. Capped at
     MAX_SINGLE_ARC_DEG=360 and MAX_SINGLE_ARC_IN=160 of path per call, radius at least
     MIN_ARC_RADIUS_IN=6.
+
+    `max_wheel_pwm` (default MAX_PWM_CEILING) caps the OUTER wheel's PWM for the whole
+    move, including anything the curvature loop asks for -- use it to honor an operator's
+    "never above N PWM" limit, since `pwm` is only the average and the outer wheel runs
+    above it. The average is reduced if needed so the geometric starting split fits
+    under the cap.
+
+    `travel="reverse"` drives the same arc backing up: both wheels roll backward and the
+    robot's heading still turns `direction` (left = counter-clockwise seen from above), so
+    the outer wheel is the LEFT one for "left" (the opposite of a forward arc) and the
+    rear sweeps out along the path. The camera cannot see behind the robot, so only back
+    up into space the operator has said is clear. Forward then reverse arcs of the same
+    direction trace an S-curve: the robot ends facing the opposite way, displaced along its
+    original axis by twice the radius and back on the same line laterally.
     """
     if link is None:
         return _not_connected()
@@ -631,9 +785,10 @@ def drive_arc(
         return {"ok": False, "error": "no live IMU telemetry -- drive_arc needs it to "
                 "measure how far around the arc it has gone", "telemetry": snap}
 
-    pwm = min(abs(int(pwm)), MAX_PWM_CEILING)
+    wheel_cap = min(abs(int(max_wheel_pwm)), MAX_PWM_CEILING)
+    pwm = min(abs(int(pwm)), wheel_cap)
     if pwm == 0:
-        return {"ok": False, "error": "pwm must be > 0"}
+        return {"ok": False, "error": "pwm and max_wheel_pwm must be > 0"}
 
     link.send_stop()
     time.sleep(STOP_SETTLE_S)
@@ -643,20 +798,26 @@ def drive_arc(
     diff = pwm * min(1.0, half_track / radius_inches)
     target_curv = 1.0 / radius_inches  # rad per inch of path
 
+    travel_sign = 1 if travel == "forward" else -1
+
     def forward_path_in(a, b):
-        # Signed, so a reversing inner wheel subtracts from the path instead of adding.
+        # Signed along the direction of travel, so a wheel running against it (the inner
+        # wheel of a tight arc) subtracts from the path instead of adding.
         l_fwd = (b[0] - a[0]) * ENCODER_FORWARD_SIGN[0]
         r_fwd = (b[1] - a[1]) * ENCODER_FORWARD_SIGN[1]
-        return (l_fwd + r_fwd) / 2.0 * in_per_tick
+        return travel_sign * (l_fwd + r_fwd) / 2.0 * in_per_tick
 
     max_diff = pwm + ARC_MAX_INNER_REVERSE_PWM
 
     def wheel_cmd(d):
-        outer = min(MAX_PWM_CEILING, pwm + d)
+        outer = min(wheel_cap, pwm + d)
         inner = max(-ARC_MAX_INNER_REVERSE_PWM, pwm - d)
-        # "left" = right wheel on the outside, matching turn_degrees' mapping.
-        l_real, r_real = (inner, outer) if direction == "left" else (outer, inner)
-        return FORWARD_PWM_SIGN * l_real, FORWARD_PWM_SIGN * r_real
+        # Forward: "left" = right wheel on the outside, matching turn_degrees' mapping.
+        # Reverse: heading turns the same way, so the outside wheel swaps sides.
+        outer_is_right = (direction == "left") == (travel == "forward")
+        l_real, r_real = (inner, outer) if outer_is_right else (outer, inner)
+        return (FORWARD_PWM_SIGN * travel_sign * l_real,
+                FORWARD_PWM_SIGN * travel_sign * r_real)
 
     start = link.last_counts()
     with link.lock:
@@ -714,6 +875,7 @@ def drive_arc(
         "requested_radius_in": radius_inches,
         "requested_degrees": degrees,
         "direction": direction,
+        "travel": travel,
         "pwm_used": pwm,
         "actual_degrees_turned": round(turned, 1),
         "path_length_in": round(path_in, 2),

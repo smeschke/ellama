@@ -46,14 +46,20 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | Tool | Moves the robot? | Needs `confirmed_safe`? |
 | --- | --- | --- |
 | `read_telemetry()` | No | — |
+| `look(width=640)` | No | — |
 | `zero_odometry()` | No | — |
 | `stop()` | Commands zero PWM (active braking) | No — always safe |
 | `listen()` | Stops and releases control to the stick controller | No — always safe |
 | `connect(port=None)` | No | — |
 | `drive_distance(distance_inches, direction, pwm, confirmed_safe)` | Yes | Yes |
 | `turn_degrees(degrees, direction, pwm, confirmed_safe)` | Yes | Yes |
-| `drive_arc(radius_inches, degrees, direction, pwm, confirmed_safe)` | Yes (curved; 360° = full circle) | Yes |
+| `drive_arc(radius_inches, degrees, direction, pwm, confirmed_safe, max_wheel_pwm=125, travel="forward")` | Yes (curved; 360° = full circle; `travel="reverse"` backs up along the arc) | Yes |
 | `jog(left_pwm, right_pwm, duration_s, confirmed_safe)` | Yes (raw, time-based) | Yes |
+
+`look()` returns a photo from the phone camera on the robot (Android "IP Camera" or "IP
+Webcam" app). The phone is found by scanning the local /24 for ports 8080/4444, or set
+`ELLAMA_CAM_URL` (e.g. `https://192.168.0.54:4444`) to skip the scan. A snapshot takes
+~5-8s. It is advisory vision only and does not replace `confirmed_safe`.
 
 `drive_distance` and `turn_degrees` are closed-loop: they stop themselves once the
 target is confirmed reached, or after a generous timeout, whichever comes first.
