@@ -27,7 +27,7 @@ Drive-a-foot workflow:
      turn estimate depends on it.
 
 Terminal commands:  z  |  d <inches>  |  t <degrees>  |  show  |  help
-Close the window or Ctrl+C to quit. Nothing is recorded.
+Close the window or Ctrl+C to quit. Nothing is recorded unless you pass --csv.
 
 Limits: distance calibration assumes the robot drove straight (both wheels
 scaled together); the IMU yaw shown is gyro-integrated and drifts slowly.
@@ -35,12 +35,15 @@ scaled together); the IMU yaw shown is gyro-integrated and drifts slowly.
 Usage:
     python3 calibration/live_view.py
     python3 calibration/live_view.py --port /dev/ttyUSB0 --window 30
+    python3 calibration/live_view.py --csv run1.csv     # also save every sample
+    python3 calibration/live_view.py --csv              # auto-named live_<timestamp>.csv
 
 Requires: matplotlib
 """
 
 import argparse
 import collections
+import csv
 import queue
 import sys
 import threading
@@ -66,6 +69,8 @@ def main():
     parser = argparse.ArgumentParser(description="Live read-only encoder + IMU viewer and calibrator.")
     parser.add_argument("--port", help="Serial port for the bridge ESP32 (default: auto-detect)")
     parser.add_argument("--window", type=float, default=20.0, help="Seconds of history to show (default: 20)")
+    parser.add_argument("--csv", nargs="?", const="auto", metavar="FILE",
+                        help="Also record every sample to a CSV (no FILE = live_<timestamp>.csv in the current directory)")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -195,6 +200,30 @@ def main():
 
     fig.canvas.mpl_connect("key_press_event", on_key)
 
+    # Optional CSV recording: one row per incoming ENC or IMU sample, holding the
+    # latest value of the other stream so every row is fully populated.
+    csv_file = csv_writer = None
+    if args.csv:
+        csv_path = args.csv
+        if csv_path == "auto":
+            csv_path = time.strftime("live_%Y%m%d_%H%M%S.csv")
+        csv_file = open(csv_path, "w", newline="")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(["time_s", "source", "dist_l_in", "dist_r_in", "dist_avg_in",
+                             "speed_l_in_s", "speed_r_in_s", "enc_heading_deg",
+                             "pitch_deg", "roll_deg", "yaw_deg", "acc_x_g", "acc_y_g", "acc_z_g"])
+        print(f"Recording to {csv_path}")
+    held = {"speed_l": 0.0, "speed_r": 0.0, "acc": (0.0, 0.0, 0.0)}
+
+    def log_row(t, source):
+        if csv_writer is None:
+            return
+        csv_writer.writerow([f"{t:.3f}", source,
+                             f"{enc.dist_l:.4f}", f"{enc.dist_r:.4f}", f"{enc.dist_avg:.4f}",
+                             f"{held['speed_l']:.4f}", f"{held['speed_r']:.4f}", f"{enc.heading_deg:.3f}",
+                             f"{ori.pitch:.3f}", f"{ori.roll:.3f}", f"{ori.yaw:.3f}",
+                             *(f"{a:.4f}" for a in held["acc"])])
+
     def drain():
         while True:
             try:
@@ -210,12 +239,16 @@ def main():
                 speed_r.append(sr if sr is not None else 0.0)
                 enc_hdg.append(enc.heading_deg)
                 last_seen["enc"] = t
+                held["speed_l"], held["speed_r"] = speed_l[-1], speed_r[-1]
+                log_row(t, "ENC")
             elif kind == "IMU":
                 agx, agy, agz, *_ = ori.update(*data)
                 t_imu.append(t)
                 pitch.append(ori.pitch); roll.append(ori.roll); yaw.append(ori.yaw)
                 acc_x.append(agx); acc_y.append(agy); acc_z.append(agz)
                 last_seen["imu"] = t
+                held["acc"] = (agx, agy, agz)
+                log_row(t, "IMU")
 
     def trim(now, *groups):
         for tq, *qs in groups:
@@ -276,6 +309,8 @@ def main():
     finally:
         reader.stop()
         ser.close()
+        if csv_file:
+            csv_file.close()
     return anim
 
 
