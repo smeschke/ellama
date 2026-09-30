@@ -74,6 +74,15 @@ robot is safe to move.
 > 60->6.13, 80->9.36, 100->12.03, 125->14.46. Roughly linear, ~0.14 in/s per PWM count
 > above the deadband. Re-run the script per robot; this is unit1's curve, not a
 > universal one.
+>
+> Re-run (2026-09-29, "unit1", painted wood, 4ft clear on all sides, pwm 40-125, 12in
+> each way): `calibration/speed_characterization_unit1_20260929_172444.csv`. Reproduces
+> the 09-27 curve within ~4%: 50->3.92/3.82in/s (fwd/rev), 60->5.92/5.87, 80->9.28/9.23,
+> 100->11.91/11.59, 125->14.32/14.33. Deadband still between pwm 40 and 50, and this time
+> pwm 40 failed to move in *both* directions (0.02in/s fwd, 0.03in/s rev), so the 09-27
+> reverse move at 40 was marginal. Forward and reverse agree within 3%. A 12in request
+> overshoots by +0.7in at pwm 50, +1.3 at 60, +2.8 at 80, ~+4 at 100 and ~+5 at 125
+> (coast past the stop point). The 09-27 numbers above were not stale for this unit.
 
 ## 2. Acceleration and stopping
 
@@ -116,6 +125,19 @@ right).
 > way, most likely the right-side wheel/motor having a slight speed or effective-diameter
 > edge over the left. Only one run so far (not the 3x-forward + 3x-reverse the "How"
 > above asks for) -- re-run for a real average and to check reverse behaves the same way.
+>
+> Re-run (2026-09-29, "unit1", painted wood, 3x forward + 3x reverse, 30in at pwm 80,
+> odometry zeroed before each run): `calibration/drift_characterization_unit1_20260929_173403.csv`.
+> Right wheel again travels farther than left in both directions: forward left/right
+> 30.2/33.4, 31.5/33.3, 31.4/33.2in; reverse ~32.1/33.5in on all three. That is ~4-6%
+> more on the right (10% on the first forward run, which looks like a warm-up outlier).
+> IMU yaw: +2.8, +3.4, +3.2deg forward (robot curves left), -3.3, -3.3, -3.9deg reverse,
+> so a forward-and-back trip largely cancels. Forward runs 2 and 3 agree within ~0.2deg IMU yaw,
+> so the drift is systematic, not noise. Encoder heading reads +5 to +9deg forward vs
+> ~3deg on the IMU -- the same wheel-scrub overestimate as section 4, so use the IMU for
+> heading. drive_distance overshoots a 30in request by ~2.1in forward and ~2.8in reverse
+> at pwm 80. Distances matched what the operator saw on the floor; no separate tape
+> measurement of lateral offset was logged for this re-run.
 
 ## 4. Turning in place
 
@@ -145,6 +167,16 @@ calibration (`d <inches>`) first, because the turn estimate depends on it.
 > most pronounced near the deadband (~50% at pwm 60) and converging toward parity
 > (~6%) at pwm 125. Read as this unit's individual wheel-alignment asymmetry, not a
 > universal number — re-run the script per robot.
+>
+> Re-run (2026-09-29, "unit1", painted wood, pwm 50-125, 90deg each way):
+> `calibration/turn_characterization_unit1_20260929_172614.csv`. Deadband still between
+> pwm 50 and 60 (at 50 left reached only 25.5deg and right 2.7deg in 12s). Turn rate at
+> pwm 60/80/100/125: left 9.95/26.7/37.5/50.1deg/s, right 13.6/28.1/39.4/51.8deg/s --
+> right still faster than left, +36% at pwm 60 shrinking to +3.5% at 125 (09-27: ~+50%
+> and ~+6%). Achieved angle on a 90deg request (IMU): 91 at pwm 60, ~94 at 80, ~97 at
+> 100, ~102 at 125, i.e. overshoot grows with speed (~1deg to ~12deg). The encoder
+> estimate read ~150deg per real 90deg at pwm 80 and above, ~1.7x too high (09-27: ~2x),
+> same scrub effect; the IMU stays the reliable number.
 
 ## 5. Latency and link loss (safety)
 

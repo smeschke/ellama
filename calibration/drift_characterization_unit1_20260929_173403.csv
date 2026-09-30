@@ -1,0 +1,7 @@
+robot_id,run,direction,pwm,requested_in,actual_in,ok,left_in,right_in,enc_heading_deg,imu_yaw_deg
+unit1,1,forward,80,30.0,31.73,True,30.206,33.359,9.03,2.81
+unit1,1,reverse,80,30.0,32.81,True,-32.12,-33.519,-4.01,-3.26
+unit1,2,forward,80,30.0,32.37,True,31.515,33.306,5.13,3.37
+unit1,2,reverse,80,30.0,32.79,True,-32.093,-33.475,-3.96,-3.3
+unit1,3,forward,80,30.0,32.27,True,31.411,33.16,5.01,3.15
+unit1,3,reverse,80,30.0,32.83,True,-32.079,-33.494,-4.05,-3.91
