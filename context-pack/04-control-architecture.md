@@ -21,6 +21,11 @@ ESP-NOW. No computer involved. This is what ships working.
 ESP32 acting as a radio bridge. The Pi can be connected to the internet for
 teleoperation.
 
+One constraint: only one sender may transmit at a time. Commands do not work properly when
+two different ESP32s are sending them, because the motor board follows whichever packet
+arrives last. When using the computer bridge, unplug the stick controller from its battery;
+when using the stick controller, put the bridge in listen mode (or unplug it).
+
 The handheld path needs none of the others to exist. That ordering matters: the robot is
 complete without compute, and compute is an expansion rather than a dependency.
 

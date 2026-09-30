@@ -24,6 +24,12 @@ The design leans on that. eLlama supplies only the slow-moving parts (motors, ge
 | Charging | Passive dock: drive in, pogo pins meet contacts, dumb 12 V charger runs |
 | Weight | About 32 lb dry, 37 lb with one battery, 42 lb with two |
 
+## How it works
+
+![System architecture](images/system_architecture.png)
+
+Drive the robot with the stick controller or with a computer through the USB bridge, one at a time, with no firmware changes. Both send the same drive packets over ESP-NOW to the motor board. The encoder and IMU boards broadcast telemetry that the bridge relays back to the computer.
+
 ## Status
 
 **Works:** manual and remote driving, docking by driving in, encoder and IMU telemetry, encoder-closed-loop moves ("go forward 10 inches") from Python or an AI agent through the MCP server, camera and lidar streaming over the network, and the calibrated simulators. Over 13 miles of field runs are logged in [`context-pack/Testing.csv`](context-pack/Testing.csv), failures included.

@@ -23,3 +23,5 @@ Arduino sketches for every ESP32 in the system — one for the controller, one f
 Standard ESP32 Arduino toolchain — install the ESP32 board package, pick your board, flash over USB. The controller flashes through the same USB-C port that powers it, no disassembly.
 
 The single stick controller broadcasts, so it drives any `robot_motor_bts7960.ino` listening on the same WiFi channel — no MAC address configuration needed. `computer_bridge.ino` broadcasts the same way once it is sent a drive line, so it works when driving from a computer instead of the stick; until then it only listens, so it can log telemetry while you drive with the stick.
+
+**Only one ESP32 should transmit drive commands at a time.** The motor board follows whichever `DrivePacket` arrives last, so two senders fight and neither works properly. Unplug the stick controller from its battery when driving from the computer bridge, and put the bridge in listen mode (send `listen`) or unplug it when driving with the stick.

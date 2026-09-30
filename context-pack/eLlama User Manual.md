@@ -93,7 +93,7 @@ The USB port on the onboard Llama Motor Board is accessible, and users are encou
 
 ### 2.2 Powering Up
 
-Start with the robot, compute, and Single-Stick Controller off. Turn on the robot, then turn on either the Single-Stick Controller or the compute module.
+Start with the robot, compute, and Single-Stick Controller off. Turn on the robot, then turn on either the Single-Stick Controller or the compute module, not both (see 2.4).
 
 ### 2.3 Network Configuration
 
@@ -101,7 +101,14 @@ If the robot is being controlled with the Single-Stick Controller, the ESP-NOW p
 
 ### 2.4 Single-Stick Controller
 
-When running the stock firmware, there is no pairing. The ESP32 in the Single-Stick Controller broadcasts a 12-byte struct, and every ESP32 that is listening will try to execute the command.
+When running the stock firmware, there is no pairing. The ESP32 in the Single-Stick Controller broadcasts a 4-byte struct, and every ESP32 that is listening will try to execute the command.
+
+**Use one command source at a time.** Commands do not work properly when two different ESP32s are transmitting them: the motor board executes whichever packet arrives last, so the two sources fight. To ensure proper operation:
+
+- When driving with the computer bridge, unplug the Single-Stick Controller from its battery.
+- When driving with the Single-Stick Controller, put the computer bridge in listen mode (send `listen`) or unplug it.
+
+No firmware changes are needed to switch between them.
 
 ### 2.5 Battery Charging
 
