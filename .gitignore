@@ -2,3 +2,5 @@ video_evidence/
 __pycache__/
 build/
 mcp_server/.venv/
+*.mp4
+*~
