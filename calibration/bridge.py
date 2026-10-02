@@ -8,6 +8,8 @@ scripts here never send one, so they can run while you drive with the stick.
 Serial lines this understands:
   ENC <left> <right> <ms>                  cumulative AS5600 counts per wheel
   IMU <ax> <ay> <az> <gx> <gy> <gz> <ms>   raw accel LSB (+-2g), bias-corrected gyro LSB (+-250 dps)
+  CMD <left> <right>                       a drive command the bridge overheard (e.g. from the stick);
+                                           needs a computer_bridge.ino new enough to relay them
 
 Measured constants (wheel size, gear ratio, track width) live in config.json
 next to this file, so live_view.py can write calibration results there instead
@@ -118,12 +120,14 @@ class SerialReader:
 
 def parse_line(raw):
     """Return ("ENC", (left, right, ms)), ("IMU", (ax, ay, az, gx, gy, gz, ms)),
-    or (None, decoded_text) for anything else (bridge chatter, garbage)."""
+    ("CMD", (left, right)), or (None, decoded_text) for anything else (bridge chatter, garbage)."""
     text = raw.decode("ascii", errors="ignore").strip()
     parts = text.split()
     try:
         if parts and parts[0] == "ENC" and len(parts) == 4:
             return "ENC", tuple(int(x) for x in parts[1:4])
+        if parts and parts[0] == "CMD" and len(parts) == 3:
+            return "CMD", tuple(int(x) for x in parts[1:3])
         if parts and parts[0] == "IMU" and len(parts) == 8:
             return "IMU", tuple(int(x) for x in parts[1:8])
     except ValueError:

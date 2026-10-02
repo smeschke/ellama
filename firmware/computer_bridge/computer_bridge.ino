@@ -21,6 +21,9 @@
 // DrivePacket/EncoderPacket by its own distinct length (16 bytes), printed as
 // "IMU <ax> <ay> <az> <gx> <gy> <gz> <ms>".
 //
+// Also relays drive commands heard from other senders (the stick) as "CMD <left> <right>",
+// so a PC-side recorder can log what the human commanded.
+//
 // Packet lengths: Drive = 4, Encoder = 12, Imu = 16.
 //
 // Listen-only by default: after boot this bridge transmits NOTHING, so it
@@ -90,7 +93,15 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
     Serial.printf("IMU %d %d %d %d %d %d %lu\n",
                   p.ax, p.ay, p.az, p.gx, p.gy, p.gz, (unsigned long)p.ms);
   }
-  // anything else (e.g. a stray DrivePacket echo) is ignored
+  else if (len == sizeof(DrivePacket)) {
+    // The stick's (or anyone's) drive command, heard on the same channel. ESP-NOW never
+    // delivers a sender its own packets, so this is never our own transmission. Lets the
+    // computer log what the human commanded alongside the telemetry.
+    DrivePacket p;
+    memcpy(&p, data, sizeof(p));
+    Serial.printf("CMD %d %d\n", p.left, p.right);
+  }
+  // anything else is ignored
 }
 
 void readSerialCommand() {
