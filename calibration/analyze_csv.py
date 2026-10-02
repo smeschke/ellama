@@ -43,7 +43,7 @@ def load(path):
         rows = list(csv.DictReader(f))
     if not rows:
         raise SystemExit(f"{path}: no data rows")
-    cols = {k: [float(r[k]) if k != "source" else r[k] for r in rows] for k in rows[0]}
+    cols = {k: [float(r[k]) if k not in ("source", "note") else r[k] for r in rows] for k in rows[0]}
     return cols
 
 
@@ -51,7 +51,7 @@ def segments(cols, enc_idx):
     """Split encoder sample indices into runs between zeros (distance and
     heading both snap back to ~0 after being non-zero)."""
     dist = cols["dist_avg_in"]
-    segs, start = [], 0
+    segs, start = [], enc_idx[0]
     for a, b in zip(enc_idx, enc_idx[1:]):
         if abs(dist[a]) > 1.0 and abs(dist[b]) < 0.05:
             segs.append((start, a))
@@ -62,8 +62,16 @@ def segments(cols, enc_idx):
 
 def summarize(cols, enc_idx):
     t = cols["time_s"]
+    src = cols["source"]
     print(f"{len(t)} rows over {t[-1] - t[0]:.1f} s "
-          f"({len(enc_idx)} encoder, {len(t) - len(enc_idx)} imu samples)")
+          f"({len(enc_idx)} encoder, {src.count('IMU')} imu samples)")
+    # MARK / PHOTO rows come from the MCP server's recorder (see mcp_server/recording.py).
+    notes = [i for i, s_ in enumerate(src) if s_ in ("MARK", "PHOTO")]
+    if notes:
+        print("\nmarkers:")
+        for i in notes:
+            print(f"  t = {t[i]:7.1f} s  {src[i]:5}  dist {cols['dist_avg_in'][i]:+8.2f} in  "
+                  f"{cols['note'][i]}")
     for n, (si, ei) in enumerate(segments(cols, enc_idx), 1):
         idx = enc_idx[si:ei + 1]
         moving = [i for i in idx

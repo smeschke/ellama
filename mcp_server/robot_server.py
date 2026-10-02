@@ -47,6 +47,10 @@ import serial
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "calibration"))
 import bridge  # noqa: E402  (calibration/bridge.py)
+import recording  # noqa: E402  (mcp_server/recording.py)
+import line_vision  # noqa: E402  (mcp_server/line_vision.py)
+import camera_stream  # noqa: E402  (mcp_server/camera_stream.py)
+import line_follow  # noqa: E402  (mcp_server/line_follow.py)
 
 from mcp.server.mcpserver import MCPServer as FastMCP  # mcp>=2.0 renamed FastMCP -> MCPServer
 from mcp.server.mcpserver import Image
@@ -160,6 +164,8 @@ class RobotLink:
         self.enc = bridge.EncoderState(self.cfg)
         self.orient = bridge.OrientationState()
         self.lock = threading.Lock()
+        self.recorder = recording.Recorder(Path(__file__).resolve().parent.parent / "recordings")
+        self.video = None  # recording.VideoRecorder while a recording has video on
         self.last_enc_wall = None  # time.monotonic() of the last ENC packet seen
         self.last_imu = None
         self.last_imu_wall = None  # time.monotonic() of the last IMU packet seen
@@ -180,11 +186,15 @@ class RobotLink:
             with self.lock:
                 if kind == "ENC":
                     left, right, ms = payload
-                    self.enc.update(left, right, ms)
+                    sl, sr = self.enc.update(left, right, ms)
                     self.last_enc_wall = time.monotonic()
+                    self.recorder.on_enc(self.enc, self.orient, sl, sr)
+                elif kind == "CMD":
+                    self.recorder.on_cmd(*payload)  # the stick's command, overheard by the bridge
                 elif kind == "IMU":
                     ax, ay, az, gx, gy, gz, ms = payload
-                    self.orient.update(ax, ay, az, gx, gy, gz, ms)
+                    acc = self.orient.update(ax, ay, az, gx, gy, gz, ms)[:3]
+                    self.recorder.on_imu(self.enc, self.orient, acc)
                     self.last_imu = dict(ax=ax, ay=ay, az=az, gx=gx, gy=gy, gz=gz, ms=ms)
                     self.last_imu_wall = time.monotonic()
 
@@ -244,6 +254,10 @@ class RobotLink:
 
     def close(self):
         self.emergency_stop()
+        if self.video is not None:
+            self.video.stop()
+            self.video = None
+        self.recorder.stop()
         self._stop_pump.set()
         self.reader.stop()  # joins bridge.py's own reader thread before the port closes
         try:
@@ -276,6 +290,7 @@ def _connect(port=None):
 
 
 def _shutdown():
+    _follow["abort"].set()
     if link is not None:
         link.emergency_stop()
 
@@ -299,8 +314,18 @@ CAM_PORTS = (8080, 4444)  # IP Webcam's default, and the one this phone is set t
 # Single-JPEG endpoints of the apps we know: "Android IP Camera" (what this phone runs, over
 # https on 4444; a snapshot takes ~5-8s) and Pavel Khlebovich's "IP Webcam".
 CAM_SNAPSHOT_PATHS = ("/video/snapshot", "/shot.jpg")
+# Live MJPEG endpoints of the same apps, tried in order: "Android IP Camera" (what this phone
+# runs; ~15 fps at 360x480 as of 2026-10-02) and IP Webcam.
+CAM_STREAM_PATHS = ("/video/mjpeg", "/video")
 CAM_TIMEOUT_S = 20
 CAM_MAX_WIDTH = 1280
+
+# auto_photo (start_recording): take a photo each time the robot comes to rest after moving.
+AUTO_PHOTO_STILL_S = 0.7          # both wheels below STILL_SPEED_IN_S for this long = stopped
+AUTO_PHOTO_STILL_SPEED_IN_S = 0.5
+AUTO_PHOTO_MIN_TRAVEL_IN = 4.0    # summed |left|+|right| wheel travel since the last photo
+AUTO_PHOTO_MIN_TURN_DEG = 10.0    # or this much IMU yaw change
+AUTO_PHOTO_POLL_S = 0.1
 _cam = None  # cached (base_url, snapshot_path) once found
 # IP Webcam's optional TLS uses a self-signed cert, so verification is off -- acceptable
 # for a read-only camera on the home LAN, and this context is used for nothing else.
@@ -394,6 +419,35 @@ def _fetch_snapshot():
     raise RuntimeError(f"camera fetch failed: {last}")
 
 
+def _open_stream():
+    """Open the phone's MJPEG stream (for recording). Rediscovers the phone once if the
+    cached address is stale. Returns a file-like to read multipart MJPEG from."""
+    last = None
+    for attempt in (0, 1):
+        base, _ = _camera(rediscover=attempt == 1)
+        for path in CAM_STREAM_PATHS:
+            try:
+                return _cam_open(base + path, 10)
+            except Exception as e:
+                last = e
+    raise RuntimeError(f"no video stream: {last}")
+
+
+_follow = {"running": False, "abort": threading.Event(), "status": "idle", "info": {}, "result": None,
+           "ended": threading.Event()}
+_frames = None  # camera_stream.FrameSource, created on first use
+
+FOLLOW_MAX_CRUISE_PWM = 70  # start_line_follow's speed_pwm is capped here (turns may go to OUTER_MAX)
+
+
+def _frame_source():
+    global _frames
+    if _frames is None:
+        _frames = camera_stream.FrameSource(_open_stream)
+    _frames.start()
+    return _frames
+
+
 mcp = FastMCP("ellama-robot")
 
 
@@ -402,6 +456,8 @@ def _not_connected():
 
 
 def _confirm_gate(confirmed_safe: bool):
+    if _follow["running"]:
+        return {"ok": False, "error": "a line-follow run is in progress; call stop() first"}
     if confirmed_safe:
         return None
     return {
@@ -463,6 +519,7 @@ def stop() -> dict:
     """Immediately command zero PWM (active braking, not coasting -- see
     DRIVING_POLICY.md). Always safe to call with no confirmation, any time, including
     when nothing is currently moving."""
+    _follow["abort"].set()
     if link is None:
         return _not_connected()
     link.send_stop()
@@ -476,6 +533,7 @@ def listen() -> dict:
     matching computer_bridge.ino's serial protocol). Use this when done driving so a
     human can pick up the stick without the two fighting on the same ESP-NOW channel.
     Always safe to call, no confirmation needed."""
+    _follow["abort"].set()
     if link is None:
         return _not_connected()
     link.send_listen()
@@ -500,6 +558,181 @@ def look(width: int = 640):
     except Exception as e:
         return {"ok": False, "error": str(e)}
     return Image(data=buf.getvalue(), format="jpeg")
+
+
+@mcp.tool()
+def line_view(width: int = 640):
+    """Read-only. Take a phone-camera photo, find the dark tape line in it, and return the
+    photo with the detection drawn on (red = dark pixels, green dots = line center per band
+    with its lateral offset in inches) plus the numbers: `offset_in` (+ = line is right of
+    the robot's center, nearest band), `lean_deg` (+ = line leans right going away),
+    `lookahead_offset_in` (farthest band) and `found`. Offsets use the known 3/4in tape
+    width as the scale, so they're approximate. Never moves the robot, no confirmation
+    needed; same ~5-8s snapshot as look()."""
+    width = max(64, min(int(width), CAM_MAX_WIDTH))
+    try:
+        import cv2
+        import numpy as np
+        bgr = cv2.imdecode(np.frombuffer(_fetch_snapshot(), np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None:
+            return {"ok": False, "error": "camera returned something that isn't an image"}
+        if bgr.shape[1] > width:
+            bgr = cv2.resize(bgr, (width, round(bgr.shape[0] * width / bgr.shape[1])))
+        result, annotated = line_vision.analyze(bgr)
+        ok, jpg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    import json
+    return [json.dumps(result), Image(data=jpg.tobytes(), format="jpeg")]
+
+
+@mcp.tool()
+def start_recording(name: Optional[str] = None, auto_photo: bool = False,
+                    video: bool = True) -> dict:
+    """Read-only. Start recording telemetry to recordings/<name>/<name>.csv (name defaults
+    to run_<timestamp>): one row per encoder/IMU sample, in the same format as
+    calibration/live_view.py --csv, so analyze_csv.py reads it. Works while the stick
+    controller drives -- this server sends nothing to the robot unless a drive tool is
+    called. Never moves the robot, no confirmation needed. Use add_marker() and
+    take_photo() during the recording, stop_recording() when done.
+
+    auto_photo=True: also take a photo by itself whenever the robot comes to rest (wheels
+    still for ~0.7 s) after moving at least ~4 in of wheel travel or ~10 deg of yaw since
+    the last photo, plus one at the start once still. Each PHOTO row is stamped when the
+    robot stopped; if it moves again before the snapshot arrives (~5-8 s), a MARK row
+    says so. Hold still until you've seen it happen, or accept the flag.
+
+    video=True (default): also record the phone's live video stream to video.mp4 in the
+    recording folder, plus video_times.csv (when each frame arrived, on the same time_s
+    clock as the CSV -- use it to sync, since the phone's frame rate varies). Also saves
+    commands.csv: every drive command the stick sent (time_s,left,right), if the bridge
+    has the firmware that relays them. A failed video start doesn't stop telemetry
+    recording; it's reported in the result."""
+    if link is None:
+        return _not_connected()
+    try:
+        path = link.recorder.start(name)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    video_status = "off"
+    if video:
+        link.video = recording.VideoRecorder(_open_stream, link.recorder.now, link.recorder.dir)
+        link.video.start()
+        video_status = "recording (check video_error in stop_recording if video.mp4 is empty)"
+    if auto_photo:
+        threading.Thread(target=_auto_photo_loop, args=(link, path), daemon=True).start()
+    return {"ok": True, "csv": str(path), "auto_photo": auto_photo, "video": video_status,
+            **link.telemetry_snapshot()}
+
+
+@mcp.tool()
+def add_marker(text: str) -> dict:
+    """Read-only. While recording, write a MARK row (with the current distance, heading
+    and orientation, and `text` in the note column) into the CSV, e.g. "start of ramp" or
+    "wheel slipped". Never moves the robot."""
+    if link is None:
+        return _not_connected()
+    with link.lock:
+        t = link.recorder.mark(link.enc, link.orient, "MARK", text)
+    if t is None:
+        return {"ok": False, "error": "not recording; call start_recording() first"}
+    return {"ok": True, "time_s": round(t, 3), "note": text}
+
+
+_photo_lock = threading.Lock()  # path choice + PHOTO row must be atomic across threads
+
+
+def _capture_photo(lnk, note=""):
+    """Stamp a PHOTO row now, then fetch and save the snapshot. Returns (result dict,
+    stamped pose (dist_l, dist_r, yaw)) -- the pose lets callers tell if the robot moved
+    during the slow fetch."""
+    rec = lnk.recorder
+    with _photo_lock:
+        path = rec.next_photo_path()
+        label = f"{path.name} {note}".strip()
+        with lnk.lock:
+            t = rec.mark(lnk.enc, lnk.orient, "PHOTO", label)
+            pose = (lnk.enc.dist_l, lnk.enc.dist_r, lnk.orient.yaw)
+    try:
+        path.write_bytes(_fetch_snapshot())
+    except Exception as e:
+        with lnk.lock:
+            rec.mark(lnk.enc, lnk.orient, "MARK", f"{path.name} FAILED: {e}")
+        return {"ok": False, "error": str(e)}, pose
+    return {"ok": True, "photo": str(path), "time_s": None if t is None else round(t, 3)}, pose
+
+
+def _auto_photo_loop(lnk, csv_path):
+    """Watches for the robot coming to rest and photographs it. Runs until this recording
+    (identified by its csv path) ends."""
+    rec = lnk.recorder
+    last = None          # pose at the last photo: (dist_l, dist_r, yaw); None until the first
+    still_since = None
+    while rec.active and rec.csv_path == csv_path:
+        time.sleep(AUTO_PHOTO_POLL_S)
+        now = time.monotonic()
+        sl, sr = rec.speed
+        if max(abs(sl), abs(sr)) >= AUTO_PHOTO_STILL_SPEED_IN_S:
+            still_since = None
+            continue
+        if still_since is None:
+            still_since = now
+        if now - still_since < AUTO_PHOTO_STILL_S:
+            continue
+        with lnk.lock:
+            cur = (lnk.enc.dist_l, lnk.enc.dist_r, lnk.orient.yaw)
+        if last is not None:
+            travel = abs(cur[0] - last[0]) + abs(cur[1] - last[1])
+            turn = abs(cur[2] - last[2])
+            if travel < AUTO_PHOTO_MIN_TRAVEL_IN and turn < AUTO_PHOTO_MIN_TURN_DEG:
+                continue
+        result, pose = _capture_photo(lnk, "auto")
+        last = pose
+        with lnk.lock:
+            after = (lnk.enc.dist_l, lnk.enc.dist_r, lnk.orient.yaw)
+            moved = (abs(after[0] - pose[0]) + abs(after[1] - pose[1]) >= 1.0
+                     or abs(after[2] - pose[2]) >= 3.0)
+            if moved and result.get("ok") and rec.csv_path == csv_path:
+                rec.mark(lnk.enc, lnk.orient, "MARK",
+                         f"{Path(result['photo']).name} robot moved during capture")
+        still_since = None
+
+
+@mcp.tool()
+def take_photo(note: str = "") -> dict:
+    """Read-only. While recording, take a full-size photo with the phone camera and save
+    it next to the CSV (photo_001.jpg, ...), with a PHOTO row at the moment of the request
+    (the snapshot itself takes ~5-8 seconds). Never moves the robot. Use look() instead to
+    just view the camera without saving."""
+    if link is None:
+        return _not_connected()
+    if not link.recorder.active:
+        return {"ok": False, "error": "not recording; call start_recording() first"}
+    result, _ = _capture_photo(link, note)
+    return result
+
+
+@mcp.tool()
+def stop_recording() -> dict:
+    """Read-only. Stop recording and close the CSV. Returns its path, duration and how
+    many samples, markers and photos were saved. Never moves the robot."""
+    if link is None:
+        return _not_connected()
+    video_summary = None
+    if link.video is not None:
+        video_summary = link.video.stop()
+        link.video = None
+    summary = link.recorder.stop()
+    if summary is None:
+        return {"ok": False, "error": "not recording"}
+    out = {"ok": True, **summary}
+    if video_summary is not None:
+        out["video"] = video_summary
+    if summary["commands"] == 0:
+        out["note"] = ("no stick commands were captured: either the stick wasn't driven, or "
+                       "the bridge still has firmware that doesn't relay them (reflash "
+                       "firmware/computer_bridge/computer_bridge.ino)")
+    return out
 
 
 @mcp.tool()
@@ -939,6 +1172,157 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool) 
         "elapsed_s": round(time.monotonic() - t_start, 2),
         "telemetry": link.telemetry_snapshot(),
     }
+
+
+def _follow_loop(lnk, src, ctl, rec_dir, t_rec):
+    """Runs on its own thread for the whole run: newest frame -> detect -> controller -> wheels.
+    Re-sends the last command at least every DRIVE_KEEPALIVE_S (the bridge goes listen-only
+    after 500ms of silence) and ends the moment the controller says so, the operator calls
+    stop(), or encoder telemetry dies. Always finishes with a stop."""
+    import csv
+    import cv2
+    log = open(rec_dir / "follow_log.csv", "w", newline="")
+    lw = csv.writer(log)
+    lw.writerow(["time_s", "frame", "found", "n_bands", "e_near_in", "phi_deg", "spin", "f", "t",
+                 "left_raw", "right_raw", "status"])
+    times = open(rec_dir / "video_times.csv", "w", newline="")
+    tw = csv.writer(times)
+    tw.writerow(["frame", "time_s"])
+    writer = None
+    prev_x, last_seq, last_send = None, -1, 0.0
+    cmd = line_follow.Command()
+    send_now = False
+    reason = None
+    try:
+        ctl.start(time.monotonic())
+        while True:
+            now = time.monotonic()
+            if _follow["abort"].is_set():
+                ctl.stop()
+                reason = "stopped"
+                break
+            snap_age = lnk.telemetry_snapshot()["telemetry_age_s"]
+            if snap_age is None or snap_age > TELEMETRY_STALE_S:
+                ctl.status = "telemetry_stale"
+                reason = "telemetry_stale"
+                break
+            fr = src.latest()
+            if fr is not None and fr.seq != last_seq:
+                last_seq = fr.seq
+                res, _ = line_vision.analyze(fr.img, prev_x_frac=prev_x)
+                prev_x = res.get("x_frac") if res["found"] else None
+                cmd = ctl.update(res, fr.t)
+                t = t_rec()
+                if writer is None:
+                    h, w = fr.img.shape[:2]
+                    writer = cv2.VideoWriter(str(rec_dir / "video.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 15, (w, h))
+                writer.write(fr.img)
+                tw.writerow([fr.seq, f"{t:.3f}"])
+                i = cmd.info
+                lw.writerow([f"{t:.3f}", fr.seq, int(res["found"]), res["n_bands"], i.get("e_in", ""),
+                             i.get("phi_deg", ""), int(bool(i.get("spin", False))), i.get("f", ""),
+                             i.get("t", ""), cmd.left_raw, cmd.right_raw, cmd.status])
+                _follow["info"] = dict(i, status=cmd.status, fps=round(src.fps(), 1))
+                log.flush()
+                times.flush()   # a crash mid-run must not lose the data that explains it
+                send_now = True
+            else:
+                cmd = ctl.check(now)
+            if cmd.status != "running":
+                reason = cmd.status
+                break
+            if send_now or now - last_send >= DRIVE_KEEPALIVE_S:
+                if _follow["abort"].is_set():   # stop() may have landed since the check above
+                    continue
+                lnk.send_drive(cmd.left_raw, cmd.right_raw)
+                last_send, send_now = now, False
+            time.sleep(0.01)
+    except Exception as e:
+        reason = f"error: {e}"
+    finally:
+        try:
+            lnk.send_stop()
+        except Exception:
+            pass
+        if writer is not None:
+            writer.release()
+        log.close()
+        times.close()
+        summary = lnk.recorder.stop()
+        _follow["status"] = reason or "ended"
+        _follow["result"] = dict(status=_follow["status"], frames=ctl.frames, dir=str(rec_dir),
+                                 duration_s=None if summary is None else summary["duration_s"],
+                                 last=_follow["info"])
+        _follow["running"] = False
+        _follow["ended"].set()
+
+
+@mcp.tool()
+def start_line_follow(confirmed_safe: bool, speed_pwm: int = 58, max_seconds: float = 90.0,
+                      name: Optional[str] = None) -> dict:
+    """Start following the tape line with the phone camera, on its own thread, and return at
+    once; poll line_follow_status(wait_s=...) for the end. ONE confirmed_safe covers the whole
+    run: set it only after telling the operator the exact run (speed_pwm, max_seconds, that it
+    stops if the line is lost / the finish strip is seen / camera or telemetry go stale) and
+    getting a go-ahead. The line must already be in view (>=3 bands) and the finish strip not.
+
+    It stops by itself and reports why: finished (cross strip reached), lost (no line for
+    0.5s), stale (no camera frame for 0.5s), telemetry_stale, timeout, stopped (stop() or
+    listen() was called -- call stop() at any time to abort). No searching for a lost line.
+    Records telemetry, video, and a per-frame follow_log.csv to recordings/<name>/.
+    speed_pwm is the cruise forward effort, 50-70 (default 58); turns may go up to 90 on the
+    outer wheel."""
+    if link is None:
+        return _not_connected()
+    gate = _confirm_gate(confirmed_safe)
+    if gate:
+        return gate
+    if link.recorder.active:
+        return {"ok": False, "error": "a recording is already active; stop_recording() first"}
+    if not (line_follow.F_MOVE_MIN <= speed_pwm <= FOLLOW_MAX_CRUISE_PWM):
+        return {"ok": False, "error": f"speed_pwm must be {line_follow.F_MOVE_MIN}-{FOLLOW_MAX_CRUISE_PWM}"}
+    if not (0 < max_seconds <= 300):
+        return {"ok": False, "error": "max_seconds must be in (0, 300]"}
+    snap = link.telemetry_snapshot()
+    if not snap["telemetry_live"]:
+        return {"ok": False, "error": "no live encoder telemetry", "telemetry": snap}
+    src = _frame_source()
+    t0 = time.monotonic()
+    while src.latest() is None and time.monotonic() - t0 < 10:
+        time.sleep(0.05)
+    fr = src.latest()
+    if fr is None or src.age_s() > 1.0:
+        return {"ok": False, "error": "no live camera frames", "camera": src.status()}
+    res, _ = line_vision.analyze(fr.img)
+    ctl = line_follow.LineFollower(max_run_s=max_seconds, forward_pwm_sign=FORWARD_PWM_SIGN,
+                                   f_cruise=speed_pwm)
+    ok, why = ctl.can_start(res)
+    if not ok:
+        return {"ok": False, "error": why}
+    try:
+        path = link.recorder.start(name or time.strftime("follow_%Y%m%d_%H%M%S"))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    _follow["abort"].clear()
+    _follow["ended"].clear()
+    _follow.update(running=True, status="running", info={}, result=None)
+    threading.Thread(target=_follow_loop, daemon=True,
+                     args=(link, src, ctl, link.recorder.dir, link.recorder.now)).start()
+    return {"ok": True, "started": True, "dir": str(link.recorder.dir), "speed_pwm": speed_pwm,
+            "max_seconds": max_seconds, "bands_at_start": res["n_bands"], "camera": src.status()}
+
+
+@mcp.tool()
+def line_follow_status(wait_s: float = 0.0) -> dict:
+    """Read-only. State of the line-follow run: running / the reason it ended (finished, lost,
+    stale, telemetry_stale, timeout, stopped, error: ...), the latest offsets and wheel
+    efforts, and the recording folder. wait_s (max 60) blocks until the run ends or that long
+    passes -- use it instead of polling in a tight loop. Never moves the robot."""
+    if _follow["running"] and wait_s > 0:
+        _follow["ended"].wait(min(wait_s, 60.0))
+    return {"ok": True, "running": _follow["running"], "status": _follow["status"],
+            "info": _follow["info"], "result": _follow["result"],
+            "camera": None if _frames is None else _frames.status()}
 
 
 if __name__ == "__main__":
