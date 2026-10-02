@@ -49,6 +49,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "calibration"))
 import bridge  # noqa: E402  (calibration/bridge.py)
 import recording  # noqa: E402  (mcp_server/recording.py)
 import line_vision  # noqa: E402  (mcp_server/line_vision.py)
+import person_track  # noqa: E402  (mcp_server/person_track.py)
+import person_vision  # noqa: E402  (mcp_server/person_vision.py)
 import camera_stream  # noqa: E402  (mcp_server/camera_stream.py)
 import line_follow  # noqa: E402  (mcp_server/line_follow.py)
 
@@ -457,7 +459,7 @@ def _not_connected():
 
 def _confirm_gate(confirmed_safe: bool):
     if _follow["running"]:
-        return {"ok": False, "error": "a line-follow run is in progress; call stop() first"}
+        return {"ok": False, "error": "an autonomous run (line-follow / turn-to-me) is in progress; call stop() first"}
     if confirmed_safe:
         return None
     return {
@@ -579,6 +581,31 @@ def line_view(width: int = 640):
         if bgr.shape[1] > width:
             bgr = cv2.resize(bgr, (width, round(bgr.shape[0] * width / bgr.shape[1])))
         result, annotated = line_vision.analyze(bgr)
+        ok, jpg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    import json
+    return [json.dumps(result), Image(data=jpg.tobytes(), format="jpeg")]
+
+
+@mcp.tool()
+def person_view():
+    """Read-only. Grab the newest live camera frame, find people in it, and return it with
+    the detection drawn on (green = the largest person, orange = others; vertical line = their
+    horizontal center) plus the numbers: `n_people`, and per person `bearing_deg` (+ = to the
+    RIGHT of where the robot points) and `x_frac`. Legs-only views are fine -- every visible
+    keypoint votes for the center. Never moves the robot, no confirmation needed. This is
+    what turn_to_me would act on, so use it to check the detection first."""
+    try:
+        import cv2
+        src = _frame_source()
+        t0 = time.monotonic()
+        while src.latest() is None and time.monotonic() - t0 < 10:
+            time.sleep(0.05)
+        fr = src.latest()
+        if fr is None or src.age_s() > 1.0:
+            return {"ok": False, "error": "no live camera frames", "camera": src.status()}
+        result, annotated = person_vision.analyze(fr.img)
         ok, jpg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -1323,6 +1350,226 @@ def line_follow_status(wait_s: float = 0.0) -> dict:
     return {"ok": True, "running": _follow["running"], "status": _follow["status"],
             "info": _follow["info"], "result": _follow["result"],
             "camera": None if _frames is None else _frames.status()}
+
+
+TURN_MAX_SECONDS = 3600.0
+TURN_SPIN_DPS_RANGE = (5.0, 60.0)
+
+
+def _check_turn_params(max_seconds, lost_timeout_s, spin_speed_dps):
+    """Error string if any turn_to_me setting is out of range (None values are skipped)."""
+    if max_seconds is not None and not (0 <= max_seconds <= TURN_MAX_SECONDS):
+        return f"max_seconds must be 0 (no limit) to {TURN_MAX_SECONDS:.0f}"
+    if lost_timeout_s is not None and not (0 <= lost_timeout_s <= 600):
+        return "lost_timeout_s must be 0 (never end when the person is gone) to 600"
+    if spin_speed_dps is not None and not (TURN_SPIN_DPS_RANGE[0] <= spin_speed_dps <= TURN_SPIN_DPS_RANGE[1]):
+        return f"spin_speed_dps must be {TURN_SPIN_DPS_RANGE[0]:.0f}-{TURN_SPIN_DPS_RANGE[1]:.0f}"
+    return None
+
+
+def _person_loop(lnk, src, trk, rec_dir, t_rec):
+    """Runs on its own thread for the whole turn-to-me run: newest frame -> person detector ->
+    tracker (sets a world-frame yaw target) and, every ~10ms tick, IMU yaw -> spin command.
+    Shares the _follow state with the line follower (one autonomous run at a time, stop() /
+    listen() abort it). Re-sends the last command at least every DRIVE_KEEPALIVE_S and always
+    finishes with a stop."""
+    import csv
+    import cv2
+    log = open(rec_dir / "turn_log.csv", "w", newline="")
+    lw = csv.writer(log)
+    lw.writerow(["time_s", "frame", "n_people", "bearing_deg", "yaw", "target_yaw", "err_deg", "spin",
+                 "t", "left_raw", "right_raw", "status"])
+    times = open(rec_dir / "video_times.csv", "w", newline="")
+    tw = csv.writer(times)
+    tw.writerow(["frame", "time_s"])
+    writer = None
+    last_seq, last_send, last_row = -1, 0.0, 0.0
+    cmd = line_follow.Command()
+    n_people, bearing, reason = 0, None, None
+    try:
+        with lnk.lock:
+            yaw = lnk.orient.yaw
+        trk.start(time.monotonic(), yaw)
+        while True:
+            now = time.monotonic()
+            if _follow["abort"].is_set():
+                trk.stop()
+                reason = "stopped"
+                break
+            snap = lnk.telemetry_snapshot()
+            if snap["telemetry_age_s"] is None or snap["telemetry_age_s"] > TELEMETRY_STALE_S:
+                reason = "telemetry_stale"
+                break
+            if not snap["imu_live"]:
+                reason = "imu_stale"
+                break
+            with lnk.lock:
+                yaw = lnk.orient.yaw
+            fr = src.latest()
+            new_frame = fr is not None and fr.seq != last_seq
+            if new_frame:
+                last_seq = fr.seq
+                res, _ = person_vision.analyze(fr.img, draw=False)
+                n_people = res["n_people"]
+                bearing = res["bearing_deg"]
+                trk.on_frame(res, fr.t)
+                if writer is None:
+                    h, w = fr.img.shape[:2]
+                    writer = cv2.VideoWriter(str(rec_dir / "video.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 15, (w, h))
+                writer.write(fr.img)
+                tw.writerow([fr.seq, f"{t_rec():.3f}"])
+                times.flush()
+            cmd = trk.step(now, yaw)
+            i = cmd.info
+            if new_frame or now - last_row >= 0.1:
+                last_row = now
+                lw.writerow([f"{t_rec():.3f}", last_seq, n_people, "" if bearing is None else bearing,
+                             f"{yaw:.2f}", i.get("target_yaw", ""), i.get("err_deg", ""),
+                             int(bool(i.get("spin", False))), i.get("t", ""), cmd.left_raw, cmd.right_raw,
+                             cmd.status])
+                log.flush()
+                _follow["info"] = dict(i, status=cmd.status, n_people=n_people, bearing_deg=bearing,
+                                       yaw=round(yaw, 1), fps=round(src.fps(), 1))
+            if cmd.status != "running":
+                reason = cmd.status
+                break
+            if now - last_send >= DRIVE_KEEPALIVE_S or (new_frame and (cmd.left_raw or cmd.right_raw)):
+                if _follow["abort"].is_set():
+                    continue
+                lnk.send_drive(cmd.left_raw, cmd.right_raw)
+                last_send = now
+            time.sleep(0.01)
+    except Exception as e:
+        reason = f"error: {e}"
+    finally:
+        try:
+            lnk.send_stop()
+        except Exception:
+            pass
+        if writer is not None:
+            writer.release()
+        log.close()
+        times.close()
+        summary = lnk.recorder.stop()
+        _follow["status"] = reason or "ended"
+        _follow["result"] = dict(status=_follow["status"], frames=trk.frames, dir=str(rec_dir),
+                                 duration_s=None if summary is None else summary["duration_s"],
+                                 last=_follow["info"])
+        _follow["running"] = False
+        _follow["ended"].set()
+
+
+@mcp.tool()
+def turn_to_me(confirmed_safe: bool, max_seconds: float = 30.0, name: Optional[str] = None,
+               spin_speed_dps: float = 18.0, lost_timeout_s: float = 1.0) -> dict:
+    """Spin in place to face the person the phone camera sees, then HOLD: keep watching and
+    spin again whenever they move (it never drives forward/back). Runs on its own thread and
+    returns at once; poll turn_to_me_status(wait_s=...). Call stop() to end it.
+
+    BEFORE calling: tell the operator the run (max_seconds, spins in place only, stops if it
+    loses the person for lost_timeout_s) and get a go-ahead; ONE confirmed_safe covers the run. If the
+    tool says several people are in view, ASK the operator who to face / to clear the frame --
+    do not guess. Needs exactly one person in view at the start (legs only is fine; check with
+    person_view() first). It does not search for a lost person.
+
+    Tunable, and changeable mid-run with turn_to_me_set(): max_seconds (default 30; 0 = no
+    time limit), lost_timeout_s (default 1.0; 0 = never end because the person is gone, it
+    just holds its last heading), spin_speed_dps (fastest spin it will ask for, 5-60, default
+    18; faster follows a walking person better but overshoots small corrections more).
+
+    Ends by itself with a reason: lost (no person for lost_timeout_s), stale (no camera frame
+    for 0.5s), telemetry_stale / imu_stale, timeout (max_seconds), stopped (stop() or
+    listen()). While running it follows the person nearest its current target if several
+    appear. Records telemetry, video and turn_log.csv to recordings/<name>/."""
+    if link is None:
+        return _not_connected()
+    gate = _confirm_gate(confirmed_safe)
+    if gate:
+        return gate
+    if link.recorder.active:
+        return {"ok": False, "error": "a recording is already active; stop_recording() first"}
+    bad = _check_turn_params(max_seconds, lost_timeout_s, spin_speed_dps)
+    if bad:
+        return {"ok": False, "error": bad}
+    snap = link.telemetry_snapshot()
+    if not snap["telemetry_live"]:
+        return {"ok": False, "error": "no live encoder telemetry", "telemetry": snap}
+    if not snap["imu_live"]:
+        return {"ok": False, "error": "no live IMU telemetry (the spin is closed on IMU yaw)",
+                "telemetry": snap}
+    src = _frame_source()
+    t0 = time.monotonic()
+    while src.latest() is None and time.monotonic() - t0 < 10:
+        time.sleep(0.05)
+    if src.latest() is None or src.age_s() > 1.0:
+        return {"ok": False, "error": "no live camera frames", "camera": src.status()}
+    # look at a few fresh frames: need exactly one person throughout, not a lucky single frame
+    counts, seen = [], -1
+    t0 = time.monotonic()
+    while len(counts) < 4 and time.monotonic() - t0 < 3:
+        fr = src.latest()
+        if fr is not None and fr.seq != seen:
+            seen = fr.seq
+            counts.append(person_vision.analyze(fr.img, draw=False)[0]["n_people"])
+        time.sleep(0.02)
+    if len(counts) < 2:
+        return {"ok": False, "error": "couldn't get fresh camera frames", "camera": src.status()}
+    if max(counts) > 1:
+        return {"ok": False, "error": "more than one person is in view -- ask the operator who to "
+                "face (or to clear the frame) before starting", "people_per_frame": counts}
+    if min(counts) == 0:
+        return {"ok": False, "error": "no person clearly in view (not seen in every frame) -- check "
+                "with person_view()", "people_per_frame": counts}
+    trk = person_track.PersonTracker(max_run_s=max_seconds, forward_pwm_sign=FORWARD_PWM_SIGN,
+                                     spin_u_max=spin_speed_dps, lost_timeout_s=lost_timeout_s)
+    try:
+        path = link.recorder.start(name or time.strftime("turn_%Y%m%d_%H%M%S"))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    _follow["abort"].clear()
+    _follow["ended"].clear()
+    _follow.update(running=True, status="running", info={}, result=None, tracker=trk)
+    threading.Thread(target=_person_loop, daemon=True,
+                     args=(link, src, trk, link.recorder.dir, link.recorder.now)).start()
+    return {"ok": True, "started": True, "dir": str(link.recorder.dir), "max_seconds": max_seconds,
+            "lost_timeout_s": lost_timeout_s, "spin_speed_dps": spin_speed_dps,
+            "people_per_frame": counts, "camera": src.status()}
+
+
+@mcp.tool()
+def turn_to_me_set(max_seconds: Optional[float] = None, lost_timeout_s: Optional[float] = None,
+                   spin_speed_dps: Optional[float] = None) -> dict:
+    """Change a RUNNING turn_to_me on the fly (give only what you want to change; no
+    confirmation needed since the run is already approved and this only adjusts it).
+    max_seconds: total run time limit measured from the start of the run (0 = no limit).
+    lost_timeout_s: how long with nobody in view before it gives up (0 = never; it holds its
+    last heading). spin_speed_dps: fastest spin it will ask for, 5-60 (higher = follows a
+    walking person better, overshoots small corrections more). Returns the settings now in
+    effect. Fails if no turn_to_me run is in progress."""
+    trk = _follow.get("tracker")
+    if not _follow["running"] or trk is None or trk.status != "running":
+        return {"ok": False, "error": "no turn_to_me run is in progress"}
+    bad = _check_turn_params(max_seconds, lost_timeout_s, spin_speed_dps)
+    if bad:
+        return {"ok": False, "error": bad}
+    if max_seconds is not None:
+        trk.max_run_s = max_seconds
+    if lost_timeout_s is not None:
+        trk.lost_timeout_s = lost_timeout_s
+    if spin_speed_dps is not None:
+        trk.spin_u_max = spin_speed_dps
+    return {"ok": True, "max_seconds": trk.max_run_s, "lost_timeout_s": trk.lost_timeout_s,
+            "spin_speed_dps": trk.spin_u_max}
+
+
+@mcp.tool()
+def turn_to_me_status(wait_s: float = 0.0) -> dict:
+    """Read-only. State of the turn_to_me run: running / the reason it ended (lost, stale,
+    telemetry_stale, imu_stale, timeout, stopped, error: ...), the latest bearing to the
+    person, heading error in degrees (err_deg; + = needs a left turn), whether it is facing
+    them, and the recording folder. wait_s (max 60) blocks until the run ends or that long
+    passes. Never moves the robot."""
+    return line_follow_status(wait_s)
 
 
 if __name__ == "__main__":

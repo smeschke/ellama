@@ -60,6 +60,10 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `drive_arc(radius_inches, degrees, direction, pwm, confirmed_safe, max_wheel_pwm=125, travel="forward")` | Yes (curved; 360° = full circle; `travel="reverse"` backs up along the arc) | Yes |
 | `jog(left_pwm, right_pwm, duration_s, confirmed_safe)` | Yes (raw, time-based) | Yes |
 | `line_view(width=640)` | No | — |
+| `person_view()` | No | — (finds people in the live frame, returns bearing to each) |
+| `turn_to_me(confirmed_safe, max_seconds=30, name=None, spin_speed_dps=18, lost_timeout_s=1)` | Yes (spins in place, holds until it ends; max_seconds / lost_timeout_s of 0 = never) | Yes — once per run; refuses to start if 0 or >1 people are in view (ask the operator) |
+| `turn_to_me_set(max_seconds, lost_timeout_s, spin_speed_dps)` | No (adjusts an already-approved run) | — |
+| `turn_to_me_status(wait_s=0)` | No | — |
 | `start_line_follow(confirmed_safe, speed_pwm=58, max_seconds=90, name=None)` | Yes (autonomous, until it ends) | Yes — once per run |
 | `line_follow_status(wait_s=0)` | No | — |
 
