@@ -49,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "calibration"))
 import bridge  # noqa: E402  (calibration/bridge.py)
 import recording  # noqa: E402  (mcp_server/recording.py)
 import line_vision  # noqa: E402  (mcp_server/line_vision.py)
+import phone_display  # noqa: E402  (mcp_server/phone_display.py)
 import person_track  # noqa: E402  (mcp_server/person_track.py)
 import person_vision  # noqa: E402  (mcp_server/person_vision.py)
 import camera_stream  # noqa: E402  (mcp_server/camera_stream.py)
@@ -440,6 +441,16 @@ _follow = {"running": False, "abort": threading.Event(), "status": "idle", "info
 _frames = None  # camera_stream.FrameSource, created on first use
 
 FOLLOW_MAX_CRUISE_PWM = 70  # start_line_follow's speed_pwm is capped here (turns may go to OUTER_MAX)
+
+
+def _phone_display_url():
+    """Where phone/display_server.py listens: ELLAMA_PHONE_DISPLAY, else port 8080 on the phone
+    that serves the camera."""
+    explicit = os.environ.get("ELLAMA_PHONE_DISPLAY", "").rstrip("/")
+    if explicit:
+        return explicit
+    from urllib.parse import urlparse
+    return f"http://{urlparse(_camera()[0]).hostname}:8080"
 
 
 def _frame_source():
@@ -1201,7 +1212,19 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool) 
     }
 
 
-def _follow_loop(lnk, src, ctl, rec_dir, t_rec):
+def _follow_hud(cmd, src, t_s):
+    """What the phone display's command panel shows for one line-follow command."""
+    i = cmd.info
+    lines = []
+    if "phi_deg" in i:
+        lines.append(f"aim {i['phi_deg']:+.1f} deg   offset {i.get('e_in', 0):+.1f} in")
+        lines.append(f"forward {i.get('f', 0):+d}   turn {i.get('t', 0):+d}")
+    lines.append(f"bands {i.get('bands', '-')}   {src.fps():.0f} fps")
+    return dict(left=cmd.left_raw * FORWARD_PWM_SIGN, right=cmd.right_raw * FORWARD_PWM_SIGN,
+                status=cmd.status, spin=bool(i.get("spin")), t_s=t_s, lines=lines)
+
+
+def _follow_loop(lnk, src, ctl, rec_dir, t_rec, display=None):
     """Runs on its own thread for the whole run: newest frame -> detect -> controller -> wheels.
     Re-sends the last command at least every DRIVE_KEEPALIVE_S (the bridge goes listen-only
     after 500ms of silence) and ends the moment the controller says so, the operator calls
@@ -1220,6 +1243,7 @@ def _follow_loop(lnk, src, ctl, rec_dir, t_rec):
     cmd = line_follow.Command()
     send_now = False
     reason = None
+    shown = None
     try:
         ctl.start(time.monotonic())
         while True:
@@ -1236,9 +1260,12 @@ def _follow_loop(lnk, src, ctl, rec_dir, t_rec):
             fr = src.latest()
             if fr is not None and fr.seq != last_seq:
                 last_seq = fr.seq
-                res, _ = line_vision.analyze(fr.img, prev_x_frac=prev_x)
+                res, ann = line_vision.analyze(fr.img, prev_x_frac=prev_x)
                 prev_x = res.get("x_frac") if res["found"] else None
                 cmd = ctl.update(res, fr.t)
+                if display is not None:
+                    shown = (ann, _follow_hud(cmd, src, t_rec()))
+                    display.push(*shown)
                 t = t_rec()
                 if writer is None:
                     h, w = fr.img.shape[:2]
@@ -1276,6 +1303,11 @@ def _follow_loop(lnk, src, ctl, rec_dir, t_rec):
         log.close()
         times.close()
         summary = lnk.recorder.stop()
+        if display is not None:
+            try:
+                display.close(None if shown is None else (shown[0], dict(shown[1], status=reason or "ended", spin=False)))
+            except Exception:
+                pass
         _follow["status"] = reason or "ended"
         _follow["result"] = dict(status=_follow["status"], frames=ctl.frames, dir=str(rec_dir),
                                  duration_s=None if summary is None else summary["duration_s"],
@@ -1286,7 +1318,7 @@ def _follow_loop(lnk, src, ctl, rec_dir, t_rec):
 
 @mcp.tool()
 def start_line_follow(confirmed_safe: bool, speed_pwm: int = 58, max_seconds: float = 90.0,
-                      name: Optional[str] = None) -> dict:
+                      name: Optional[str] = None, show_on_phone: bool = False) -> dict:
     """Start following the tape line with the phone camera, on its own thread, and return at
     once; poll line_follow_status(wait_s=...) for the end. ONE confirmed_safe covers the whole
     run: set it only after telling the operator the exact run (speed_pwm, max_seconds, that it
@@ -1298,7 +1330,13 @@ def start_line_follow(confirmed_safe: bool, speed_pwm: int = 58, max_seconds: fl
     listen() was called -- call stop() at any time to abort). No searching for a lost line.
     Records telemetry, video, and a per-frame follow_log.csv to recordings/<name>/.
     speed_pwm is the cruise forward effort, 50-70 (default 58); turns may go up to 90 on the
-    outer wheel."""
+    outer wheel.
+
+    show_on_phone (default False): also show the line-detection overlay with a motor-command
+    panel (wheel bars, aim angle, status) live on the phone's screen. Needs
+    phone/display_server.py running in Termux and show.html open in the phone's browser (see
+    phone/README.md); if the phone can't be reached the run still starts and the result says
+    so. Purely cosmetic: it can't affect the run."""
     if link is None:
         return _not_connected()
     gate = _confirm_gate(confirmed_safe)
@@ -1330,13 +1368,28 @@ def start_line_follow(confirmed_safe: bool, speed_pwm: int = 58, max_seconds: fl
         path = link.recorder.start(name or time.strftime("follow_%Y%m%d_%H%M%S"))
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    display, display_info = None, None
+    if show_on_phone:
+        try:
+            display = phone_display.PhoneDisplay(_phone_display_url())
+            ok, err = display.check()
+            display_info = {"ok": ok, "url": display.url, **({"error": err} if err else {})}
+            if ok:
+                display.start()
+            else:
+                display = None
+        except Exception as e:
+            display, display_info = None, {"ok": False, "error": str(e)}
     _follow["abort"].clear()
     _follow["ended"].clear()
     _follow.update(running=True, status="running", info={}, result=None)
     threading.Thread(target=_follow_loop, daemon=True,
-                     args=(link, src, ctl, link.recorder.dir, link.recorder.now)).start()
-    return {"ok": True, "started": True, "dir": str(link.recorder.dir), "speed_pwm": speed_pwm,
-            "max_seconds": max_seconds, "bands_at_start": res["n_bands"], "camera": src.status()}
+                     args=(link, src, ctl, link.recorder.dir, link.recorder.now, display)).start()
+    out = {"ok": True, "started": True, "dir": str(link.recorder.dir), "speed_pwm": speed_pwm,
+           "max_seconds": max_seconds, "bands_at_start": res["n_bands"], "camera": src.status()}
+    if display_info is not None:
+        out["phone_display"] = display_info
+    return out
 
 
 @mcp.tool()
