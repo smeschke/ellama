@@ -18,25 +18,23 @@ second — clean odometry on a flat floor hides every hard problem. Mowers, UTVs
 quadrupeds clear the second and fail the first, being heavy or fast enough that you do
 not want a stranger standing next to one.
 
-## Weight, and why the battery ships separately
+## Weight, and why you bring the battery
 
-At **~32 lb dry / ~37 lb with one battery**, this is a real one-person lift with a
-handle. At 42 lb with two batteries it is at the edge of comfortable.
+At **~32 lb dry / ~37 lb with one 12 V 7 Ah SLA battery**, this is a real one-person lift
+with a handle. At 42 lb with two SLA batteries it is at the edge of comfortable. A tool
+pack or a LiFePO4 battery weighs less than an SLA, so those builds come out lighter.
 
-Shipping without a battery started as a practical annoyance and turned out to solve three
+The battery is bring-your-own, for the same reason the compute is. It solves three
 problems at once:
 
-1. **Shipping classification.** Sealed lead-acid falls under UN2800 (batteries, wet,
-   non-spillable). Properly marked and packed it is largely excepted from dangerous goods
-   rules — but it still carries marking requirements, carrier restrictions and
-   surcharges, and per-unit compliance overhead. Not shipping one removes that entire
-   category of work from fulfilment.
+1. **Shipping classification.** Sealed lead-acid falls under UN2800 and lithium batteries
+   under their own dangerous-goods classes, each with marking requirements, carrier
+   restrictions and surcharges. Not shipping a battery removes that entire category of
+   work from fulfilment.
 2. **Carton weight.** The shipped box stays under 40 lb.
-3. **Substitution.** The user can fit an e-bike pack and a converter instead, without
-   fighting a design built around one specific cell.
-
-A 12 V 7 Ah SLA is available at any hardware store, auto parts store, or alarm supplier,
-worldwide, for about $21. Requiring one is not a burden.
+3. **Choice.** Most buyers already own a battery that works, usually a cordless-tool pack.
+   There are three supported options (`05-battery-options.md`), with current prices in
+   `battery_bom.csv`.
 
 ## Geometry: 17 wide × 16 long
 
@@ -73,8 +71,7 @@ steering, and four contact patches for traction on loose surfaces.
 
 ## The compute module
 
-The compute module bolts onto the chassis. Power from the main pack is available inside the module.
-It holds whatever compute and sensors the owner prefers — a Raspberry Pi, a camera, a
+The compute module bolts onto the chassis. It holds whatever compute and sensors the owner prefers — a Raspberry Pi, a camera, a
 lidar, an IMU, a GPS, or something else entirely. Internal volume is 10 W × 4 D × 10 in H.
 
 ### Sensors live in the module, not on the chassis

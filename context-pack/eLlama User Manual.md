@@ -2,20 +2,19 @@
 
 ## 1. Introduction
 
-eLlama is a four-wheel-drive outdoor robot platform, roughly the size of a large dog, that a person can lift into a car trunk. It ships as a complete working robot: chassis, four driven wheels, and a handheld controller. Drive it out of the box with no computer, no software, and no configuration beyond charging a battery.
+eLlama is a four-wheel-drive outdoor robot base, roughly the size of a large dog, that a person can lift into a car trunk. It ships as a base: chassis, four driven wheels, the Llama Motor Board, and a handheld controller. Add a battery of your own and drive it with no computer and no software.
 
-It is also a mount for compute. A box on the front deck takes a single-board computer and whatever sensors the job needs — a camera, a lidar, an IMU — powered from the same battery that drives the wheels. With that fitted, the same chassis becomes a teleoperated or autonomous platform.
+It is also a mount for compute. A box on the front deck takes a single-board computer and whatever sensors the job needs — a camera, a lidar, an IMU. With that fitted, the same chassis becomes a teleoperated or autonomous platform.
 
 ### 1.1 Shipping Contents
 
 - eLlama robot platform
 - Onboard Llama Motor Board
-- User breakout panel with 12V power
+- User breakout panel (battery voltage, unregulated; see 1.2.5)
 - Single-Stick Controller
-- Charging dock
-- Compute module
+- Compute module (an empty bay for your own compute)
 
-**Batteries not included.** The robot uses a common, widely available battery, so users are expected to source their own locally or have a supplier ship one directly (some batteries can't be shipped by all carriers). All documentation and specifications in this manual assume the stock SLA (sealed lead-acid) chemistry, but any battery can be used with an appropriate voltage converter.
+**Battery and charger not included.** You bring your own battery. Three options are supported: a 12 V 7 Ah SLA (sealed lead-acid) battery, an 18 V cordless-tool battery pack, or a 12 V LiFePO4 battery. Pick one, and charge it with its own charger off the robot. The comparison, the rules that apply to every option and current prices are in `05-battery-options.md` and `battery_bom.csv`. The specifications in this manual were measured on the 12 V SLA battery unless a row says otherwise.
 
 ### 1.2 Hardware Overview
 
@@ -42,7 +41,7 @@ There are two switches on the robot. One switches the Llama Motor Board and powe
 
 #### 1.2.5 Payloads
 
-A compute module is included with the robot. Additional payloads such as IMUs, lidar, cameras, GPS, and single-board computers can be easily, safely, and securely mounted in the compute module, and powered with the supplied 12V DC.
+A compute module is included with the robot. Additional payloads such as IMUs, lidar, cameras, GPS, and single-board computers can be easily, safely, and securely mounted in the compute module, and powered from the breakout panel. The panel carries battery voltage unregulated: about 12 V on SLA or LiFePO4, and roughly 16–21 V on a tool pack. Check that your equipment accepts that range, or add your own converter.
 
 #### 1.2.6 Robot Equations
 
@@ -61,21 +60,21 @@ Theta = (vR - vL) / effective track
 | Track Width | 18.5 in |
 | Wheelbase Length | 14 in |
 | Ground Clearance | 4 in |
-| Mass | 37 pounds |
+| Mass | 37 pounds with one 12 V SLA battery (32 pounds without a battery) |
 | Maximum Payload | 40 pounds |
 | All-terrain Payload | 20 pounds |
-| Maximum Speed | 1 m/s |
+| Maximum Speed | 1 m/s on a 12 V SLA battery; a tool pack runs faster at the same command |
 | Turn Rate (in-place spin), low-speed setting | ~60–80°/s |
 | Turn Rate (in-place spin), high-speed setting | ~150–180°/s |
 | Climb Grade | 30% |
 | Sideslope | 15% |
 | Operating Temperature, Min | 0 F |
 | Operating Temperature, Max | 100 F |
-| Operating Time, Max Power Consumption | 1.5 h |
+| Operating Time, Max Power Consumption | About 1.5 h per 12 V 7 Ah SLA battery; depends on your battery |
 | Operating Time, Standby | 24 h |
-| Battery (not included; stock chemistry) | 2x 12V 7Ah SLA |
-| Battery Charger | Two-stage float charger |
-| User Power | 12V 100A |
+| Battery (not included) | Your choice of 12 V SLA, 18 V tool pack, or 12 V LiFePO4 |
+| Battery Charger | Not included; use the charger that matches your battery |
+| User Power | Battery voltage, unregulated, fused |
 | Communication | WiFi, UART serial |
 | Wheel Encoders | None |
 | Internal Sensing | None |
@@ -110,11 +109,17 @@ When running the stock firmware, there is no pairing. The ESP32 in the Single-St
 
 No firmware changes are needed to switch between them.
 
-### 2.5 Battery Charging
+### 2.5 Battery and Charging
 
-If the charging dock is used, the robot should be driven into the dock, and when the pogo pins in the dock make contact with the robot, the light on the charger should change from green to red and the robot will start charging.
+There is no dock and no charging circuit on the robot. Charge the battery off the robot with its own charger, then connect it.
 
-To charge without the dock, alligator clips can be connected directly to the battery terminals for charging with a standard 12V automotive float charger.
+1. Pick one of the three battery options in `05-battery-options.md` (12 V SLA, 18 V tool pack, or 12 V LiFePO4).
+2. With the main power switch off, connect the battery. Check polarity first: red is positive.
+3. Keep the voltage between 12 V and 21 V. Do not use a 36 V, 40 V, 56 V or 60 V pack.
+4. Switch the robot on and drive it, following section 3.1.
+5. When you are done, switch the robot off, disconnect or remove the battery, and charge it with its own charger. A 12 V SLA takes a standard SLA float charger, a tool pack its own tool charger, and a LiFePO4 battery a LiFePO4 charger. An SLA float charger is the wrong profile for LiFePO4.
+
+If you use a tool pack, the robot runs faster at the same command than it does on SLA. Run it on blocks first and start with slow speeds.
 
 ## 3. Safety Considerations
 

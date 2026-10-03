@@ -1,22 +1,22 @@
 # eLlama — Design Context Pack
 
-A four-wheel-drive outdoor robot platform. Ships working with a handheld controller;
-accepts a single-board computer, camera, lidar, and any sensors the owner needs as an
-expansion path.
+A four-wheel-drive outdoor robot platform. The base ships with a handheld controller; you bring
+the battery, and optionally a single-board computer, camera, lidar, and any sensors you need.
 
 ## Contents
 
 | File | Covers |
 |---|---|
-| `01-overview.md` | What it is, who it's for, the product tiers |
+| `01-overview.md` | What it is, who it's for, what is bring-your-own |
 | `02-physical-design.md` | Size, weight, geometry, and why each was chosen |
 | `03-drivetrain-power.md` | Motors, wheels, battery, and the tradeoffs behind them |
 | `04-control-architecture.md` | Design principles only — protocol is in flux |
-| `05-docking.md` | The charging dock, and why the battery chemistry makes it trivial |
+| `05-battery-options.md` | The three supported battery options and the rules for all of them |
 | `06-manufacturing-cost.md` | BOM, in-house fabrication, batch plan |
 | `07-simulation.md` | The calibrated desktop simulator, sending commands from off-board compute, and the off-board-compute product vision (lawn mowing) |
 | `eLlama User Manual.md` | The product manual: specs, getting started, safety |
-| `bom.csv` | Current bill of materials |
+| `bom.csv` | Current bill of materials (robot and controller, no battery) |
+| `battery_bom.csv` | Prices for the three battery options |
 | `Testing.csv` | Test log |
 
 ## Naming

@@ -20,7 +20,8 @@ Consequences worth naming:
   wheel lands at walking pace. No additional reduction, no belt, no chain.
 - **Availability outlives the product.** These are stocked by dozens of sellers and are
   not going away.
-- **The speed figures come from testing.** At 12 V the robot moves at about 1 m/s.
+- **The speed figures come from testing.** On a 12 V SLA battery the robot moves at about
+  1 m/s.
 
 **The cost is backlash.** Triple spur reduction in a toy-grade housing has meaningful
 play. It is fine for open-loop hauling and teleoperation, and it is the first thing that
@@ -69,27 +70,30 @@ logged run at 2.87 mph.
 
 ## Power
 
-**12 V 7 Ah sealed lead-acid, one or two wired in parallel, user-supplied.** The system
-runs on 12 V only — a second battery adds capacity, not voltage.
+**Bring your own battery. Three options are supported:** a 12 V 7 Ah sealed lead-acid
+battery (one, or two in parallel), an 18 V cordless-tool pack, or a 12 V LiFePO4 battery.
+The full comparison and the rules that apply to all of them are in
+`05-battery-options.md`; current prices are in `battery_bom.csv`.
 
-SLA is the unfashionable choice and the correct one here:
+How each one behaves on this drivetrain:
 
-- **The dock is nearly free because of it.** SLA tolerates float charging from a dumb
-  12 V charger with no communication. That means contact closure *is* the charging
-  protocol — pogo pins touch, charger clicks on, done. No BMS conversation, no handshake,
-  no smart dock. With lithium the dock becomes a smart device with a protocol. See
-  `05-docking.md`.
-- **Available anywhere.** Hardware store, auto parts store, alarm supplier, ~$21.
-- **Carries shipping overhead, so we do not ship it.** UN2800 non-spillable: largely
-  excepted when marked and packed correctly, but still marking rules, carrier surcharges,
-  and weight. See `02-physical-design.md`.
-- **Safe to abuse.** No thermal runaway, no fire risk from a shop-floor puncture.
+- **12 V SLA.** The baseline. The motors are 12 V ride-on-toy motors, and the speed and
+  PWM figures in this repo were measured on it. About 4.85 lb each. Runtime is roughly
+  1.5 hours per battery at working duty — an inference from logged voltage drop, not a
+  measurement. A second battery adds capacity, not voltage.
+- **18 V tool pack.** Tested with one Milwaukee M18 2 Ah pack. It worked well and was
+  faster than two SLA batteries. The firmware sends duty cycle, not speed, so the same
+  command runs the motors at a higher voltage. Re-run the speed calibration before trusting
+  the SLA numbers.
+- **12 V LiFePO4.** Not tested yet. At 12.8 V nominal it should match SLA, but check the
+  BMS discharge rating first.
 
-The costs are honest: weight (~4.85 lb), poor energy density, and limited cycle life
-compared to lithium. Runtime is roughly 1.5 hours per battery at working duty — an
-inference from logged voltage drop, not a measurement. The design accommodates the user
-substituting an e-bike pack and a converter.
+The battery is bring-your-own because it is a fast-moving part, the same argument as the
+compute (`01-overview.md`). The robot has no charging circuit and no dock: you charge the
+battery off the robot with its own charger.
 
 ## Accessory power
 
-The compute module takes 12 V from the robot battery through an inline-fused barrel jack.
+The compute module has an inline-fused barrel jack that carries **battery voltage,
+unregulated**. That is about 12 V on SLA or LiFePO4 and roughly 16–21 V on a tool pack.
+Whatever you mount in the bay must accept that range, or sit behind its own converter.

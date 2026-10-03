@@ -1,0 +1,14 @@
+"Battery options BOM - bring your own battery (prices are a web snapshot from 2026-10-03; re-check before relying on them)",,,,,,,,,
+,,,,,,,,,
+Option,Item,Description,Nominal V,Qty,Unit $ (low),Unit $ (high),Status,Charger,Notes
+A: 12 V SLA,Battery,"12 V 7 Ah sealed lead-acid with F1 terminals (ExpertPower EXP1270 or equivalent)",12,1,$19.99,$28.45,Tested,Any 12 V SLA float charger,"One battery runs the robot; a second in parallel adds capacity, not voltage. Retail range from ExpertPower direct to eBay."
+A: 12 V SLA,Second battery (optional),Same part wired in parallel,12,1,$19.99,$28.45,Tested,,Adds runtime only.
+A: 12 V SLA,Charger,Cen-Tech 12 V 2 A SLA charger (Harbor Freight),,1,$20.00,$20.00,Tested,,Carried over from the old master BOM; price not re-checked.
+A: 12 V SLA,Terminals,"F1 style terminal connectors for 14 AWG wire (two red, two blue)",,4,$0.10,$0.10,Tested,,Carried over from the old master BOM.
+B: 18 V tool pack,Battery,"Milwaukee M18 REDLITHIUM CP2.0 (48-11-1820), 2 Ah",18,1,$109.00,$148.00,Tested,Brand charger (you probably own one),"This is the pack the robot was tested with. Most retailers $119-137. Skip this line if you already own one."
+B: 18 V tool pack,Battery (larger),"Milwaukee M18 REDLITHIUM XC5.0 (48-11-1850), 5 Ah",18,1,$100.01,$209.00,Not tested,Brand charger,"MSRP about $169; $100 was a sale price. Not run on the robot yet."
+B: 18 V tool pack,Adapter,Printed pack receiver with metal contacts and a lead to the robot,,1,TBD,TBD,Tested,,Not priced. Contacts must be metal; do not rely on printed plastic to carry current.
+C: 12 V LiFePO4,Battery,"12.8 V 10 Ah LiFePO4 with 10 A BMS (typical Amazon listing)",12.8,1,$31.00,$40.00,Not tested,LiFePO4-specific charger (14.4-14.6 V),"A 10 A BMS is probably too small for four RS550 motors and may trip under load. Prefer a BMS rated for the robot's real peak current."
+C: 12 V LiFePO4,Battery (larger BMS),"12.8 V 20 Ah LiFePO4 with 20 A BMS",12.8,1,$49.99,$129.99,Not tested,LiFePO4-specific charger,"Range runs from budget brands to ExpertPower at the top. Still a 20 A BMS; peak current not yet measured."
+C: 12 V LiFePO4,Charger,LiFePO4 charger matched to the pack,,1,TBD,TBD,Not tested,,Not priced. Do not use an SLA float charger.
+C: 12 V LiFePO4,Terminals,F1 or the battery's own terminal type,,1,TBD,TBD,Not tested,,Check the pack's terminals before buying.

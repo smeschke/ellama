@@ -2,15 +2,18 @@
 
 ## What it is
 
-eLlama is a four-wheel-drive outdoor robot platform, roughly the size of a large dog,
-that a person can lift into a car trunk. It ships as a complete working robot: chassis,
-four driven wheels, and a handheld controller. Drive it out of the box with no computer,
-no software, and no configuration beyond charging a battery.
+eLlama is a four-wheel-drive outdoor robot base, roughly the size of a large dog, that a
+person can lift into a car trunk. It ships as a base: chassis, four driven wheels, the
+motor board, and a handheld controller. Add a battery, switch it on, and drive it with no
+computer and no software.
 
 It is also a mount for compute. A box on the front deck takes a single-board computer and
-whatever sensors the job needs — a camera, a lidar, an IMU — powered from the same
-battery that drives the wheels. With that fitted, the same chassis is a teleoperated or
-autonomous platform. The robot ships with an empty box intended for a single board computer or mini pc.
+whatever sensors the job needs — a camera, a lidar, an IMU. With that fitted, the same
+chassis is a teleoperated or autonomous platform. The robot ships with an empty box
+intended for a single board computer or mini pc.
+
+Two things are bring-your-own: the **battery** and the **compute**. You choose both. The
+battery choices are in `05-battery-options.md`.
 
 Both of those are true at once, and the relationship between them is the product.
 
@@ -20,8 +23,10 @@ A robot sold with a specific SBC in 2026 is carrying a 2026 decision forever.
 
 eLlama supplies only the slow-moving parts: motors, gearboxes, wheels, plywood, an ESP32,
 and a radio protocol. None of those will be meaningfully better in three years. The
-fast-moving part — the computer, the camera, the model running on it — is the owner's,
-replaced on the owner's schedule, in a box sized to accept whatever comes next.
+fast-moving parts — the computer, the camera, the model running on it, and the battery
+chemistry that is cheapest this year — are the owner's, replaced on the owner's schedule.
+The compute goes in a box sized to accept whatever comes next, and the battery is one
+the owner already has or can buy locally.
 
 That is also why the mechanical design targets ubiquitous parts
 (`03-drivetrain-power.md`). A ride-on-toy gearmotor and a hand-truck tire will be

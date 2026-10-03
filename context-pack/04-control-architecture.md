@@ -68,7 +68,7 @@ Deliberate delay or offset — staggering when a robot acts on a broadcast packe
 
 Or whatever the owner's own use case actually needs — the point is not this specific list, it's that the stock configuration is a known-good starting state, not a locked one.
 
-This is the same argument as the tiers in 01-overview.md, one level down: the platform ships with one deliberate, working default so it's usable immediately, and leaves the protocol itself as open territory for the owner to shape, the same way the compute bay leaves the brain open.
+This is the same argument as the split in 01-overview.md between the base and the owner's compute and battery, one level down: the platform ships with one deliberate, working default so it's usable immediately, and leaves the protocol itself as open territory for the owner to shape, the same way the compute bay leaves the brain open.
 
 ## Why a direct radio link rather than WiFi
 

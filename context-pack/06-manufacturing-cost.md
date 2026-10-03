@@ -3,12 +3,13 @@
 ## Make vs. buy
 
 **Bought:** everything where a commodity market has already solved the problem —
-gearmotors, wheels, ESP32s, BTS7960 drivers, allthread, fasteners, plywood, battery. This
+gearmotors, wheels, ESP32s, BTS7960 drivers, allthread, fasteners, plywood. The battery is
+not bought at all: it is the owner's (`05-battery-options.md`, `battery_bom.csv`). This
 is the sourcing philosophy from `01-overview.md` applied to procurement: buy the
 ubiquitous part, and inherit its price, availability, and longevity.
 
 **Made in-house:** the parts that are specific to this robot and that nobody sells —
-motor mounts, hub adapters, axle blocks, battery holder, motor driver mount, and body
+motor mounts, hub adapters, axle blocks, battery tray, motor driver mount, and body
 shell (all FDM printed); the plywood deck and axle capture blocks (table saw and drill
 press); the fixed axles (bandsaw and bench grinder); and the Llama Motor Board
 (fabricated at JLCPCB, through-hole connectors hand-soldered).
