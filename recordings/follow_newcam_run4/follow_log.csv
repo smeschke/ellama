@@ -1,0 +1,2 @@
+time_s,frame,found,n_bands,e_near_in,phi_deg,spin,f,t,left_raw,right_raw,status
+0.208,2,1,7,-0.48,-1.8,0,50,-12,-38,-62,running
