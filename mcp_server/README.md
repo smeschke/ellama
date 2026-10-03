@@ -152,9 +152,10 @@ raw PWM, fixed duration, no target — for bench/commissioning tests, capped at
 `start_line_follow` runs a camera -> detect -> steer loop on its own thread (`line_vision.py`
 finds the 3/4in tape, `line_follow.py` turns it into wheel commands, `camera_stream.py` shares
 the phone's `/video/mjpeg` stream). One `confirmed_safe` covers the run. It stops by itself and
-reports why: `finished` (cross strip at the end), `lost` (no line for 0.5 s), `stale` (no camera
-frame), `telemetry_stale`, `timeout`, or `stopped` (`stop()` / `listen()` abort it at any time).
-It never searches for a lost line. Other drive tools refuse while it runs. The run is recorded
+reports why: `finish_candidate` (something like the end strip; may be paint or glare), `end_of_tape` (line
+vanished right after a cross strip), `lost` (no line for 0.5 s), `stale` (no camera
+frame), `telemetry_stale`, `timeout`, or `stopped` (`stop()` / `listen()` abort it at any time). These are claims for the AI to check with
+`line_follow_report`, not verdicts. It never searches for a lost line. Other drive tools refuse while it runs. The run is recorded
 to `recordings/<name>/` (telemetry CSV, `video.mp4`, `video_times.csv`, `follow_log.csv`).
 `line_follow_sim.py` is a closed-loop sanity check of the controller, not a prediction -- its
 constants are fit from `tape_manual_run1/2` and need tuning on the real robot.

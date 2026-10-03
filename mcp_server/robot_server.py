@@ -440,7 +440,8 @@ _follow = {"running": False, "abort": threading.Event(), "status": "idle", "info
            "ended": threading.Event()}
 _frames = None  # camera_stream.FrameSource, created on first use
 
-FOLLOW_MAX_CRUISE_PWM = 70  # start_line_follow's speed_pwm is capped here (turns may go to OUTER_MAX)
+FOLLOW_MAX_CRUISE_PWM = line_follow.F_MAX  # start_line_follow's speed_pwm cap. Forward effort is touchy, so
+                                           # it stays modest; turns may go to TURN_OUTER_MAX / T_SPIN_MAX
 
 
 def _phone_display_url():
@@ -1252,7 +1253,9 @@ def _follow_loop(lnk, src, ctl, rec_dir, t_rec, display=None):
                 ctl.stop()
                 reason = "stopped"
                 break
-            snap_age = lnk.telemetry_snapshot()["telemetry_age_s"]
+            # Heartbeat is the IMU stream, not the encoders: the follower is camera-only, so a
+            # dead encoder must not stop a run (the board link going quiet still does).
+            snap_age = lnk.telemetry_snapshot()["imu_age_s"]
             if snap_age is None or snap_age > TELEMETRY_STALE_S:
                 ctl.status = "telemetry_stale"
                 reason = "telemetry_stale"
@@ -1318,27 +1321,39 @@ def _follow_loop(lnk, src, ctl, rec_dir, t_rec, display=None):
 
 @mcp.tool()
 def start_line_follow(confirmed_safe: bool, speed_pwm: int = 58, max_seconds: float = 90.0,
-                      name: Optional[str] = None, show_on_phone: bool = False) -> dict:
+                      name: Optional[str] = None, show_on_phone: bool = False,
+                      ignore_finish_s: float = 0.0) -> dict:
     """Start following the tape line with the phone camera, on its own thread, and return at
     once; poll line_follow_status(wait_s=...) for the end. ONE confirmed_safe covers the whole
     run: set it only after telling the operator the exact run (speed_pwm, max_seconds, that it
     stops if the line is lost / the finish strip is seen / camera or telemetry go stale) and
     getting a go-ahead. The line must already be in view (>=3 bands) and the finish strip not.
 
-    It stops by itself and reports why: finished (cross strip reached), lost (no line for
-    0.5s), stale (no camera frame for 0.5s), telemetry_stale, timeout, stopped (stop() or
-    listen() was called -- call stop() at any time to abort). No searching for a lost line.
+    It stops by itself and reports why: finish_candidate (something like the end strip is
+    reached -- may be paint or glare), end_of_tape (the line vanished right after a cross strip
+    was seen), lost (no line for 0.5s), stale (no camera frame for 0.5s), telemetry_stale,
+    timeout, stopped (stop() or listen() was called -- call stop() at any time to abort).
+    The reason is a CLAIM, not a verdict: call line_follow_report and look at the images before
+    deciding what it was. No searching for a lost line.
     Records telemetry, video, and a per-frame follow_log.csv to recordings/<name>/.
-    speed_pwm is the cruise forward effort, 50-70 (default 58); turns may go up to 90 on the
-    outer wheel.
+    speed_pwm is the cruise forward effort, 50-64 (default 58; forward effort is touchy, so
+    it is capped low); turns may go up to 100 on the outer wheel, and a spin that is not
+    getting anywhere is boosted up to 85.
 
     show_on_phone (default False): also show the line-detection overlay with a motor-command
     panel (wheel bars, aim angle, status) live on the phone's screen. Needs
     phone/display_server.py running in Termux and show.html open in the phone's browser (see
     phone/README.md); if the phone can't be reached the run still starts and the result says
-    so. Purely cosmetic: it can't affect the run."""
+    so. Purely cosmetic: it can't affect the run.
+
+    ignore_finish_s (default 0, max 30): for resuming mid-course after you've judged a stop
+    was a FALSE finish (chipped paint, glare mistaken for the finish strip). For this many
+    seconds after the start, a finish strip in view doesn't block the start and doesn't end
+    the run. Lost-line, stale and timeout stops still apply. Leave at 0 for a normal start."""
     if link is None:
         return _not_connected()
+    if not (0 <= ignore_finish_s <= 30):
+        return {"ok": False, "error": "ignore_finish_s must be 0-30"}
     gate = _confirm_gate(confirmed_safe)
     if gate:
         return gate
@@ -1349,8 +1364,8 @@ def start_line_follow(confirmed_safe: bool, speed_pwm: int = 58, max_seconds: fl
     if not (0 < max_seconds <= 300):
         return {"ok": False, "error": "max_seconds must be in (0, 300]"}
     snap = link.telemetry_snapshot()
-    if not snap["telemetry_live"]:
-        return {"ok": False, "error": "no live encoder telemetry", "telemetry": snap}
+    if not snap["imu_live"]:   # camera-only follower: encoders not required
+        return {"ok": False, "error": "no live IMU telemetry (board link down?)", "telemetry": snap}
     src = _frame_source()
     t0 = time.monotonic()
     while src.latest() is None and time.monotonic() - t0 < 10:
@@ -1358,9 +1373,17 @@ def start_line_follow(confirmed_safe: bool, speed_pwm: int = 58, max_seconds: fl
     fr = src.latest()
     if fr is None or src.age_s() > 1.0:
         return {"ok": False, "error": "no live camera frames", "camera": src.status()}
+    # A stream that just (re)opened delivers its first frames late and uneven, which trips
+    # the follower's stale-frame stop within half a second. Let it settle first.
+    while not src.is_warm() and time.monotonic() - t0 < 12:
+        time.sleep(0.1)
+    if not src.is_warm():
+        return {"ok": False, "error": "camera stream not steady yet (needs ~20 frames at >=10 fps "
+                "with no gaps over 0.3s); try again in a few seconds", "camera": src.status()}
+    fr = src.latest()
     res, _ = line_vision.analyze(fr.img)
     ctl = line_follow.LineFollower(max_run_s=max_seconds, forward_pwm_sign=FORWARD_PWM_SIGN,
-                                   f_cruise=speed_pwm)
+                                   f_cruise=speed_pwm, ignore_finish_s=ignore_finish_s)
     ok, why = ctl.can_start(res)
     if not ok:
         return {"ok": False, "error": why}
@@ -1394,15 +1417,93 @@ def start_line_follow(confirmed_safe: bool, speed_pwm: int = 58, max_seconds: fl
 
 @mcp.tool()
 def line_follow_status(wait_s: float = 0.0) -> dict:
-    """Read-only. State of the line-follow run: running / the reason it ended (finished, lost,
-    stale, telemetry_stale, timeout, stopped, error: ...), the latest offsets and wheel
-    efforts, and the recording folder. wait_s (max 60) blocks until the run ends or that long
+    """Read-only. State of the line-follow run: running / the reason it ended (finish_candidate,
+    end_of_tape, lost, stale, telemetry_stale, timeout, stopped, error: ...; these are claims --
+    verify with line_follow_report), the latest offsets and wheel efforts (info.boost > 0 means
+    the stall check is adding spin effort), and the recording folder. wait_s (max 60) blocks until the run ends or that long
     passes -- use it instead of polling in a tight loop. Never moves the robot."""
     if _follow["running"] and wait_s > 0:
         _follow["ended"].wait(min(wait_s, 60.0))
     return {"ok": True, "running": _follow["running"], "status": _follow["status"],
             "info": _follow["info"], "result": _follow["result"],
             "camera": None if _frames is None else _frames.status()}
+
+
+@mcp.tool()
+def line_follow_report(run: Optional[str] = None, n_rows: int = 10, n_frames: int = 6,
+                       raw: bool = True):
+    """Read-only. Everything needed to judge why a line-follow run stopped, in one call:
+    the end reason, the last `n_rows` rows of the run's follow_log.csv (offset, aim angle,
+    bands, spin, wheel efforts), a contact sheet of the last `n_frames` video frames with the
+    detection drawn on (oldest at left; red = dark pixels, green dots = line), and a fresh
+    full-resolution still of what the robot sees right now with the same overlay. With
+    `raw` (default true) it also returns the same frames and the same still WITHOUT any
+    overlay, because the red tint can hide small things (a paint chip, a glare edge, a thin
+    crossbar): the images come back in the order annotated sheet, raw sheet, annotated still,
+    raw still. `run` is a recordings/ folder name (default: the latest line-follow run). Use it
+    after any stop to tell a real finish from a false one (paint, glare), and to see which side
+    the line left on. Never moves the robot, no confirmation needed; the still takes ~5-8s."""
+    import csv
+    import json
+    try:
+        import cv2
+        import numpy as np
+        rec_root = Path(__file__).resolve().parent.parent / "recordings"
+        if run:
+            d = rec_root / run
+        else:
+            logs = sorted(rec_root.glob("*/follow_log.csv"), key=lambda q: q.stat().st_mtime)
+            if not logs:
+                return {"ok": False, "error": "no line-follow runs recorded yet"}
+            d = logs[-1].parent
+        if not (d / "follow_log.csv").exists():
+            return {"ok": False, "error": f"no follow_log.csv in {d}"}
+        rows = list(csv.DictReader(open(d / "follow_log.csv")))
+        n_rows, n_frames = max(1, min(n_rows, 40)), max(1, min(n_frames, 12))
+        last_seen = next((r for r in reversed(rows) if r["found"] == "1"), None)
+        summary = {"ok": True, "dir": str(d), "running": _follow["running"],
+                   "status": _follow["status"] if _follow["running"] else (
+                       (_follow["result"] or {}).get("status") if _follow["result"] else None),
+                   "rows_total": len(rows), "last_rows": rows[-n_rows:],
+                   "last_line_seen": None if last_seen is None else dict(
+                       time_s=last_seen["time_s"], e_near_in=last_seen["e_near_in"],
+                       phi_deg=last_seen["phi_deg"],
+                       side="right" if float(last_seen["phi_deg"] or 0) > 0 else "left")}
+        out = [json.dumps(summary)]
+        cap = cv2.VideoCapture(str(d / "video.mp4"))
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        tiles, raw_tiles = [], []
+        for i in range(max(0, n - n_frames), n):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            ok, f = cap.read()
+            if not ok:
+                continue
+            _, ann = line_vision.analyze(f)
+            for dst, img in ((tiles, ann), (raw_tiles, f)):
+                img = cv2.resize(img, (240, round(img.shape[0] * 240 / img.shape[1])))
+                cv2.putText(img, str(i), (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                dst.append(img)
+        for sheet in ((tiles, raw_tiles) if raw else (tiles,)):
+            if sheet:
+                hmax = max(t.shape[0] for t in sheet)
+                sheet = [cv2.copyMakeBorder(t, 0, hmax - t.shape[0], 0, 0, cv2.BORDER_CONSTANT) for t in sheet]
+                ok, jpg = cv2.imencode(".jpg", np.hstack(sheet), [cv2.IMWRITE_JPEG_QUALITY, 80])
+                out.append(Image(data=jpg.tobytes(), format="jpeg"))
+        try:
+            bgr = cv2.imdecode(np.frombuffer(_fetch_snapshot(), np.uint8), cv2.IMREAD_COLOR)
+            bgr = cv2.resize(bgr, (640, round(bgr.shape[0] * 640 / bgr.shape[1])))
+            res, ann = line_vision.analyze(bgr)
+            ok, jpg = cv2.imencode(".jpg", ann, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            out[0] = json.dumps({**summary, "still_detection": res})
+            out.append(Image(data=jpg.tobytes(), format="jpeg"))
+            if raw:
+                ok, jpg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                out.append(Image(data=jpg.tobytes(), format="jpeg"))
+        except Exception as e:
+            out[0] = json.dumps({**summary, "still_error": str(e)})
+        return out
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 TURN_MAX_SECONDS = 3600.0

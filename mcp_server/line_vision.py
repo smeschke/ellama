@@ -19,7 +19,7 @@ N_BANDS = 8
 # Fraction of the image height, top and bottom, that is ignored. The bottom often shows the
 # robot's own bumper or wheels; the top is far away and low-resolution.
 ROI_TOP = 0.05
-ROI_BOTTOM = 0.85
+ROI_BOTTOM = 0.56  # new webcam mount sees the robot front + shadow below ~0.60
 # A run narrower than this (fraction of image width) is noise, wider is a shadow or the
 # edge of the sheet, not tape.
 MIN_RUN_FRAC = 0.01
@@ -30,7 +30,7 @@ OPEN_WIDTH_FRAC = 0.01  # box width (fraction of image width) the tape must fill
 MAX_BAND_STEP_FRAC = 0.15  # max sideways jump of the line between neighboring bands
 CROSS_MIN_FRAC = 0.40  # a run this wide (fraction of image width) is a cross strip, not the line
 CROSS_MIN_ROWS_FRAC = 0.012  # ...and must stay that wide for this much of the image height
-CROSS_MAX_Y_FRAC = 0.70  # only looked for above this (fraction of height from the top)
+CROSS_MAX_Y_FRAC = 0.56  # only looked for above this (fraction of height from the top)
 REL_THRESH = 0.35  # mask threshold as a fraction of the strongest response
 
 

@@ -70,6 +70,18 @@ class FrameSource:
             ts = list(self._times)
         return 0.0 if len(ts) < 2 or ts[-1] == ts[0] else (len(ts) - 1) / (ts[-1] - ts[0])
 
+    def is_warm(self, min_frames=20, min_fps=10.0, max_gap_s=0.3):
+        """True once the stream has settled: enough frames since it opened, a sane frame
+        rate, and no gap between recent frames long enough to trip the follower's stale
+        check. Right after a (re)start the first frames arrive late and uneven."""
+        with self._lock:
+            ts = list(self._times)
+        if self.seq < min_frames or len(ts) < min_frames:
+            return False
+        ts = ts[-min_frames:]
+        gaps = [b - a for a, b in zip(ts, ts[1:])]
+        return (len(ts) - 1) / (ts[-1] - ts[0]) >= min_fps and max(gaps) <= max_gap_s
+
     def subscribe(self, callback):
         with self._lock:
             self._subs.append(callback)

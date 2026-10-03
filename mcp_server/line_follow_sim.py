@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Closed-loop simulation of line_follow.LineFollower on a toy robot, to tune the controller
-before it drives anything.
+before it drives anything. Runs end in `finish_candidate` (the strip was seen) -- in the real
+system that is a hand-off to the AI, here it just counts as arriving.
 
     python3 mcp_server/line_follow_sim.py            # a table of courses x plant variations
     python3 mcp_server/line_follow_sim.py --plot     # also save sim_<course>.png trajectories
@@ -70,7 +71,7 @@ class Plant:
     """Yaw has two regimes (see line_follow.py): linear and weak while driving, deadband then
     steeper while spinning on the spot. Blended on the (lagged) forward effort."""
 
-    def __init__(self, g=0.5, t_db=28.0, g_drive=0.2, left_scale=0.85, tau_f=0.2, tau_t=0.15,
+    def __init__(self, g=1.2, t_db=50.0, g_drive=0.2, left_scale=0.85, tau_f=0.2, tau_t=0.15,
                  kv=0.095, f_db=45.0):
         self.g, self.t_db, self.g_drive, self.left_scale = g, t_db, g_drive, left_scale
         self.tau_f, self.tau_t, self.kv, self.f_db = tau_f, tau_t, kv, f_db
@@ -180,9 +181,13 @@ def run(course, plant, delay=0.25, noise=0.1, start_off=(0.0, 0.0), seed=0, f_cr
 
 
 VARIANTS = {
+    # nominal: the test floor as measured 2026-10-03 -- a spin does nothing below ~50, then ~17 deg/s at 64
     "nominal": dict(plant=dict(), delay=0.25),
-    "weak turn": dict(plant=dict(g=0.3, t_db=35.0, g_drive=0.13), delay=0.25),
-    "strong turn": dict(plant=dict(g=0.7, t_db=22.0, g_drive=0.3), delay=0.25),
+    "old fit": dict(plant=dict(g=0.5, t_db=28.0), delay=0.25),
+    "weak turn": dict(plant=dict(g=0.8, t_db=56.0, g_drive=0.13), delay=0.25),
+    "strong turn": dict(plant=dict(g=1.6, t_db=44.0, g_drive=0.3), delay=0.25),
+    # needs the stall boost: nothing moves until ~66, past what the first spin command asks for
+    "sticky floor": dict(plant=dict(g=1.2, t_db=66.0), delay=0.25),
     "slow camera": dict(plant=dict(), delay=0.45),
     "laggy motors": dict(plant=dict(tau_f=0.35, tau_t=0.3), delay=0.25),
 }
@@ -192,7 +197,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--plot", action="store_true")
     ap.add_argument("--cruise", type=int, default=None, help="override F_CRUISE")
+    ap.add_argument("--no-boost", action="store_true", help="disable the spin stall boost (to see it matter)")
     args = ap.parse_args()
+    if args.no_boost:
+        lf.STALL_BOOST = 0
     starts = [(0.0, 0.0), (2.5, 12.0), (-2.5, -12.0)]
     print(f"{'course':14s} {'variant':13s} " + "  ".join(f"start{i}" for i in range(len(starts))))
     bad = 0
@@ -202,7 +210,7 @@ def main():
             for si, so in enumerate(starts):
                 r = run(course, Plant(**v["plant"]), delay=v["delay"], start_off=so, seed=si,
                         f_cruise=args.cruise)
-                good = r["status"] == "finished"
+                good = r["status"] in ("finish_candidate", "end_of_tape")
                 bad += not good
                 cells.append(f"{r['status'][:8]:8s} err{(r['max_err'] if r['max_err'] is not None else 0):4.1f}in {r['t']:4.0f}s")
             print(f"{course:14s} {vname:13s} " + " | ".join(cells))
