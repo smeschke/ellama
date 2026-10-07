@@ -28,16 +28,21 @@ Env:
                          default scans the local /24 subnet for the phone.
 """
 
+import array
 import atexit
+import json
 import math
 import os
 import signal
 import socket
 import ssl
+import subprocess
 import sys
 import threading
+import tempfile
 import time
 import urllib.request
+import wave
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
@@ -780,6 +785,7 @@ def drive_distance(
     direction: Literal["forward", "reverse"],
     pwm: int,
     confirmed_safe: bool,
+    warn_lights: bool = True,
 ) -> dict:
     """Closed-loop straight-line move: drives at `pwm` (0-255, clamped to
     MAX_PWM_CEILING=125) until the wheel encoders report `distance_inches` traveled, then
@@ -798,6 +804,11 @@ def drive_distance(
     (FORWARD_PWM_SIGN in this file) but hasn't been verified against a live test yet --
     the first real call on new hardware should be a small one specifically to check the
     robot actually moves the way it was asked.
+
+    By default (warn_lights=True) the WLED strip does a 1.5 s warning pattern (on, off, on,
+    off, on, solid green at 50%) right before the motors start, then is restored when the
+    move ends; pass warn_lights=False to skip it. A strip that can't be reached never
+    blocks the move.
     """
     if link is None:
         return _not_connected()
@@ -826,6 +837,7 @@ def drive_distance(
     if pwm == 0:
         return {"ok": False, "error": "pwm must be > 0"}
 
+    prior_lights = _warn_blink(warn_lights)
     link.send_stop()
     time.sleep(STOP_SETTLE_S)
 
@@ -854,6 +866,7 @@ def drive_distance(
             time.sleep(0.03)
     finally:
         link.send_stop()
+        _lights_restore(prior_lights)
         time.sleep(STOP_SETTLE_S)
 
     end = link.last_counts()
@@ -877,6 +890,7 @@ def turn_degrees(
     direction: Literal["left", "right"],
     pwm: int,
     confirmed_safe: bool,
+    warn_lights: bool = True,
 ) -> dict:
     """Closed-loop spin-in-place: drives the wheels in opposite directions at `pwm`
     (0-255, clamped to MAX_PWM_CEILING=125) until the IMU's gyro-integrated yaw reports
@@ -894,6 +908,11 @@ def turn_degrees(
 
     Capped at MAX_SINGLE_TURN_DEG=180 per call. direction "left" is counter-clockwise
     viewed from above, matching calibration/bridge.py's heading convention.
+
+    By default (warn_lights=True) the WLED strip does a 1.5 s warning pattern (on, off, on,
+    off, on, solid green at 50%) right before the motors start, then is restored when the
+    move ends; pass warn_lights=False to skip it. A strip that can't be reached never
+    blocks the move.
     """
     if link is None:
         return _not_connected()
@@ -929,6 +948,7 @@ def turn_degrees(
     if pwm == 0:
         return {"ok": False, "error": "pwm must be > 0"}
 
+    prior_lights = _warn_blink(warn_lights)
     link.send_stop()
     time.sleep(STOP_SETTLE_S)
 
@@ -964,6 +984,7 @@ def turn_degrees(
             time.sleep(0.03)
     finally:
         link.send_stop()
+        _lights_restore(prior_lights)
         time.sleep(STOP_SETTLE_S)
 
     end = link.last_counts()
@@ -998,6 +1019,7 @@ def drive_arc(
     confirmed_safe: bool,
     max_wheel_pwm: int = MAX_PWM_CEILING,
     travel: Literal["forward", "reverse"] = "forward",
+    warn_lights: bool = True,
 ) -> dict:
     """Closed-loop curved drive: both wheels roll forward (or backward, see `travel`), the
     outer one faster, so the robot drives an arc of `radius_inches` (measured to the robot's center) until the
@@ -1033,6 +1055,11 @@ def drive_arc(
     up into space the operator has said is clear. Forward then reverse arcs of the same
     direction trace an S-curve: the robot ends facing the opposite way, displaced along its
     original axis by twice the radius and back on the same line laterally.
+
+    By default (warn_lights=True) the WLED strip does a 1.5 s warning pattern (on, off, on,
+    off, on, solid green at 50%) right before the motors start, then is restored when the
+    move ends; pass warn_lights=False to skip it. A strip that can't be reached never
+    blocks the move.
     """
     if link is None:
         return _not_connected()
@@ -1062,6 +1089,7 @@ def drive_arc(
     if pwm == 0:
         return {"ok": False, "error": "pwm and max_wheel_pwm must be > 0"}
 
+    prior_lights = _warn_blink(warn_lights)
     link.send_stop()
     time.sleep(STOP_SETTLE_S)
 
@@ -1132,6 +1160,7 @@ def drive_arc(
             time.sleep(0.03)
     finally:
         link.send_stop()
+        _lights_restore(prior_lights)
         time.sleep(STOP_SETTLE_S)
 
     end = link.last_counts()
@@ -1161,7 +1190,8 @@ def drive_arc(
 
 
 @mcp.tool()
-def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool) -> dict:
+def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool,
+        warn_lights: bool = True, require_telemetry: bool = True) -> dict:
     """Raw open-loop command: drive at exactly (left_pwm, right_pwm) for duration_s
     seconds, then stop. No encoder target and no direction-aware sign correction (unlike
     drive_distance/turn_degrees) -- positive does not necessarily mean forward, see
@@ -1169,6 +1199,15 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool) 
     duration matters more than hitting a distance or angle (checking direction, deadband,
     turn convention by eye). Same confirmed_safe gate as the other drive tools. Capped at
     MAX_JOG_DURATION_S=10s and MAX_PWM_CEILING=125 per side.
+
+    By default (warn_lights=True) the WLED strip does a 1.5 s warning pattern (on, off, on,
+    off, on, solid green at 50%) right before the motors start, then is restored when the
+    move ends; pass warn_lights=False to skip it. A strip that can't be reached never
+    blocks the move.
+
+    require_telemetry=True (default) refuses to run without live encoder data. Pass False
+    ONLY for a bench test the operator is watching (e.g. robot on blocks while the encoder
+    link is down): it still needs confirmed_safe, and the distances come back as null.
     """
     if link is None:
         return _not_connected()
@@ -1179,13 +1218,14 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool) 
         return {"ok": False, "error": f"duration_s must be > 0 and <= {MAX_JOG_DURATION_S}"}
 
     snap = link.telemetry_snapshot()
-    if not snap["telemetry_live"]:
+    if require_telemetry and not snap["telemetry_live"]:
         return {
             "ok": False,
             "error": "no live encoder telemetry -- refusing to drive without feedback",
             "telemetry": snap,
         }
 
+    prior_lights = _warn_blink(warn_lights)
     link.send_stop()
     time.sleep(STOP_SETTLE_S)
 
@@ -1197,17 +1237,19 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool) 
             time.sleep(min(DRIVE_KEEPALIVE_S, max(0.0, duration_s - (time.monotonic() - t_start))))
     finally:
         link.send_stop()
+        _lights_restore(prior_lights)
         time.sleep(STOP_SETTLE_S)
 
     end = link.last_counts()
     in_per_tick = link.in_per_tick()
+    have_counts = start is not None and end is not None
     return {
         "ok": True,
         "left_pwm": left_pwm,
         "right_pwm": right_pwm,
         "duration_s": duration_s,
-        "dist_l_in": round((end[0] - start[0]) * in_per_tick, 2),
-        "dist_r_in": round((end[1] - start[1]) * in_per_tick, 2),
+        "dist_l_in": round((end[0] - start[0]) * in_per_tick, 2) if have_counts else None,
+        "dist_r_in": round((end[1] - start[1]) * in_per_tick, 2) if have_counts else None,
         "elapsed_s": round(time.monotonic() - t_start, 2),
         "telemetry": link.telemetry_snapshot(),
     }
@@ -1724,6 +1766,210 @@ def turn_to_me_status(wait_s: float = 0.0) -> dict:
     them, and the recording folder. wait_s (max 60) blocks until the run ends or that long
     passes. Never moves the robot."""
     return line_follow_status(wait_s)
+
+
+WLED_HOST = os.environ.get("ELLAMA_WLED_HOST", "192.168.0.57")
+
+
+def _wled(path, body=None):
+    req = urllib.request.Request(
+        f"http://{WLED_HOST}{path}",
+        data=None if body is None else json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=4) as r:
+        return json.load(r)
+
+
+def _wled_snapshot():
+    """The strip's current on/bri/effect/speed/intensity/color, in a form _wled() can re-post."""
+    st = _wled("/json/state")
+    sg = st["seg"][0]
+    return {"on": st["on"], "bri": st["bri"], "tt": 0,
+            "seg": [{"fx": sg["fx"], "sx": sg["sx"], "ix": sg["ix"], "col": sg["col"]}]}
+
+
+def _lights_restore(prior):
+    if prior:
+        try:
+            _wled("/json/state", prior)
+        except Exception:
+            pass
+
+
+def _blink(blinks=2, phase_s=0.3, color=(0, 255, 0), brightness=127, fade=True):
+    """on, then `blinks` x (off, on), each phase phase_s long, leaving the strip solid `color`
+    when it returns (so 2 blinks at 0.3 s = on off on off on = 1.5 s). With fade=True each
+    phase is a WLED transition of the same length (tt is in 100 ms units), so it ramps up and
+    down instead of switching; fade=False switches instantly. Phases are scheduled from one
+    start time so the HTTP round-trips don't stretch the pattern."""
+    tt = max(1, round(phase_s * 10)) if fade else 0
+    on = {"on": True, "bri": max(0, min(255, brightness)), "tt": tt,
+          "seg": [{"fx": 0, "col": [list(color)]}]}
+    off = {"on": False, "tt": tt}
+    t0 = time.monotonic()
+    for k in range(1 + 2 * blinks):
+        _wled("/json/state", on if k % 2 == 0 else off)
+        time.sleep(max(0.0, t0 + (k + 1) * phase_s - time.monotonic()))
+
+
+def _warn_blink(enabled):
+    """Pre-move warning for the drive tools. Returns the strip's prior state for
+    _lights_restore (None if skipped or the strip is unreachable -- never blocks a move)."""
+    if not enabled:
+        return None
+    try:
+        prior = _wled_snapshot()
+        _blink()
+        return prior
+    except Exception:
+        return None
+
+
+@mcp.tool()
+def lights_blink(blinks: int = 2, phase_s: float = 0.3, color: str = "00ff00",
+                 brightness: int = 127, restore: bool = True, fade: bool = True) -> dict:
+    """Blink the WLED strip: on, then `blinks` x (off, on), each phase phase_s seconds, ending
+    solid on. Defaults are the pre-move warning (on off on off on = 1.5 s, green, 50%, each
+    phase fading in or out; fade=False for hard switching). With restore=True the strip goes
+    back to how it was afterwards. Safe, no confirmation needed."""
+    blinks = max(1, min(10, blinks))
+    h = color.lstrip("#")
+    try:
+        prior = _wled_snapshot()
+        _blink(blinks, max(0.05, phase_s), tuple(int(h[i:i + 2], 16) for i in (0, 2, 4)), brightness, fade)
+        if restore:
+            _lights_restore(prior)
+    except Exception as e:
+        return {"ok": False, "error": f"WLED at {WLED_HOST} unreachable: {e}"}
+    return {"ok": True, "seconds": round((1 + 2 * blinks) * max(0.05, phase_s), 2), "restored": restore}
+
+
+@mcp.tool()
+def lights(on: bool = True, brightness: Optional[int] = None, color: Optional[str] = None,
+           effect: Optional[str] = None, speed: Optional[int] = None,
+           intensity: Optional[int] = None) -> dict:
+    """Control the WLED lights (default 192.168.0.57, override with ELLAMA_WLED_HOST).
+    on=False turns them off. Optional: brightness 0-255, color as hex like "ff8800",
+    effect by name (e.g. "Rainbow", "Breathe", "Solid"; see list_light_effects), speed and
+    intensity 0-255. Safe, no confirmation needed."""
+    seg = {}
+    if color:
+        h = color.lstrip("#")
+        seg["col"] = [[int(h[i:i + 2], 16) for i in (0, 2, 4)]]
+    if effect:
+        names = _wled("/json/eff")
+        match = [i for i, n in enumerate(names) if n.lower() == effect.lower()]
+        if not match:
+            return {"ok": False, "error": f"unknown effect {effect!r}; see list_light_effects"}
+        seg["fx"] = match[0]
+    if speed is not None:
+        seg["sx"] = max(0, min(255, speed))
+    if intensity is not None:
+        seg["ix"] = max(0, min(255, intensity))
+    body = {"on": on}
+    if brightness is not None:
+        body["bri"] = max(0, min(255, brightness))
+    if seg:
+        body["seg"] = [seg]
+    try:
+        _wled("/json/state", body)
+        st = _wled("/json/state")
+    except Exception as e:
+        return {"ok": False, "error": f"WLED at {WLED_HOST} unreachable: {e}"}
+    s0 = st["seg"][0]
+    return {"ok": True, "on": st["on"], "brightness": st["bri"], "effect_id": s0["fx"],
+            "color": s0["col"][0]}
+
+
+@mcp.tool()
+def list_light_effects() -> dict:
+    """List the WLED effect names that lights(effect=...) accepts."""
+    try:
+        return {"ok": True, "effects": _wled("/json/eff")}
+    except Exception as e:
+        return {"ok": False, "error": f"WLED at {WLED_HOST} unreachable: {e}"}
+
+
+PIPER_BIN = os.environ.get("ELLAMA_PIPER", str(Path.home() / ".local/share/piper-venv/bin/piper"))
+PIPER_VOICE = os.environ.get("ELLAMA_PIPER_VOICE", str(Path.home() / "piper-voices/en_US-ryan-high.onnx"))
+_speak_lock = threading.Lock()
+_MOUTH_REST = [1.0, 0.8, 0.55, 0.35, 0.18, 0.07]  # closed mouth: center LED, brightness trails off
+
+
+@mcp.tool()
+def speak(text: str, speed: float = 1.3, max_brightness: int = 127) -> dict:
+    """Say text out loud on THIS computer's speakers (the robot has none) with Piper TTS,
+    while the WLED strip shows a mouth: a closed-mouth glow that opens outward from the
+    center with the real loudness of the audio. Blocks until done, then restores the lights
+    to how they were. speed is Piper's length-scale (1.0 normal, 1.3 = 30% slower);
+    max_brightness caps the strip during speech (0-255, default 127 = 50%). No confirmation
+    needed."""
+    if not _speak_lock.acquire(blocking=False):
+        return {"ok": False, "error": "already speaking"}
+    wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+    prior = None
+    try:
+        r = subprocess.run([PIPER_BIN, "-m", PIPER_VOICE, "--length-scale", str(speed), "-f", wav],
+                           input=text.encode(), capture_output=True, timeout=60)
+        if r.returncode:
+            return {"ok": False, "error": f"piper failed: {r.stderr.decode()[-300:]}"}
+        w = wave.open(wav)
+        sr, pcm = w.getframerate(), array.array("h", w.readframes(w.getnframes()))
+        w.close()
+        fps, hop, n = 30, sr // 30, 27
+        rms = [math.sqrt(sum(x * x for x in pcm[i:i + hop]) / hop) for i in range(0, len(pcm) - hop, hop)]
+        if not rms:
+            return {"ok": False, "error": "no audio generated"}
+        peak = sorted(rms)[int(len(rms) * 0.97)] or 1
+        c = n // 2
+        rest = [_MOUTH_REST[abs(i - c)] if abs(i - c) < len(_MOUTH_REST) else 0.0 for i in range(n)]
+        try:
+            st = _wled("/json/state")
+            sg = st["seg"][0]
+            prior = {"on": st["on"], "bri": st["bri"],
+                     "seg": [{"fx": sg["fx"], "sx": sg["sx"], "ix": sg["ix"], "col": sg["col"]}]}
+            _wled("/json/state", {"on": True, "bri": max(0, min(255, max_brightness))})
+        except Exception:
+            pass  # lights unreachable: still speak, just without the mouth
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        glow, env = rest[:], 0.0
+
+        def frame(target):
+            nonlocal env
+            env += (target - env) * (0.6 if target > env else 0.25)  # fast attack, slow release
+            length = env * (c + 1)
+            pkt = bytearray([2, 2])
+            for i in range(n):
+                glow[i] = max(min(1.0, max(0.0, length - abs(i - c))), glow[i] * 0.86, rest[i])
+                pkt += bytes([0, int(255 * glow[i] ** 2.2), 0])
+            try:
+                sock.sendto(pkt, (WLED_HOST, 21324))
+            except OSError:
+                pass
+
+        player = subprocess.Popen(["aplay", "-q", wav])
+        t0 = time.time()
+        for k, r_ in enumerate(rms):
+            while time.time() - t0 < k / fps:
+                time.sleep(0.002)
+            frame(min(1.0, r_ / peak))
+        player.wait()
+        for _ in range(int(1.5 * fps)):  # settle to closed mouth briefly
+            frame(0.0)
+            time.sleep(1 / fps)
+        return {"ok": True, "seconds": round(len(pcm) / sr, 1)}
+    finally:
+        if prior:
+            time.sleep(2.2)  # let WLED's realtime timeout expire before restoring
+            try:
+                _wled("/json/state", prior)
+            except Exception:
+                pass
+        try:
+            os.unlink(wav)
+        except OSError:
+            pass
+        _speak_lock.release()
 
 
 if __name__ == "__main__":

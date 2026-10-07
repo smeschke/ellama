@@ -41,6 +41,7 @@ DEFAULT_CONFIG = {
     "ticks_per_rev": 4096,       # AS5600, per revolution of the MAGNET shaft (not the wheel)
     "gear_ratio": 6.33,          # encoder-shaft turns per wheel turn; empirical, same as the bench sketch
     "track_width_in": 20.0,      # PLACEHOLDER until calibrated -- wheel-to-wheel distance
+    "encoder_sign": [1, 1],      # [left, right]; -1 flips a wheel whose magnet/encoder counts backward
 }
 
 
@@ -51,6 +52,9 @@ def load_config():
     except FileNotFoundError:
         pass
     return cfg
+
+
+ENC_SIGN = tuple(load_config()["encoder_sign"])  # applied to ENC counts in parse_line
 
 
 def save_config(cfg):
@@ -125,7 +129,8 @@ def parse_line(raw):
     parts = text.split()
     try:
         if parts and parts[0] == "ENC" and len(parts) == 4:
-            return "ENC", tuple(int(x) for x in parts[1:4])
+            left, right, ms = (int(x) for x in parts[1:4])
+            return "ENC", (left * ENC_SIGN[0], right * ENC_SIGN[1], ms)
         if parts and parts[0] == "CMD" and len(parts) == 3:
             return "CMD", tuple(int(x) for x in parts[1:3])
         if parts and parts[0] == "IMU" and len(parts) == 8:

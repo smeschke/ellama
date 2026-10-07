@@ -2,5 +2,9 @@
   "wheel_diameter_in": 10.0,
   "ticks_per_rev": 4096,
   "gear_ratio": 6.33,
-  "track_width_in": 20.0
+  "track_width_in": 20.0,
+  "encoder_sign": [
+    1,
+    1
+  ]
 }

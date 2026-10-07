@@ -58,7 +58,7 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `drive_distance(distance_inches, direction, pwm, confirmed_safe)` | Yes | Yes |
 | `turn_degrees(degrees, direction, pwm, confirmed_safe)` | Yes | Yes |
 | `drive_arc(radius_inches, degrees, direction, pwm, confirmed_safe, max_wheel_pwm=125, travel="forward")` | Yes (curved; 360° = full circle; `travel="reverse"` backs up along the arc) | Yes |
-| `jog(left_pwm, right_pwm, duration_s, confirmed_safe)` | Yes (raw, time-based) | Yes |
+| `jog(left_pwm, right_pwm, duration_s, confirmed_safe, require_telemetry=True)` | Yes (raw, time-based) | Yes |
 | `line_view(width=640)` | No | — |
 | `person_view()` | No | — (finds people in the live frame, returns bearing to each) |
 | `turn_to_me(confirmed_safe, max_seconds=30, name=None, spin_speed_dps=18, lost_timeout_s=1)` | Yes (spins in place, holds until it ends; max_seconds / lost_timeout_s of 0 = never) | Yes — once per run; refuses to start if 0 or >1 people are in view (ask the operator) |
@@ -66,6 +66,10 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `turn_to_me_status(wait_s=0)` | No | — |
 | `start_line_follow(confirmed_safe, speed_pwm=58, max_seconds=90, name=None, show_on_phone=False)` | Yes (autonomous, until it ends) | Yes — once per run (`show_on_phone` also shows the overlay + motor panel on the phone; see `phone/README.md`) |
 | `line_follow_status(wait_s=0)` | No | — |
+| `lights(on=True, brightness, color, effect, speed, intensity)` | No (WLED strip at `ELLAMA_WLED_HOST`, default 192.168.0.57) | — |
+| `list_light_effects()` | No | — |
+| `lights_blink(blinks=2, phase_s=0.3, color="00ff00", brightness=127, restore=True, fade=True)` | No (on off on off on = 1.5 s by default, each phase fading) | — |
+| `speak(text, speed=1.3, max_brightness=127)` | No (Piper TTS out of this computer's speakers, WLED strip animates a mouth; blocks until done. Env: `ELLAMA_PIPER`, `ELLAMA_PIPER_VOICE`) | — |
 
 `look()` returns a photo from the phone camera on the robot (Android "IP Camera" or "IP
 Webcam" app). The phone is found by scanning the local /24 for ports 8080/4444, or set
@@ -108,6 +112,8 @@ further confirmed calls for more, checking `read_telemetry()` between them, per
 `DRIVING_POLICY.md`'s stop-check-decide-move loop. `jog` is the odd one out: open-loop,
 raw PWM, fixed duration, no target — for bench/commissioning tests, capped at
 `MAX_JOG_DURATION_S`.
+
+`drive_distance`, `turn_degrees`, `drive_arc` and `jog` take `warn_lights=True`: right before the motors start the WLED strip does the 1.5 s fading `lights_blink` pattern (on off on off on, then solid green at 50% while moving) and is restored when the move ends. Pass `warn_lights=False` to skip it. A strip that can't be reached never blocks a move.
 
 ## Known unknowns
 
