@@ -30,6 +30,8 @@ Env:
 
 import array
 import atexit
+import bisect
+import functools
 import json
 import math
 import os
@@ -59,6 +61,10 @@ import person_track  # noqa: E402  (mcp_server/person_track.py)
 import person_vision  # noqa: E402  (mcp_server/person_vision.py)
 import camera_stream  # noqa: E402  (mcp_server/camera_stream.py)
 import line_follow  # noqa: E402  (mcp_server/line_follow.py)
+import hearing  # noqa: E402  (mcp_server/hearing.py)
+import perform as perform_show  # noqa: E402  (mcp_server/perform.py)
+import tilt_guard  # noqa: E402  (mcp_server/tilt_guard.py)
+import motion_guard  # noqa: E402  (mcp_server/motion_guard.py)
 
 from mcp.server.mcpserver import MCPServer as FastMCP  # mcp>=2.0 renamed FastMCP -> MCPServer
 from mcp.server.mcpserver import Image
@@ -136,6 +142,55 @@ ENCODER_FORWARD_SIGN = (1, 1)
 # wiring, motor board firmware, or which physical wheel is "left" vs "right".
 FORWARD_PWM_SIGN = -1
 
+# ---------------------------------------------------------------------------
+# Tilt guard (mcp_server/tilt_guard.py). The robot is low and can run banks up to ~25 deg;
+# past that it tips. Every drive command goes through RobotLink.send_drive, which refuses
+# (and sends "stop") once the guard has tripped, or while there is no live IMU to judge by.
+# This only covers commands that come through THIS server -- the handheld stick is not
+# guarded. Env knobs are the operator's, deliberately not tool arguments:
+#   ELLAMA_TILT_LIMIT_DEG     trip angle from the level reference (default 25)
+#   ELLAMA_TILT_LOOKAHEAD_S   stop-latency look-ahead on the tilt rate (default 0.3)
+#   ELLAMA_TILT_GUARD=off     bench use only: never trips and never refuses (still reports tilt)
+# ---------------------------------------------------------------------------
+TILT_LIMIT_DEG = float(os.environ.get("ELLAMA_TILT_LIMIT_DEG", tilt_guard.DEFAULT_LIMIT_DEG))
+TILT_LOOKAHEAD_S = float(os.environ.get("ELLAMA_TILT_LOOKAHEAD_S", tilt_guard.DEFAULT_LOOKAHEAD_S))
+TILT_GUARD_ENABLED = os.environ.get("ELLAMA_TILT_GUARD", "on").lower() not in ("off", "0", "false", "no")
+# Moving with the IMU silent means flying blind on the one thing this guard watches.
+IMU_STALE_FAULT_S = 0.5
+
+
+# One guard for the life of the server process, shared by every RobotLink. connect() (and a
+# robot power cycle) must not be a way to wipe a latched fault, or to re-learn "level" from a
+# robot that is leaning -- only restarting the server, which the operator does, resets it.
+TILT = tilt_guard.TiltGuard(limit_deg=TILT_LIMIT_DEG, lookahead_s=TILT_LOOKAHEAD_S,
+                            enabled=TILT_GUARD_ENABLED)
+
+
+# Motion guard (mcp_server/motion_guard.py): stall / encoder-fault / slip / bump -- the
+# sensors stopped agreeing with what was commanded. Same latch + choke point as the tilt guard.
+#   ELLAMA_MOTION_GUARD=on|warn|off   (default on; warn logs events without ever stopping)
+MOTION_MODE = os.environ.get("ELLAMA_MOTION_GUARD", "on").lower()
+if MOTION_MODE not in ("on", "warn", "off"):
+    MOTION_MODE = "on"
+MOTION = motion_guard.MotionGuard(
+    forward_pwm_sign=FORWARD_PWM_SIGN,
+    track_width_in=bridge.load_config()["track_width_in"],
+    mode=MOTION_MODE)
+
+
+class GuardFault(Exception):
+    """Raised by RobotLink.send_drive when a guard (tilt or motion) refuses a drive command.
+    Drive loops let it propagate: the tool's own `finally` sends the stop, and the tool returns
+    the fault (see _tilt_guarded); autonomous threads end with reason "error: ... guard ...".
+    `info` carries a snapshot of both guards."""
+
+    def __init__(self, message, info=None):
+        super().__init__(message)
+        self.info = info or {}
+
+
+TiltFault = GuardFault  # the original name; tests and callers still use it
+
 
 def _pick_port(explicit):
     """Like bridge.pick_port, but raises instead of calling sys.exit() -- this runs
@@ -178,6 +233,13 @@ class RobotLink:
         self.last_imu = None
         self.last_imu_wall = None  # time.monotonic() of the last IMU packet seen
 
+        # Serial writes come from tool threads AND the pump (the tilt trip sends "stop" from
+        # there, ~20 ms after the offending IMU sample), so a line must never interleave.
+        self._wlock = threading.RLock()
+        self.tilt = TILT  # module-level: a latched fault and the level reference survive connect()
+        self.motion = MOTION  # likewise: connect() must not wipe a latched motion fault
+        self.on_tilt_trip = None  # callable(fault_dict); set by the server to abort autonomous runs
+
         self._stop_pump = threading.Event()
         self._pump_thread = threading.Thread(target=self._pump, daemon=True)
         self._pump_thread.start()
@@ -191,31 +253,80 @@ class RobotLink:
             except Exception:
                 continue
             kind, payload = bridge.parse_line(raw)
+            tripped = None
             with self.lock:
                 if kind == "ENC":
                     left, right, ms = payload
                     sl, sr = self.enc.update(left, right, ms)
                     self.last_enc_wall = time.monotonic()
                     self.recorder.on_enc(self.enc, self.orient, sl, sr)
+                    if sl is not None and sr is not None:
+                        tripped = self.motion.on_enc(sl, sr, self.last_enc_wall)
                 elif kind == "CMD":
                     self.recorder.on_cmd(*payload)  # the stick's command, overheard by the bridge
                 elif kind == "IMU":
                     ax, ay, az, gx, gy, gz, ms = payload
-                    acc = self.orient.update(ax, ay, az, gx, gy, gz, ms)[:3]
-                    self.recorder.on_imu(self.enc, self.orient, acc)
+                    agx, agy, agz, dx, dy, dz = self.orient.update(ax, ay, az, gx, gy, gz, ms)
+                    self.recorder.on_imu(self.enc, self.orient, (agx, agy, agz))
                     self.last_imu = dict(ax=ax, ay=ay, az=az, gx=gx, gy=gy, gz=gz, ms=ms)
                     self.last_imu_wall = time.monotonic()
+                    tripped = self.tilt.update(self.orient.pitch, self.orient.roll, ms,
+                                               gyro_dps=math.hypot(dx, dy))
+                    mf = self.motion.on_imu(dz, agx, agy, self.last_imu_wall)
+                    tripped = tripped or mf
+            if tripped is not None:
+                # Outside the state lock: stop first (the guard already latched, so send_drive
+                # refuses from here on), then tell whoever is running an autonomous loop.
+                self.emergency_stop()
+                cb = self.on_tilt_trip
+                if cb is not None:
+                    try:
+                        cb(tripped)
+                    except Exception:
+                        pass
 
     def send_line(self, text):
-        self.ser.write((text + "\n").encode())
-        self.ser.flush()
+        with self._wlock:
+            self.ser.write((text + "\n").encode())
+            self.ser.flush()
+
+    def _tilt_refusal(self):
+        """Why a nonzero drive command must not go out right now, or None -- covers both
+        guards (name kept; see _guard_info). Fail-closed: no verdict from the IMU is a "no",
+        not a "probably fine"."""
+        m = self.motion
+        if m.mode != "off" and m.tripped:
+            return "motion guard tripped: " + m.fault["reason"]
+        t = self.tilt
+        if not t.enabled:
+            return None
+        if t.tripped:
+            return "tilt guard tripped: " + t.fault["reason"]
+        if not t.ready:
+            return "tilt guard has no level reference yet (needs ~0.5 s of a still, live IMU)"
+        age = None if self.last_imu_wall is None else time.monotonic() - self.last_imu_wall
+        if age is None or age > IMU_STALE_FAULT_S:
+            return "tilt guard has no live IMU (last sample %s ago) -- refusing to drive blind" % (
+                "never" if age is None else "%.1fs" % age)
+        return None
 
     def send_drive(self, left, right):
         left = max(-MAX_PWM_CEILING, min(MAX_PWM_CEILING, int(left)))
         right = max(-MAX_PWM_CEILING, min(MAX_PWM_CEILING, int(right)))
-        self.send_line(f"{left} {right}")
+        with self._wlock:  # check and write atomically vs. the trip's "stop" (also under it)
+            if left or right:  # a zero command is always allowed -- it's how loops stop
+                why = self._tilt_refusal()
+                if why is not None:
+                    self.emergency_stop()
+                    raise GuardFault(why, self._guard_info())
+            self.motion.on_command(left, right, time.monotonic())
+            self.send_line(f"{left} {right}")
+
+    def _guard_info(self):
+        return {"tilt": self.tilt.snapshot(), "motion": self.motion.snapshot()}
 
     def send_stop(self):
+        self.motion.on_command(0, 0, time.monotonic())
         self.send_line("stop")
 
     def send_listen(self):
@@ -248,6 +359,8 @@ class RobotLink:
                 pitch_deg=round(self.orient.pitch, 2),
                 roll_deg=round(self.orient.roll, 2),
                 yaw_deg=round(self.orient.yaw, 2),
+                tilt=self.tilt.snapshot(),
+                motion=self.motion.snapshot(),
                 telemetry_age_s=None if age is None else round(age, 2),
                 telemetry_live=age is not None and age < TELEMETRY_STALE_S,
                 imu_age_s=None if imu_age is None else round(imu_age, 2),
@@ -290,11 +403,19 @@ def _connect(port=None):
         link = None
     try:
         link = RobotLink(port)
+        link.on_tilt_trip = _on_guard_trip
         _connect_error = None
     except Exception as e:
         _connect_error = str(e)
         raise
     return link
+
+
+def _on_guard_trip(fault):
+    """Called from the IMU pump thread right after the guard trips and "stop" is sent: end any
+    autonomous run (line-follow / turn-to-me / perform). Blocking tools notice on their next
+    send_drive, which raises TiltFault."""
+    _follow["abort"].set()
 
 
 def _shutdown():
@@ -474,7 +595,41 @@ def _not_connected():
     return {"ok": False, "error": f"not connected to the robot bridge: {_connect_error}"}
 
 
+def _tilt_gate():
+    """Early, readable refusal for any motion tool; send_drive enforces the same thing as the
+    last line of defence."""
+    why = link._tilt_refusal() if link is not None else None
+    if why is None:
+        return None
+    if link.motion.tripped and link.motion.mode != "off":
+        hint = ("look at the robot first -- something stopped it (see fault) -- then "
+                "clear_motion_fault(confirmed_safe=true) after asking the operator")
+    elif link.tilt.tripped or not link.tilt.ready:
+        hint = ("if the robot is upright and still: clear_tilt_fault(confirmed_safe=true) after "
+                "asking the operator; if there is no level reference yet, wait a second with "
+                "the IMU live, or call set_level_reference")
+    else:
+        hint = "check the IMU board's power / link, then connect()"
+    return {"ok": False, "error": why, "guards": link._guard_info(), "hint": hint}
+
+
+def _tilt_guarded(fn):
+    """Turn a TiltFault raised mid-move into a normal tool result. The tool's own `finally`
+    has already sent the stop by the time this sees it."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except GuardFault as e:
+            return {"ok": False, "error": "guard: %s" % e, "guards": e.info,
+                    "telemetry": link.telemetry_snapshot() if link is not None else None}
+    return wrapper
+
+
 def _confirm_gate(confirmed_safe: bool):
+    tilt_block = _tilt_gate()
+    if tilt_block:
+        return tilt_block
     if _follow["running"]:
         return {"ok": False, "error": "an autonomous run (line-follow / turn-to-me) is in progress; call stop() first"}
     if confirmed_safe:
@@ -544,6 +699,76 @@ def stop() -> dict:
     link.send_stop()
     time.sleep(STOP_SETTLE_S)
     return {"ok": True, **link.telemetry_snapshot()}
+
+
+@mcp.tool()
+def clear_tilt_fault(confirmed_safe: bool) -> dict:
+    """Release the tilt guard after it tripped (the robot leaned past the limit and every
+    drive tool is refused until this is called). Does not move the robot. Set
+    confirmed_safe=true only after the human operator has looked at the robot and said it is
+    upright and clear of whatever it was climbing. Refused while the IMU still reads the
+    robot leaning within 5 deg of the limit or still rocking, so it cannot be used to drive
+    out of a lean -- pick the robot up or level it by hand first."""
+    if link is None:
+        return _not_connected()
+    if not confirmed_safe:
+        return {"ok": False, "error": "confirmed_safe must be true, set only after the operator "
+                "confirms the robot is upright and clear",
+                "tilt_guard": link.tilt.snapshot()}
+    with link.lock:
+        ok, msg = link.tilt.clear()
+    return {"ok": ok, "message": msg, "tilt_guard": link.tilt.snapshot()}
+
+
+@mcp.tool()
+def clear_motion_fault(confirmed_safe: bool) -> dict:
+    """Release the motion guard after it stopped the robot because the sensors stopped matching
+    the commands: a wheel commanded to turn that wasn't (stall), an encoder not producing what
+    the gyro says it should (encoder_fault), wheels turning while the chassis wasn't (slip), or
+    an impact (bump). Every drive tool is refused until this is called. Does not move the robot.
+    Set confirmed_safe=true only after the human operator has LOOKED at the robot and what it
+    was doing -- the fault says what the data looked like, not what is in the way -- and said
+    it is clear. For an `encoder_fault` the cause is the sensor, so check the encoder (magnet
+    gap, wiring) before driving something that depends on it again."""
+    if link is None:
+        return _not_connected()
+    if not confirmed_safe:
+        return {"ok": False, "error": "confirmed_safe must be true, set only after the operator "
+                "has looked at the robot and says it is clear", "motion_guard": link.motion.snapshot()}
+    ok, msg = link.motion.clear()
+    return {"ok": ok, "message": msg, "motion_guard": link.motion.snapshot()}
+
+
+@mcp.tool()
+def set_level_reference(confirmed_level: bool) -> dict:
+    """Tell the tilt guard "this is level": record the robot's current orientation as the
+    zero for tilt. It is captured automatically from the first ~0.5 s of a still, live IMU
+    after connect(), so call this only if the robot was NOT on level ground then (e.g. the
+    server connected while it sat on a ramp), or after the IMU board was remounted. Does not
+    move the robot. confirmed_level=true only after the operator says the robot is on level
+    ground. Refused if the robot is moving, or if it would move the reference by more than
+    half the tilt limit from the one in use (a real mounting change is a few degrees; a
+    bigger jump is the robot leaning, and this must not be a way to hide that)."""
+    if link is None:
+        return _not_connected()
+    if not confirmed_level:
+        return {"ok": False, "error": "confirmed_level must be true, set only after the operator "
+                "confirms the robot is sitting on level ground"}
+    snap = link.telemetry_snapshot()
+    if not snap["imu_live"]:
+        return {"ok": False, "error": "no live IMU", "telemetry": snap}
+    with link.lock:
+        t = link.tilt
+        if abs(t.rate_dps) > tilt_guard.REF_MAX_RATE_DPS:
+            return {"ok": False, "error": "robot is moving; hold it still first",
+                    "tilt_guard": t.snapshot()}
+        if t.ready and t.tilt_deg > t.limit_deg / 2.0:
+            return {"ok": False, "error": "robot reads %.1f deg off the current reference, more than "
+                    "half the %.0f deg limit -- that is a lean, not a mounting change. Level it "
+                    "by hand, or restart the server to re-capture from scratch."
+                    % (t.tilt_deg, t.limit_deg), "tilt_guard": t.snapshot()}
+        t.set_reference(link.orient.pitch, link.orient.roll, source="operator")
+    return {"ok": True, "tilt_guard": link.tilt.snapshot()}
 
 
 @mcp.tool()
@@ -780,6 +1005,7 @@ def stop_recording() -> dict:
 
 
 @mcp.tool()
+@_tilt_guarded
 def drive_distance(
     distance_inches: float,
     direction: Literal["forward", "reverse"],
@@ -885,6 +1111,7 @@ def drive_distance(
 
 
 @mcp.tool()
+@_tilt_guarded
 def turn_degrees(
     degrees: float,
     direction: Literal["left", "right"],
@@ -1011,6 +1238,7 @@ def turn_degrees(
 
 
 @mcp.tool()
+@_tilt_guarded
 def drive_arc(
     radius_inches: float,
     degrees: float,
@@ -1190,6 +1418,7 @@ def drive_arc(
 
 
 @mcp.tool()
+@_tilt_guarded
 def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool,
         warn_lights: bool = True, require_telemetry: bool = True) -> dict:
     """Raw open-loop command: drive at exactly (left_pwm, right_pwm) for duration_s
@@ -1231,11 +1460,13 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool,
 
     start = link.last_counts()
     t_start = time.monotonic()
+    link.motion.encoders_required = bool(require_telemetry)  # bench mode: no encoders to fault on
     try:
         while time.monotonic() - t_start < duration_s:
             link.send_drive(left_pwm, right_pwm)
             time.sleep(min(DRIVE_KEEPALIVE_S, max(0.0, duration_s - (time.monotonic() - t_start))))
     finally:
+        link.motion.encoders_required = True
         link.send_stop()
         _lights_restore(prior_lights)
         time.sleep(STOP_SETTLE_S)
@@ -1252,6 +1483,88 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool,
         "dist_r_in": round((end[1] - start[1]) * in_per_tick, 2) if have_counts else None,
         "elapsed_s": round(time.monotonic() - t_start, 2),
         "telemetry": link.telemetry_snapshot(),
+    }
+
+
+@mcp.tool()
+@_tilt_guarded
+def speak_then_drive(text: str, pwm: int, duration_s: float, confirmed_safe: bool,
+                     direction: str = "forward", speed: float = 1.3,
+                     warn_lights: bool = True, require_telemetry: bool = True) -> dict:
+    """speak(text), then the instant the last word and the closed-mouth settle are done,
+    drive straight (open-loop, like jog) at `pwm` for duration_s -- one call, so there is no
+    round trip to the model between the voice and the wheels. Both wheels get the same PWM
+    (FORWARD_PWM_SIGN is applied for you: direction is forward or reverse), so a wheel or
+    encoder fault will curve the path. Same confirmed_safe gate as the other drive tools
+    (checked BEFORE speaking, so a refused move says nothing). warn_lights=True (default)
+    keeps the pre-move blink (1.25 s, fading on off on off on, solid green while moving) between
+    the speech and the motors, sent over the realtime channel so it shows right after the
+    mouth closes; False starts the motors straight away. Capped at MAX_JOG_DURATION_S and MAX_PWM_CEILING."""
+    if link is None:
+        return _not_connected()
+    gate = _confirm_gate(confirmed_safe)
+    if gate:
+        return gate
+    if direction not in ("forward", "reverse"):
+        return {"ok": False, "error": "direction must be 'forward' or 'reverse'"}
+    if not (0 < pwm <= MAX_PWM_CEILING):
+        return {"ok": False, "error": f"pwm must be 1-{MAX_PWM_CEILING}"}
+    if not (0 < duration_s <= MAX_JOG_DURATION_S):
+        return {"ok": False, "error": f"duration_s must be > 0 and <= {MAX_JOG_DURATION_S}"}
+    if require_telemetry and not link.telemetry_snapshot()["telemetry_live"]:
+        return {"ok": False, "error": "no live encoder telemetry -- refusing to drive without feedback"}
+    said = speak(text, speed=speed)  # ends on the closed mouth, ~0.4 s after the last word
+    if not said.get("ok"):
+        return {"ok": False, "error": f"speech failed, did not drive: {said.get('error')}"}
+    signed = pwm * (FORWARD_PWM_SIGN if direction == "forward" else -FORWARD_PWM_SIGN)
+
+    # speech -> closed mouth -> blink -> drive, back to back. The strip is still in WLED
+    # realtime mode from the mouth (HTTP state changes are ignored until it times out), so the
+    # blink and the solid-green "moving" light go out over the same UDP channel as the mouth.
+    # Keep the mouth's pending restore from firing mid-drive; release it when the move ends.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def paint(level):
+        v = int(255 * max(0.0, min(1.0, level)))
+        try:
+            sock.sendto(bytes([2, 2]) + bytes([0, v, 0]) * _Mouth.N, (WLED_HOST, 21324))
+        except OSError:
+            pass
+
+    if warn_lights:
+        _mouth.acquire(127)  # cancels the restore timer speak() left; keeps the pre-speech state
+        phase_s, level = 0.25, 0.0
+        for target in (1, 0, 1, 0, 1):  # on off on off on, fading, ends solid green
+            t_phase = time.monotonic()
+            while (f := (time.monotonic() - t_phase) / phase_s) < 1.0:
+                paint(level + (target - level) * f)
+                time.sleep(1 / 30)
+            level = target
+        paint(1.0)
+    link.send_stop()
+    start = link.last_counts()
+    t_start = time.monotonic()
+    try:
+        while time.monotonic() - t_start < duration_s:
+            link.send_drive(signed, signed)
+            if warn_lights:
+                paint(1.0)
+            time.sleep(min(DRIVE_KEEPALIVE_S, max(0.0, duration_s - (time.monotonic() - t_start))))
+    finally:
+        link.send_stop()
+        if warn_lights:
+            _mouth.release(2.6)
+        time.sleep(STOP_SETTLE_S)
+    end = link.last_counts()
+    in_per_tick = link.in_per_tick()
+    have_counts = start is not None and end is not None
+    return {
+        "ok": True, "left_pwm": signed, "right_pwm": signed, "duration_s": duration_s,
+        "dist_l_in": round((end[0] - start[0]) * in_per_tick, 2) if have_counts else None,
+        "dist_r_in": round((end[1] - start[1]) * in_per_tick, 2) if have_counts else None,
+        "elapsed_s": round(time.monotonic() - t_start, 2),
+        "telemetry": link.telemetry_snapshot(),
+        "spoke_seconds": said.get("seconds"), "direction": direction, "pwm": pwm,
     }
 
 
@@ -1287,6 +1600,7 @@ def _follow_loop(lnk, src, ctl, rec_dir, t_rec, display=None):
     send_now = False
     reason = None
     shown = None
+    lnk.motion.encoders_required = False  # camera-only: a dead encoder is logged, not a stop
     try:
         ctl.start(time.monotonic())
         while True:
@@ -1339,6 +1653,7 @@ def _follow_loop(lnk, src, ctl, rec_dir, t_rec, display=None):
     except Exception as e:
         reason = f"error: {e}"
     finally:
+        lnk.motion.encoders_required = True
         try:
             lnk.send_stop()
         except Exception:
@@ -1896,6 +2211,135 @@ _speak_lock = threading.Lock()
 _MOUTH_REST = [1.0, 0.8, 0.55, 0.35, 0.18, 0.07]  # closed mouth: center LED, brightness trails off
 
 
+class _Mouth:
+    """Expressions on the 27-LED mouth bar while the robot is NOT talking: a blue breath while
+    it waits for you, a blue mouth that widens with your voice while it hears you, an amber dot
+    sweeping side to side while it thinks. speak() draws its own mouth while talking. Owns the
+    strip's pre-conversation state and restores it a moment after the last user."""
+    N, C = 27, 13
+    THINK_TIMEOUT_S = 45.0
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._thread = None
+        self._stop = threading.Event()
+        self._timer = None          # pending restore of the strip's prior state
+        self._think_timer = None    # gives up thinking if nobody speaks
+        self.prior = None
+        self.mode = "waiting"
+        self.level = 0.0
+        self._t_mode = time.time()
+
+    def acquire(self, bri=100):
+        """Turn the strip on and remember how it was (once), cancelling any pending restore."""
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            try:
+                if self.prior is None:
+                    self.prior = _wled_snapshot()
+                _wled("/json/state", {"on": True, "bri": bri, "tt": 0})
+            except Exception:
+                pass  # lights unreachable: carry on without a mouth
+
+    def start(self, mode):
+        with self._lock:
+            self.stop_anim()
+            self.level = 0.0
+            self.set_mode(mode)
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def set_mode(self, mode):
+        self.mode = mode
+        self._t_mode = time.time()
+        if mode == "thinking":
+            if self._think_timer:
+                self._think_timer.cancel()
+            self._think_timer = threading.Timer(self.THINK_TIMEOUT_S, self.release)
+            self._think_timer.daemon = True
+            self._think_timer.start()
+
+    def stop_anim(self):
+        with self._lock:
+            if self._think_timer:
+                self._think_timer.cancel()
+                self._think_timer = None
+            self._stop.set()
+            th, self._thread = self._thread, None
+        if th and th is not threading.current_thread():
+            th.join(1.0)
+
+    def release(self, delay=0.6):
+        """Stop animating and put the strip back as it was after delay seconds (long enough for
+        WLED's realtime mode to time out, or another acquire() to take over)."""
+        self.stop_anim()
+        with self._lock:
+            if self.prior is None:
+                return
+            if self._timer:
+                self._timer.cancel()
+            self._timer = threading.Timer(delay, self._restore)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _restore(self):
+        with self._lock:
+            prior, self.prior, self._timer = self.prior, None, None
+        if prior:
+            try:
+                _wled("/json/state", prior)
+            except Exception:
+                pass
+
+    def _run(self):
+        n, c = self.N, self.C
+        rest = [_MOUTH_REST[abs(i - c)] if abs(i - c) < len(_MOUTH_REST) else 0.0 for i in range(n)]
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        glow, env, t0 = [0.0] * n, 0.0, time.time()
+        while not self._stop.is_set():
+            now = time.time()
+            mode = self.mode
+            if mode == "waiting":
+                b = 0.30 + 0.20 * math.sin((now - t0) * 2 * math.pi / 2.4)
+                glow = [r_ * b for r_ in rest]
+                color = (0.1, 0.5, 1.0)
+            elif mode == "hearing":
+                env += (self.level - env) * 0.5
+                length = env * (c + 1)
+                glow = [max(min(1.0, max(0.0, length - abs(i - c))), glow[i] * 0.8, rest[i] * 0.5) for i in range(n)]
+                color = (0.1, 0.5, 1.0)
+            else:  # thinking
+                pos = c + 11 * math.sin((now - self._t_mode) * 2.2)
+                glow = [max(max(0.0, 1.0 - abs(i - pos) / 2.0), glow[i] * 0.88, rest[i] * 0.25) for i in range(n)]
+                color = (1.0, 0.55, 0.05)
+            pkt = bytearray([2, 2])
+            for g in glow:
+                v = 255 * g ** 2.2
+                pkt += bytes([int(v * color[0]), int(v * color[1]), int(v * color[2])])
+            try:
+                sock.sendto(pkt, (WLED_HOST, 21324))
+            except OSError:
+                pass
+            time.sleep(1 / 30)
+
+
+_mouth = _Mouth()
+
+
+def _beep(freq=1100, ms=70, vol=0.2):
+    """Soft blip through the computer speakers: 'I heard you'. Fire and forget."""
+    sr, n = 16000, 16000 * ms // 1000
+    pcm = array.array("h", [int(32767 * vol * math.sin(2 * math.pi * freq * i / sr) * min(1.0, i / 80, (n - i) / 80))
+                            for i in range(n)])
+    hearing.mute_for(ms / 1000 + 0.4)
+    threading.Thread(target=lambda: subprocess.run(
+        ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(sr), "-c", "1"],
+        input=pcm.tobytes(), capture_output=True), daemon=True).start()
+
+
 @mcp.tool()
 def speak(text: str, speed: float = 1.3, max_brightness: int = 127) -> dict:
     """Say text out loud on THIS computer's speakers (the robot has none) with Piper TTS,
@@ -1906,8 +2350,9 @@ def speak(text: str, speed: float = 1.3, max_brightness: int = 127) -> dict:
     needed."""
     if not _speak_lock.acquire(blocking=False):
         return {"ok": False, "error": "already speaking"}
+    _mouth.stop_anim()
+    spoke = False
     wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-    prior = None
     try:
         r = subprocess.run([PIPER_BIN, "-m", PIPER_VOICE, "--length-scale", str(speed), "-f", wav],
                            input=text.encode(), capture_output=True, timeout=60)
@@ -1923,14 +2368,7 @@ def speak(text: str, speed: float = 1.3, max_brightness: int = 127) -> dict:
         peak = sorted(rms)[int(len(rms) * 0.97)] or 1
         c = n // 2
         rest = [_MOUTH_REST[abs(i - c)] if abs(i - c) < len(_MOUTH_REST) else 0.0 for i in range(n)]
-        try:
-            st = _wled("/json/state")
-            sg = st["seg"][0]
-            prior = {"on": st["on"], "bri": st["bri"],
-                     "seg": [{"fx": sg["fx"], "sx": sg["sx"], "ix": sg["ix"], "col": sg["col"]}]}
-            _wled("/json/state", {"on": True, "bri": max(0, min(255, max_brightness))})
-        except Exception:
-            pass  # lights unreachable: still speak, just without the mouth
+        _mouth.acquire(max(0, min(255, max_brightness)))
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         glow, env = rest[:], 0.0
 
@@ -1947,6 +2385,8 @@ def speak(text: str, speed: float = 1.3, max_brightness: int = 127) -> dict:
             except OSError:
                 pass
 
+        hearing.speaking(True)
+        spoke = True
         player = subprocess.Popen(["aplay", "-q", wav])
         t0 = time.time()
         for k, r_ in enumerate(rms):
@@ -1954,22 +2394,288 @@ def speak(text: str, speed: float = 1.3, max_brightness: int = 127) -> dict:
                 time.sleep(0.002)
             frame(min(1.0, r_ / peak))
         player.wait()
-        for _ in range(int(1.5 * fps)):  # settle to closed mouth briefly
+        hearing.speaking(False)
+        spoke = False
+        for _ in range(int(0.4 * fps)):  # settle to closed mouth briefly
             frame(0.0)
             time.sleep(1 / fps)
         return {"ok": True, "seconds": round(len(pcm) / sr, 1)}
     finally:
-        if prior:
-            time.sleep(2.2)  # let WLED's realtime timeout expire before restoring
-            try:
-                _wled("/json/state", prior)
-            except Exception:
-                pass
+        if spoke:
+            hearing.speaking(False)
+        _mouth.release(2.6)  # in the background: after WLED's realtime timeout, unless hear() takes over
         try:
             os.unlink(wav)
         except OSError:
             pass
         _speak_lock.release()
+
+
+_hear_lock = threading.Lock()
+
+
+@mcp.tool()
+def hear(wait_seconds: float = 10.0, max_seconds: float = 20.0, pause_seconds: float = 0.8) -> dict:
+    """Listen on the webcam microphone plugged into THIS computer and return what the person
+    said, as text. Waits up to wait_seconds for them to start talking, records until they
+    pause for pause_seconds (or max_seconds of speech), then transcribes with Whisper. Blocks.
+    For a conversation alternate hear() and speak(). Listening starts from the moment the
+    last speak() finished, so anything the person said while you were deciding what to do
+    next is not lost. The mouth bar shows the person it is listening (blue breath), hearing
+    them (blue mouth widening with their voice) and thinking (amber dot, with a soft beep when
+    they stop talking); speak() takes the lights over when you reply. Returns text="" if
+    nobody spoke. No confirmation needed."""
+    if not _hear_lock.acquire(blocking=False):
+        return {"ok": False, "error": "already listening"}
+    try:
+        _mouth.acquire(100)
+        _mouth.start("waiting")
+
+        def on_event(e):
+            if e == "speech_start":
+                _mouth.set_mode("hearing")
+            elif e == "speech_end":
+                _mouth.set_mode("thinking")
+                _beep()
+
+        def on_level(lvl, thr):
+            _mouth.level = min(1.0, lvl / (thr * 5))
+
+        try:
+            r = hearing.capture(max_seconds=max_seconds, wait_seconds=wait_seconds, silence_seconds=pause_seconds,
+                                on_event=on_event, on_level=on_level)
+        except Exception as e:
+            _mouth.release()
+            return {"ok": False, "error": f"mic capture failed: {e}"}
+        info = {"noise_floor": round(r["floor"]), "threshold": round(r["threshold"]), "peak": round(r["peak"])}
+        if r["pcm"] is None:
+            _mouth.release()
+            return {"ok": True, "text": "", "reason": "nobody spoke", **info}
+        t0 = time.time()
+        text = hearing.transcribe(r["pcm"])
+        if not text:
+            _mouth.release()
+        return {"ok": True, "text": text, "heard_seconds": round(len(r["pcm"]) / hearing.RATE, 1),
+                "transcribe_seconds": round(time.time() - t0, 1), "ended_by": r["reason"], **info}
+    finally:
+        _hear_lock.release()
+
+
+PERFORM_MAX_S = 420.0   # one perform() call never runs longer than this, whatever the file says
+PERFORM_FPS = 30
+PERFORM_BLINK_S = 1.5   # the usual pre-move warning blink, before a dancing show's countdown
+
+
+def _perform_loop(show, rend, dance, brightness, lead_in_s, start_s, end_s, audio, audio_offset_s,
+                  require_telemetry, tmp_wav):
+    """Runs on its own thread for the whole show (shares _follow with the other autonomous runs:
+    stop() / listen() abort it, the drive tools refuse while it runs). One loop at PERFORM_FPS
+    paints the light bar from the show clock and, when dancing, re-sends the current beat's
+    wheel command every DRIVE_KEEPALIVE_S. Always finishes with a stop."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    proc, reason, prev_cmd, step_k, brake_until = None, "finished", (0, 0), -1, 0.0
+    last_send = last_check = last_info = 0.0
+    lead_sec = None
+    t = start_s
+    lnk = link
+    if lnk is not None and dance:
+        lnk.motion.encoders_required = bool(require_telemetry)  # open-loop: encoders optional
+    try:
+        _mouth.acquire(brightness)
+        if dance:
+            _blink(brightness=min(brightness, 127))  # same warning the drive tools give
+        wall0 = time.monotonic() + lead_in_s          # when show time == start_s
+        a_pos0 = start_s - audio_offset_s             # where in the audio file that moment falls
+        audio_wall = wall0 + max(0.0, -a_pos0)
+        rend.seek(start_s)
+        k0 = max(0, bisect.bisect_right(show.beats, start_s) - 1)
+        while True:
+            now = time.monotonic()
+            t = start_s + (now - wall0)
+            if _follow["abort"].is_set():
+                reason = "stopped"
+                break
+            if t >= end_s:
+                break
+            if audio and proc is None and now >= audio_wall:
+                cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
+                if a_pos0 > 0:
+                    cmd += ["-ss", f"{a_pos0:.3f}"]
+                proc = subprocess.Popen(cmd + [audio], stdin=subprocess.DEVNULL)
+            if t < start_s and int(wall0 - now) != lead_sec:  # lead-in: a white blip each second
+                lead_sec = int(wall0 - now)
+                rend.pulse(0.6)
+            try:
+                sock.sendto(rend.frame(t), (WLED_HOST, 21324))
+            except OSError:
+                pass
+            if dance and lnk is not None:
+                if require_telemetry and now - last_check > 0.5:
+                    last_check = now
+                    if not lnk.telemetry_snapshot()["telemetry_live"]:
+                        reason = "telemetry_stale"
+                        break
+                if t >= start_s:
+                    k = bisect.bisect_right(show.beats, t) - 1
+                    if k >= 0:
+                        name, left, right = dance.move(k - k0)
+                    else:
+                        name, left, right = "hold", 0, 0
+                    if k != step_k:
+                        step_k = k
+                        if perform_show.reverses(prev_cmd, (left, right)):
+                            brake_until = now + STOP_SETTLE_S  # no sign reversal without a stop
+                    if now - last_send >= DRIVE_KEEPALIVE_S:
+                        last_send = now
+                        if now < brake_until:
+                            lnk.send_stop()
+                            prev_cmd = (0, 0)
+                        else:
+                            lnk.send_drive(left, right)
+                            prev_cmd = (left, right)
+            if now - last_info >= 1.0:
+                last_info = now
+                _follow["info"] = {"t_s": round(t, 1), "of_s": round(end_s, 1),
+                                   "beat": max(0, bisect.bisect_right(show.beats, t) - 1), "dancing": bool(dance)}
+            time.sleep(max(0.0, 1.0 / PERFORM_FPS - (time.monotonic() - now)))
+    except Exception as e:
+        reason = f"error: {e}"
+    finally:
+        if lnk is not None and dance:
+            lnk.motion.encoders_required = True
+            try:
+                lnk.send_stop()
+            except Exception:
+                pass
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+        for _ in range(3):  # leave the bar dark, not frozen on the last frame
+            try:
+                sock.sendto(rend.dark(), (WLED_HOST, 21324))
+            except OSError:
+                pass
+            time.sleep(1 / PERFORM_FPS)
+        _mouth.release(2.6)
+        if tmp_wav:
+            try:
+                os.unlink(tmp_wav)
+            except OSError:
+                pass
+        _follow["status"] = reason
+        _follow["result"] = dict(status=reason, ended_at_s=round(t, 1))
+        _follow["running"] = False
+        _follow["ended"].set()
+        _speak_lock.release()
+
+
+@mcp.tool()
+def perform(midi_path: Optional[str] = None, bpm: Optional[float] = None,
+            audio_path: Optional[str] = None, synth: bool = False, dance: bool = False,
+            confirmed_safe: bool = False, dance_pwm: int = 60, spin_pwm: int = 85,
+            brightness: int = 127, lead_in_s: float = 3.0, audio_offset_s: float = 0.0,
+            start_s: float = 0.0, max_seconds: Optional[float] = None,
+            duration_s: float = 60.0, require_telemetry: bool = True) -> dict:
+    """Light-bar show (and optionally a dance) timed to a song. Starts it and returns at once;
+    follow with perform_status(wait_s=...) and end early with stop().
+
+    Timing source (give one): midi_path = a .mid file, whose notes drive the bar (pitch = where
+    along the bar a coloured spot lands, kick = burst from the middle, snare = flash at both
+    ends, hats = sparkle) and whose tempo map gives the beat; or bpm (+ duration_s) = just
+    pulse and dance on a steady beat, which is the safer choice when the recording you will
+    play does not line up with any MIDI you have.
+    Sound (all optional): audio_path = a recording (mp3/wav/anything ffplay plays) played from
+    this computer's speakers in sync; synth=True = a small chiptune render of the MIDI instead
+    (the robot "sings" the melody). With neither, start your own player at the end of the
+    countdown. audio_offset_s = seconds the recording lags the MIDI/beat grid (+ = audio late;
+    ffplay also takes a few tenths of a second to start, so expect to tune this once).
+    Rehearse a piece of it with start_s / max_seconds. lead_in_s = countdown before the music
+    (a white blip per second), after the green warning blink if dancing.
+
+    dance=True also drives the wheels, open-loop, one move per beat (8-beat phrase: two arc
+    sways, rock forward/back, spin each way; it nets out near where it started). That MOVES
+    the robot, so it needs confirmed_safe=true after asking the operator, same as the drive
+    tools -- say it is a dance, for how long, and at what dance_pwm / spin_pwm. Forward effort
+    is touchy and spins need much more PWM (scrub), so they are separate. Each beat's command
+    is re-sent every 0.1 s, a stop is inserted when a wheel has to reverse, and stop() /
+    listen() ends the show with a stop. Lights-only (dance=False) needs no confirmation.
+    brightness is the strip's master (0-255, default 127 = 50%). Capped at 420 s."""
+    if not (midi_path or bpm):
+        return {"ok": False, "error": "give midi_path (a .mid file) or bpm"}
+    if midi_path and not Path(midi_path).expanduser().is_file():
+        return {"ok": False, "error": f"no such file: {midi_path}"}
+    if audio_path and not Path(audio_path).expanduser().is_file():
+        return {"ok": False, "error": f"no such file: {audio_path}"}
+    if synth and not midi_path:
+        return {"ok": False, "error": "synth=True needs midi_path (nothing to render from a bare bpm)"}
+    if synth and audio_path:
+        return {"ok": False, "error": "pick one sound source: audio_path or synth"}
+    if bpm is not None and not (40 <= bpm <= 240):
+        return {"ok": False, "error": "bpm must be 40-240"}
+    if not (0 <= brightness <= 255):
+        return {"ok": False, "error": "brightness must be 0-255"}
+    if not (0 <= lead_in_s <= 30):
+        return {"ok": False, "error": "lead_in_s must be 0-30"}
+    if not (0 <= dance_pwm <= MAX_PWM_CEILING and 0 <= spin_pwm <= MAX_PWM_CEILING):
+        return {"ok": False, "error": f"dance_pwm / spin_pwm must be 0-{MAX_PWM_CEILING}"}
+    if dance:
+        if link is None:
+            return _not_connected()
+        gate = _confirm_gate(confirmed_safe)
+        if gate:
+            return gate
+        snap = link.telemetry_snapshot()
+        if require_telemetry and not snap["telemetry_live"]:
+            return {"ok": False, "error": "no live encoder telemetry -- refusing to dance without it "
+                    "(pass require_telemetry=false only for a bench run you are watching)",
+                    "telemetry": snap}
+    elif _follow["running"]:
+        return {"ok": False, "error": "an autonomous run / show is in progress; call stop() first"}
+    try:
+        show = (perform_show.Show.from_midi(str(Path(midi_path).expanduser())) if midi_path
+                else perform_show.Show.from_bpm(bpm, duration_s))
+    except Exception as e:
+        return {"ok": False, "error": f"could not read the timing source: {e}"}
+    if not (0 <= start_s < show.length_s):
+        return {"ok": False, "error": f"start_s must be 0 to {show.length_s:.1f}"}
+    end_s = min(show.length_s, start_s + PERFORM_MAX_S)
+    if max_seconds is not None:
+        end_s = min(end_s, start_s + max(1.0, max_seconds))
+    tmp_wav = None
+    audio = str(Path(audio_path).expanduser()) if audio_path else None
+    try:
+        if synth:
+            tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+            perform_show.synth_wav(show, tmp_wav)
+            audio = tmp_wav
+        rend = perform_show.LightRender(show)
+        dancer = perform_show.Dance(pwm=dance_pwm, spin_pwm=spin_pwm, sign=FORWARD_PWM_SIGN) if dance else None
+    except Exception as e:
+        if tmp_wav:
+            os.unlink(tmp_wav)
+        return {"ok": False, "error": f"could not prepare the show: {e}"}
+    if not _speak_lock.acquire(blocking=False):
+        if tmp_wav:
+            os.unlink(tmp_wav)
+        return {"ok": False, "error": "the strip is busy (speaking or another show)"}
+    _follow["abort"].clear()
+    _follow["ended"].clear()
+    _follow.update(running=True, status="performing", info={}, result=None)
+    threading.Thread(target=_perform_loop, daemon=True,
+                     args=(show, rend, dancer, brightness, lead_in_s, start_s, end_s,
+                           audio, audio_offset_s, require_telemetry, tmp_wav)).start()
+    return {"ok": True, "started": True, "dancing": dance, "show_seconds": round(end_s - start_s, 1),
+            "bpm": round(show.bpm_hint, 1) if show.bpm_hint else None, "beats": len(show.beats),
+            "notes": len(show.notes), "pitch_range": [rend.lo, rend.hi],
+            "music_starts_in_s": round(lead_in_s + (PERFORM_BLINK_S if dance else 0.0), 1),
+            "audio": "synth" if synth else ("file" if audio_path else "none (start your own player)")}
+
+
+@mcp.tool()
+def perform_status(wait_s: float = 0.0) -> dict:
+    """Read-only. State of the perform() show: running / the reason it ended (finished, stopped,
+    telemetry_stale, error: ...), the show clock and beat while it runs. wait_s (max 60) blocks
+    until it ends or that long passes. Never moves the robot."""
+    return line_follow_status(wait_s)
 
 
 if __name__ == "__main__":

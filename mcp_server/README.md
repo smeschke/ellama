@@ -59,6 +59,10 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `turn_degrees(degrees, direction, pwm, confirmed_safe)` | Yes | Yes |
 | `drive_arc(radius_inches, degrees, direction, pwm, confirmed_safe, max_wheel_pwm=125, travel="forward")` | Yes (curved; 360° = full circle; `travel="reverse"` backs up along the arc) | Yes |
 | `jog(left_pwm, right_pwm, duration_s, confirmed_safe, require_telemetry=True)` | Yes (raw, time-based) | Yes |
+| `speak_then_drive(text, pwm, duration_s, confirmed_safe, direction="forward", warn_lights=True)` | Yes (`speak` then straight open-loop `jog`, one call, no model round trip between) | Yes |
+| `clear_motion_fault(confirmed_safe)` | No (releases a tripped motion guard) | `confirmed_safe` — only after the operator has LOOKED at the robot |
+| `set_level_reference(confirmed_level)` | No (records the current orientation as "level" for the tilt guard; refused while moving or if it would shift the reference by > half the limit) | `confirmed_level` — only after the operator says the robot is on level ground |
+| `clear_tilt_fault(confirmed_safe)` | No (releases a tripped tilt guard; refused while still leaning within 5° of the limit) | `confirmed_safe` — only after the operator has looked at the robot |
 | `line_view(width=640)` | No | — |
 | `person_view()` | No | — (finds people in the live frame, returns bearing to each) |
 | `turn_to_me(confirmed_safe, max_seconds=30, name=None, spin_speed_dps=18, lost_timeout_s=1)` | Yes (spins in place, holds until it ends; max_seconds / lost_timeout_s of 0 = never) | Yes — once per run; refuses to start if 0 or >1 people are in view (ask the operator) |
@@ -70,6 +74,29 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `list_light_effects()` | No | — |
 | `lights_blink(blinks=2, phase_s=0.3, color="00ff00", brightness=127, restore=True, fade=True)` | No (on off on off on = 1.5 s by default, each phase fading) | — |
 | `speak(text, speed=1.3, max_brightness=127)` | No (Piper TTS out of this computer's speakers, WLED strip animates a mouth; blocks until done. Env: `ELLAMA_PIPER`, `ELLAMA_PIPER_VOICE`) | — |
+| `perform(midi_path=None, bpm=None, audio_path=None, synth=False, dance=False, confirmed_safe=False, dance_pwm=60, spin_pwm=85, brightness=127, lead_in_s=3, audio_offset_s=0, start_s=0, max_seconds=None)` | Only with `dance=True` (open-loop wheel moves, one per beat) | Only with `dance=True` — lights + sound need none |
+| `perform_status(wait_s=0)` | No | — |
+| `hear(wait_seconds=10, max_seconds=20, pause_seconds=0.8)` | No (records the webcam mic on this computer, waits for speech, stops at a pause, transcribes with faster-whisper `base.en`; blocks. Alternate with `speak` for a conversation. Env: `ELLAMA_MIC`, `ELLAMA_MIC_MATCH`, `ELLAMA_WHISPER`. Test: `.venv/bin/python hearing.py`) | — |
+
+### `perform` — a song on the mouth bar (and a dance)
+
+Starts a light show timed to a MIDI file (or just a tempo) and returns at once; `perform_status(wait_s)`
+follows it, `stop()` ends it. Engine: [`perform.py`](perform.py) (pure logic, tested offline); the thread
+and the tools are in `robot_server.py`.
+
+- **Timing**: `midi_path` (notes drive the bar: pitch = where a coloured spot lands, kick = burst from the
+  middle, snare = flash at both ends, hats = sparkle; the tempo map gives the beat) or `bpm` + `duration_s`
+  (beat pulses only — the safer choice when your recording won't line up with any MIDI you have).
+- **Sound**: `audio_path` plays a recording from this computer (ffplay) in sync; `synth=True` renders the MIDI
+  as a chiptune ("the robot sings"); neither = start your own player at the end of the countdown. ffplay takes a
+  few tenths of a second to start, so tune `audio_offset_s` once. Rehearse a bit with `start_s` / `max_seconds`.
+- **Dance** (`dance=True`): one open-loop move per beat, re-sent every 0.1 s — an 8-beat phrase of two arc sways,
+  rock forward/back, spin each way. It needs `confirmed_safe=true` like any drive tool (and live telemetry,
+  unless `require_telemetry=false`), a green warning blink first, and a stop is inserted whenever a wheel has to
+  reverse. Forward effort and spins are separate knobs (`dance_pwm`, `spin_pwm`) because spins need far more PWM
+  to beat wheel scrub. The sway's inner wheel (40% of `dance_pwm`) is under the motor deadband at 60, so the
+  sway is really a pivot on one wheel. Not yet run on the robot; try it on blocks first.
+- No MIDI of a copyrighted song is bundled; supply your own `.mid` (and recording).
 
 `look()` returns a photo from the phone camera on the robot (Android "IP Camera" or "IP
 Webcam" app). The phone is found by scanning the local /24 for ports 8080/4444, or set
@@ -141,6 +168,71 @@ raw PWM, fixed duration, no target — for bench/commissioning tests, capped at
   `4.5` (confirmed by `calibration/30_inches.csv`, a real tape-measured run). This server
   uses `4.5` regardless of what the file says — `TRUE_GEAR_RATIO` in `robot_server.py` —
   left that way deliberately so it could be tested independently before touching the file.
+
+## Tilt guard (`tilt_guard.py`)
+
+The robot is low and can run banks up to ~25 deg; past that it tips. The IMU feeds a guard
+that watches the lean of the chassis and stops the robot before it goes over.
+
+- **What it measures:** the angle between "up" now and "up" at the *level reference*, so
+  the IMU's own mounting offset (a few degrees on a flat floor) doesn't count and a diagonal
+  bank counts in full. The reference is captured automatically from the first ~0.5 s of a
+  still, live IMU after the server starts; `set_level_reference` re-takes it.
+- **When it trips:** tilt plus a short look-ahead on how fast it is growing reaches the limit
+  (default 25 deg; the look-ahead adds at most 30% of the limit, so a fast lean trips at about
+  17.5 deg and a slow bank at 25), for 2 IMU samples in a row. Replayed against all 49
+  recordings in `recordings/` the worst tilt seen was 4.8 deg, no trips.
+- **What it does:** sends `stop` from the IMU thread within ~20 ms of the sample, **latches**,
+  and refuses every drive command (`send_drive` is the single choke point, so `jog`,
+  `drive_*`, `turn_*`, line-follow, turn-to-me and `perform` are all covered) until
+  `clear_tilt_fault`. Autonomous runs are aborted; blocking tools return
+  `{"ok": false, "error": "tilt guard: ...", "tilt_guard": {...}}`.
+- **Fails closed:** no level reference yet, or no IMU sample for 0.5 s, also refuses to drive
+  (zero/stop commands always go out). Needs a live IMU even for open-loop `jog`.
+- **Survives `connect()`:** the guard lives for the server process, so reconnecting cannot clear
+  a fault or re-learn "level" from a robot that is leaning. Restarting the server resets it.
+- **Reporting:** `read_telemetry()` has a `tilt` block (tilt, rate, limit, reference, fault).
+- **Env (operator only, deliberately not tool arguments):** `ELLAMA_TILT_LIMIT_DEG`,
+  `ELLAMA_TILT_LOOKAHEAD_S`, `ELLAMA_TILT_GUARD=off` (bench use: reports but never trips).
+- **Limits:** it only covers commands that go through this server -- the stick controller is
+  not guarded. A stop cannot undo momentum: the guard buys the ~0.3 s the motor ramp needs, it
+  does not make a bank safe. A guard in the motor-board firmware would be the stronger layer.
+- **Tests:** `ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_tilt_guard.py` (no hardware;
+  also replays the recordings).
+
+## Motion guard (`motion_guard.py`)
+
+Stops the robot, in real time (~0.2 s to stopped wheels), when the sensors stop agreeing with
+what it was told to do -- same latch + `send_drive` choke point as the tilt guard, so every drive
+tool and autonomous run is covered. It is *not* an obstacle sensor; it notices that "the data
+stopped matching".
+
+| Detector | Fires when | Means |
+|---|---|---|
+| `stall` | a wheel commanded above the deadband (50, or 65 in a spin) for >= 1 s reads < 0.5 in/s for 0.4 s, and the IMU agrees the robot is stuck | snagged / no traction |
+| `encoder_fault` | same, but the gyro says the robot is NOT pivoting the way the encoders imply -- or a wheel runs the wrong way for 0.5 s -- or (in a spin) a wheel reads nothing and the IMU can't tell held from dead | the sensor, not the wheel |
+| `slip` | over 1 s the wheels turned the robot >= 20 deg but the gyro saw < 1/3.5 of it (a normal spin scrubs 1.6-2x; a robot held by a foot read 5x) | wheels turning, chassis not |
+| `bump` | a >= 0.6 g spike while driving, or a >= 0.35 g spike with wheel speed collapsing to < 40% in 0.3 s and the command held | hit something |
+
+- **Why the IMU decides stall vs encoder fault:** in the 10-03 follow runs the right encoder reads
+  exactly 0 for 25-58% of "commanded" samples while the robot drove fine. A stuck wheel makes the
+  chassis pivot (gyro agrees with the encoders); a dead encoder doesn't (gyro says straight).
+- **`encoder_fault` only stops encoder-dependent tools** (`drive_*`, `turn_degrees`, `jog`).
+  Line-follow and `perform` set `encoders_required=False` -- a dead encoder is logged, a real
+  stall/slip/bump still stops them.
+- **Tuned on real data:** replaying the 39 recorded line-follow runs, camera-only mode trips on
+  exactly 2: `follow_run1` (the robot sat motionless for 5 s with the follower commanding
+  left -90) and `follow_newcam_run9b` (right wheel 6.8 -> 0 in/s in 0.1 s with a 0.35 g spike).
+  Neither looks false. Strict mode also reports 15 `encoder_fault` events, all on the dead-encoder runs.
+- **Not validated on a real obstacle yet.** Bump sensitivity in particular is set above normal
+  vibration (0.43 g peak), so a gentle bump at low speed may only be caught by the stall rule ~1.4 s
+  later. Treat the first live collision test as the real calibration.
+- **Modes:** `ELLAMA_MOTION_GUARD=on` (default) | `warn` (log events in `read_telemetry().motion`,
+  never stop -- use this to tune on a robot) | `off`.
+- **Limits:** a robot that is moving fine but *should* stop (a person in front of it) is the
+  camera's job; wheels spinning with the robot not moving at all looks like a stall (good), but a
+  wheel that slips while the robot still moves is not detectable from encoders + IMU alone.
+- **Tests:** `python3 test_motion_guard.py` (synthetic scenarios + the replay above, no hardware).
 
 ## Safety net beyond the confirmation gate
 
