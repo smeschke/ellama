@@ -47,6 +47,7 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | --- | --- | --- |
 | `read_telemetry()` | No | — |
 | `look(width=640)` | No | — |
+| `save_photo(name="", preview_width=0, open_in_browser=False)` | No | — (saves a full-res photo to `recordings/photos/` with a `.json` of the robot's pose; `preview_width` > 0 also returns the picture) |
 | `zero_odometry()` | No | — |
 | `stop()` | Commands zero PWM (active braking) | No — always safe |
 | `listen()` | Stops and releases control to the stick controller | No — always safe |
@@ -63,13 +64,6 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `clear_motion_fault(confirmed_safe)` | No (releases a tripped motion guard) | `confirmed_safe` — only after the operator has LOOKED at the robot |
 | `set_level_reference(confirmed_level)` | No (records the current orientation as "level" for the tilt guard; refused while moving or if it would shift the reference by > half the limit) | `confirmed_level` — only after the operator says the robot is on level ground |
 | `clear_tilt_fault(confirmed_safe)` | No (releases a tripped tilt guard; refused while still leaning within 5° of the limit) | `confirmed_safe` — only after the operator has looked at the robot |
-| `line_view(width=640)` | No | — |
-| `person_view()` | No | — (finds people in the live frame, returns bearing to each) |
-| `turn_to_me(confirmed_safe, max_seconds=30, name=None, spin_speed_dps=18, lost_timeout_s=1)` | Yes (spins in place, holds until it ends; max_seconds / lost_timeout_s of 0 = never) | Yes — once per run; refuses to start if 0 or >1 people are in view (ask the operator) |
-| `turn_to_me_set(max_seconds, lost_timeout_s, spin_speed_dps)` | No (adjusts an already-approved run) | — |
-| `turn_to_me_status(wait_s=0)` | No | — |
-| `start_line_follow(confirmed_safe, speed_pwm=58, max_seconds=90, name=None, show_on_phone=False)` | Yes (autonomous, until it ends) | Yes — once per run (`show_on_phone` also shows the overlay + motor panel on the phone; see `phone/README.md`) |
-| `line_follow_status(wait_s=0)` | No | — |
 | `lights(on=True, brightness, color, effect, speed, intensity)` | No (WLED strip at `ELLAMA_WLED_HOST`, default 192.168.0.57) | — |
 | `list_light_effects()` | No | — |
 | `lights_blink(blinks=2, phase_s=0.3, color="00ff00", brightness=127, restore=True, fade=True)` | No (on off on off on = 1.5 s by default, each phase fading) | — |
@@ -98,10 +92,24 @@ and the tools are in `robot_server.py`.
   sway is really a pivot on one wheel. Not yet run on the robot; try it on blocks first.
 - No MIDI of a copyrighted song is bundled; supply your own `.mid` (and recording).
 
-`look()` returns a photo from the phone camera on the robot (Android "IP Camera" or "IP
-Webcam" app). The phone is found by scanning the local /24 for ports 8080/4444, or set
-`ELLAMA_CAM_URL` (e.g. `https://192.168.0.54:4444`) to skip the scan. A snapshot takes
-~5-8s. It is advisory vision only and does not replace `confirmed_safe`.
+`look()` returns a full-res photo from the phone camera on the robot (Android "IP Camera" or
+"IP Webcam" app), or a clear error; it never substitutes a frame of the live stream. The
+address is remembered in `~/.cache/ellama/camera_url`; if that is missing or the phone has
+moved, the phone is found by scanning the local /24 for ports 8080/4444 (slow, 10-30 s, and it
+seems to stall the phone's server), or set `ELLAMA_CAM_URL` (e.g. `https://192.168.0.54:4444`)
+to skip the scan. A photo takes ~1-8 s and fails after 12 s. If the app answers but no photo
+comes back, the error says so (restart the camera app on the phone). It is advisory vision
+only and does not replace `confirmed_safe`.
+
+`save_photo()` is the same camera, saved to a file instead of shown: it writes
+`recordings/photos/<time>[_name].jpg` (override with `ELLAMA_PHOTO_DIR`) plus a `.json` with the
+robot's odometry pose at that moment, the image brightness, and `moved_during_capture`. The
+folder ignores itself in git. It is the hook for off-robot image work and for the loop *drive ->
+stop -> photo -> analyse -> decide -> drive*: the `drive_*` / `turn_degrees` tools stop
+themselves, `save_photo` takes the picture and returns its path (add `preview_width=640` to
+see it in the same call), and any script or model on this computer can read the file. Compare
+`robot.dist_avg_in` / `heading_deg` between photos to place them; call `zero_odometry()` first
+if you want them relative to a start point.
 
 ## Recording a stick-driven run
 
@@ -180,11 +188,11 @@ that watches the lean of the chassis and stops the robot before it goes over.
   still, live IMU after the server starts; `set_level_reference` re-takes it.
 - **When it trips:** tilt plus a short look-ahead on how fast it is growing reaches the limit
   (default 25 deg; the look-ahead adds at most 30% of the limit, so a fast lean trips at about
-  17.5 deg and a slow bank at 25), for 2 IMU samples in a row. Replayed against all 49
-  recordings in `recordings/` the worst tilt seen was 4.8 deg, no trips.
+  17.5 deg and a slow bank at 25), for 2 IMU samples in a row. Replayed against the 11
+  recordings in `recordings/` that carry tilt data, the worst ordinary tilt seen was 5.7 deg, no trips.
 - **What it does:** sends `stop` from the IMU thread within ~20 ms of the sample, **latches**,
   and refuses every drive command (`send_drive` is the single choke point, so `jog`,
-  `drive_*`, `turn_*`, line-follow, turn-to-me and `perform` are all covered) until
+  `drive_*`, `turn_*` and `perform` are all covered) until
   `clear_tilt_fault`. Autonomous runs are aborted; blocking tools return
   `{"ok": false, "error": "tilt guard: ...", "tilt_guard": {...}}`.
 - **Fails closed:** no level reference yet, or no IMU sample for 0.5 s, also refuses to drive
@@ -214,14 +222,14 @@ stopped matching".
 | `slip` | over 1 s the wheels turned the robot >= 20 deg but the gyro saw < 1/3.5 of it (a normal spin scrubs 1.6-2x; a robot held by a foot read 5x) | wheels turning, chassis not |
 | `bump` | a >= 0.6 g spike while driving, or a >= 0.35 g spike with wheel speed collapsing to < 40% in 0.3 s and the command held | hit something |
 
-- **Why the IMU decides stall vs encoder fault:** in the 10-03 follow runs the right encoder reads
+- **Why the IMU decides stall vs encoder fault:** in the 10-03 line-follow runs (since removed) the right encoder read
   exactly 0 for 25-58% of "commanded" samples while the robot drove fine. A stuck wheel makes the
   chassis pivot (gyro agrees with the encoders); a dead encoder doesn't (gyro says straight).
 - **`encoder_fault` only stops encoder-dependent tools** (`drive_*`, `turn_degrees`, `jog`).
-  Line-follow and `perform` set `encoders_required=False` -- a dead encoder is logged, a real
-  stall/slip/bump still stops them.
-- **Tuned on real data:** replaying the 39 recorded line-follow runs, camera-only mode trips on
-  exactly 2: `follow_run1` (the robot sat motionless for 5 s with the follower commanding
+  `perform` sets `encoders_required=False` -- a dead encoder is logged, a real
+  stall/slip/bump still stops it.
+- **Tuned on real data (runs since removed; see "Removed experiments"):** replaying 39 recorded
+  line-follow runs, camera-only mode tripped on exactly 2: `follow_run1` (the robot sat motionless for 5 s with the follower commanding
   left -90) and `follow_newcam_run9b` (right wheel 6.8 -> 0 in/s in 0.1 s with a 0.35 g spike).
   Neither looks false. Strict mode also reports 15 `encoder_fault` events, all on the dead-encoder runs.
 - **Not validated on a real obstacle yet.** Bump sensitivity in particular is set above normal
@@ -232,7 +240,7 @@ stopped matching".
 - **Limits:** a robot that is moving fine but *should* stop (a person in front of it) is the
   camera's job; wheels spinning with the robot not moving at all looks like a stall (good), but a
   wheel that slips while the robot still moves is not detectable from encoders + IMU alone.
-- **Tests:** `python3 test_motion_guard.py` (synthetic scenarios + the replay above, no hardware).
+- **Tests:** `python3 test_motion_guard.py` (synthetic scenarios, no hardware).
 
 ## Safety net beyond the confirmation gate
 
@@ -245,16 +253,11 @@ stopped matching".
 - Neither of those is a substitute for the confirmation gate — they bound how long a
   *stuck* command runs, not whether a command should have been sent at all.
 
-## Line following
+## Removed experiments
 
-`start_line_follow` runs a camera -> detect -> steer loop on its own thread (`line_vision.py`
-finds the 3/4in tape, `line_follow.py` turns it into wheel commands, `camera_stream.py` shares
-the phone's `/video/mjpeg` stream). One `confirmed_safe` covers the run. It stops by itself and
-reports why: `finish_candidate` (something like the end strip; may be paint or glare), `end_of_tape` (line
-vanished right after a cross strip), `lost` (no line for 0.5 s), `stale` (no camera
-frame), `telemetry_stale`, `timeout`, or `stopped` (`stop()` / `listen()` abort it at any time). These are claims for the AI to check with
-`line_follow_report`, not verdicts. It never searches for a lost line. Other drive tools refuse while it runs. The run is recorded
-to `recordings/<name>/` (telemetry CSV, `video.mp4`, `video_times.csv`, `follow_log.csv`).
-`line_follow_sim.py` is a closed-loop sanity check of the controller, not a prediction -- its
-constants are fit from `tape_manual_run1/2` and need tuning on the real robot.
-
+Line following (`start_line_follow`, `line_view`, `line_follow_status`, `line_follow_report`) and
+person tracking (`turn_to_me*`, `person_view`) were built on 2026-10-02/03 and taken out on
+2026-10-12 to keep this server simple. Code, run logs and stills are in git at the tag
+`before-experiment-removal`; the run videos and pose models are in
+`~/ellama_experiments_archive/`. The write-up of what worked and what did not is the doc
+"eLlama experiments: line following and person tracking".

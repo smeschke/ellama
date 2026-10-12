@@ -23,12 +23,12 @@ slip       Over 1 s the wheels report a rotation >= 20 deg but the gyro saw less
 bump       Hard: horizontal acceleration spike >= 0.6 g (normal driving peaks at 0.43 g).
            Corroborated: a >= 0.35 g spike within 0.15 s of the wheels' mean speed collapsing
            to < 40% of what it was 0.3 s earlier (from >= 3 in/s) with the command held ->
-           "bump". A speed drop alone is NOT enough -- the line follower does that normally.
+           "bump". A speed drop alone is NOT enough -- ordinary braking and turning do that.
 
 Faults latch like the tilt guard's (stop -> check -> decide -> move): nothing drives until
 the operator clears it. Two exceptions are deliberate. An "encoder_fault" only latches when
-the running tool depends on the encoders (encoders_required); the camera-only line follower
-sets it False, because a dead encoder must not stop a run that doesn't use them, and the event
+the running tool depends on the encoders (encoders_required); a camera-only run
+(perform) sets it False, because a dead encoder must not stop a run that doesn't use them, and the event
 is just logged. And mode "warn" logs every event without ever stopping, for tuning on a robot.
 
 What it cannot see: wheels spinning on the spot with the robot not moving at all and the IMU

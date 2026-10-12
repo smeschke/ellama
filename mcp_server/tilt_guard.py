@@ -70,6 +70,7 @@ class TiltGuard:
         self.tripped = False
         self.fault = None          # dict describing the trip while latched
         self.tilt_deg = 0.0
+        self.max_tilt_deg = 0.0   # peak lean seen since start or the last cleared fault
         self.rate_dps = 0.0
         self.pitch = self.roll = 0.0
         self.samples = 0
@@ -131,6 +132,8 @@ class TiltGuard:
             self.rate_dps += RATE_ALPHA * (raw_rate - self.rate_dps)
         self._last_tilt = tilt
         self.tilt_deg = tilt
+        if tilt > self.max_tilt_deg:
+            self.max_tilt_deg = tilt
 
         if not self.enabled or self.tripped:
             return None
@@ -165,6 +168,7 @@ class TiltGuard:
         self.tripped = False
         self.fault = None
         self._over = 0
+        self.max_tilt_deg = self.tilt_deg
         return True, "fault cleared"
 
     def snapshot(self):
@@ -172,6 +176,7 @@ class TiltGuard:
             enabled=self.enabled,
             ready=self.ready,
             tilt_deg=round(self.tilt_deg, 1),
+            max_tilt_deg=round(self.max_tilt_deg, 1),
             tilt_rate_dps=round(self.rate_dps, 1),
             limit_deg=self.limit_deg,
             lookahead_s=self.lookahead_s,

@@ -2,8 +2,9 @@
 
 The phone app serves a limited number of simultaneous streams, and each extra reader drops
 every reader's frame rate (two readers each got ~13 fps instead of ~16.6 on 2026-10-02). So
-anything that wants frames -- the line follower, a recorder, a live preview -- subscribes to
-one FrameSource instead of opening its own connection.
+anything that wants frames -- a vision script, a recorder, a live preview -- subscribes to
+one FrameSource instead of opening its own connection. (robot_server.py does not use it right
+now; it was the line follower's and turn-to-me's reader, and is kept for a stream/image tool.)
 
     src = FrameSource(open_stream)       # open_stream() -> file-like of multipart MJPEG
     src.start()
@@ -12,8 +13,8 @@ one FrameSource instead of opening its own connection.
     src.stop()
 
 `t` is time.monotonic() when the frame finished arriving on the computer (not when the phone
-exposed it -- the phone's capture/encode delay is on top of that; see line_follow.py's
-CAMERA_DELAY_S). Reconnects by itself if the stream drops.
+exposed it -- the phone's capture/encode delay is on top of that, about 0.25 s behind the
+IMU when last measured). Reconnects by itself if the stream drops.
 """
 
 import threading

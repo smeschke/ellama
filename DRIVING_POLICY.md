@@ -157,7 +157,63 @@ give you that read while the robot is still moving and carrying momentum
 from what you just told it to do — so without sensing good enough to
 replace the stop-and-look step, don't skip it.
 
-## 6. Why this reads differently from how AI defaults to operating
+**Example: noticing a stall the tool didn't report.** During a camera scan in
+35° in-place steps, one step took 5.9 s instead of ~1.9 s, and the wheel
+encoders counted about three times the rotation of the previous steps (173°
+against ~56°) while the IMU reported the same ~34° turn. The tool still
+returned `ok` with no timeout, so nothing flagged it; the operator caught it
+only by comparing that step to the ones before it. The wheels were turning
+far more than the body, which means something was resisting the robot (here,
+a person's foot, deliberately). The operator stopped, released control with
+`listen`, and reported the numbers and what it did and didn't know, instead
+of continuing the scan. It guessed a wall was the cause and was wrong; it
+flagged that as a guess. The rule this illustrates: an operator without
+obstacle sensors has no way to see what the robot is up against, so when
+wheel motion, timing or the camera disagree with what the IMU says happened,
+treat it as "something is in the way," stop, and ask before sending the next
+command, instead of finishing the sequence.
+
+## 6. Doorways and other narrow gaps — just go through
+
+When the navigation, the person, or the code says to go through a doorway
+(or any gap the robot is meant to pass), and you can see two vertical edges
+with the floor continuing between them, go through it. Do not estimate
+whether it will fit, and do not compute the opening's size beforehand. When
+you are close it is obvious what it is, and the wheels, being rounded, will
+guide the robot in if they brush the frame. This section is about how to do
+the move, not whether to do it; section 1 still applies.
+
+**Robot facts that matter:** it is 22 in wide at the wheels, 24 in long and
+10 in tall. The wheels are the widest part, and rubbing up to about 1 in per
+side is fine. The camera is centered on the robot, 10 in off the ground, so
+the image's center column is the robot's centerline. Forward moves drift left
+by about 1.5° per foot, so aim a touch right of center on a long approach.
+The smallest in-place turn is about 3–4°, so a sideways shift is an S-turn
+(turn, a short drive, turn back), not an aim.
+
+**Procedure**
+
+1. **Look.** Find the two vertical edges with floor continuing between them.
+   If you can't find both and the floor between them, don't drive: look again
+   from a different heading, or say so.
+2. **Aim at the middle.** Put the midpoint between the edges on the image's
+   center column. Turn only when it is visibly off.
+3. **Approach in steps** of 10–12 in at PWM 50, and re-center after each step
+   with a small turn or an S-turn.
+4. **Keep both edges balanced** as you close in. If one is clearly nearer the
+   center, shift toward the other side before the last stretch.
+5. **Go through steadily.** The last couple of feet are blind because the
+   edges leave the frame. Hold the heading you had; don't swerve on the last
+   picture.
+6. **Keep going until the whole body is through**, then turn.
+
+**If it physically resists:** a light brush on a wheel is fine, so keep
+moving gently. If it stops making progress for about a second, or a move
+takes much longer than its usual 0.25 s per inch, stop and back up a few
+inches, re-aim, and try again. Do not push harder. This is a response to
+what the robot does, not a judgment about the gap.
+
+## 7. Why this reads differently from how AI defaults to operating
 
 Left to its own judgment, AI tends to pick the PWM value that most cleanly
 demonstrates the intended behavior, apply it immediately at full target

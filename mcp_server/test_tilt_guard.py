@@ -118,6 +118,21 @@ def test_latch_and_clear():
     assert not g.tripped
 
 
+def test_peak_tilt_is_tracked_and_reset_on_clear():
+    g, t = fresh()
+    assert g.snapshot()["max_tilt_deg"] == 0.0
+    lean(g, t, roll_rate_dps=3.0, to_deg=40)
+    peak = g.snapshot()["max_tilt_deg"]
+    assert peak >= 17, peak                    # at least where it tripped
+    for i in range(10):                        # righted
+        t += 5000
+        g.update(MOUNT[0], MOUNT[1], t)
+    assert g.snapshot()["max_tilt_deg"] == peak, "peak must survive the robot righting itself"
+    ok, msg = g.clear()
+    assert ok, msg
+    assert g.snapshot()["max_tilt_deg"] < 2.0, "clearing a fault resets the peak"
+
+
 def test_disabled_never_trips_but_reports():
     g, t = fresh(enabled=False)
     f, tilt, _ = lean(g, t, roll_rate_dps=3.0, to_deg=40)

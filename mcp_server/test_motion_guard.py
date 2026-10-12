@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Tests for motion_guard.py -- synthetic scenarios, then a replay of the recorded runs.
+"""Tests for motion_guard.py -- synthetic scenarios.
 
     python3 mcp_server/test_motion_guard.py
 """
-import bisect
-import csv
-import glob
 import math
-import os
 import sys
 from pathlib import Path
 
@@ -69,7 +65,7 @@ def test_dead_encoder_with_straight_driving_is_encoder_fault_not_stall():
 
 def test_encoder_fault_only_logged_when_encoders_not_required():
     g = guard()
-    g.encoders_required = False  # camera-only line follower
+    g.encoders_required = False  # camera-only run: encoders not required
     f, _ = run(g, (-60, -60), 4.0, lambda e: (0.0, 6.0), gz=0.0)
     assert f is None and not g.tripped
     assert any(ev["kind"] == "encoder_fault" for ev in g.events)
@@ -154,7 +150,7 @@ def test_corroborated_bump_needs_both_spike_and_collapse():
     f, _ = run(g, (-60, -60), 3.0, lambda e: (6.5, 6.5) if e < 1.5 else (0.5, 0.5),
                acc=lambda e: (0.45, 0.0) if 1.50 <= e < 1.54 else (0.0, 0.0))
     assert f and f["kind"] == "bump", f
-    # same speed collapse with NO accel spike (the line follower does this) -> nothing... until
+    # same speed collapse with NO accel spike (a slow-moving run does this) -> nothing... until
     # the stall detector's own rules (grace/hold) would apply, so keep it short
     g = guard()
     f, _ = run(g, (-60, -60), 1.8, lambda e: (6.5, 6.5) if e < 1.2 else (0.5, 0.5))
@@ -180,82 +176,6 @@ def test_latch_and_clear():
     assert ok and not g.tripped and g.fault is None
 
 
-# ---- replay ------------------------------------------------------------------------
-
-def load_run(d):
-    fl = os.path.join(d, "follow_log.csv")
-    mains = [p for p in glob.glob(os.path.join(d, "*.csv"))
-             if os.path.basename(p) not in ("commands.csv", "follow_log.csv", "video_times.csv")]
-    if not (os.path.exists(fl) and mains):
-        return None
-    try:
-        cmds = [(float(r["time_s"]), int(r["left_raw"]), int(r["right_raw"]))
-                for r in csv.DictReader(open(fl)) if r["left_raw"] != ""]
-        rows = list(csv.DictReader(open(mains[0])))
-    except Exception:
-        return None
-    if not cmds or not rows or "acc_x_g" not in rows[0]:
-        return None
-    ev = [(t, 0, ("cmd", l, r)) for t, l, r in cmds]
-    last_yaw = last_t = None
-    for r in rows:
-        try:
-            t = float(r["time_s"])
-            if r["source"] == "ENC":
-                ev.append((t, 1, ("enc", float(r["speed_l_in_s"] or 0), float(r["speed_r_in_s"] or 0))))
-            elif r["source"] == "IMU":
-                yaw = float(r["yaw_deg"])
-                gz = 0.0 if last_t is None or t <= last_t else (yaw - last_yaw) / (t - last_t)
-                last_yaw, last_t = yaw, t
-                ev.append((t, 2, ("imu", gz, float(r["acc_x_g"]), float(r["acc_y_g"]))))
-        except ValueError:
-            continue
-    ev.sort(key=lambda e: (e[0], e[1]))
-    return ev
-
-
-def replay(ev, encoders_required):
-    g = mg.MotionGuard(forward_pwm_sign=FWD, track_width_in=20.0)
-    g.encoders_required = encoders_required
-    hits = []
-    for t, _, p in ev:
-        f = None
-        if p[0] == "cmd":
-            g.on_command(p[1], p[2], t)
-        elif p[0] == "enc":
-            f = g.on_enc(p[1], p[2], t)
-        else:
-            f = g.on_imu(p[1], p[2], p[3], t)
-        if f:
-            hits.append((t, f))
-            g.clear()  # keep counting past the first
-    kinds = {}
-    for e in g.events:
-        pass
-    return hits, g
-
-
-def replay_report():
-    root = Path(__file__).resolve().parent.parent / "recordings"
-    totals = {"real": {}, "lenient": {}}
-    per = []
-    for d in sorted(glob.glob(str(root / "*/"))):
-        ev = load_run(d)
-        if not ev:
-            continue
-        name = os.path.basename(d.rstrip("/"))
-        out = {}
-        for key, req in (("real", True), ("lenient", False)):
-            hits, _ = replay(ev, req)
-            c = {}
-            for _, f in hits:
-                c[f["kind"]] = c.get(f["kind"], 0) + 1
-                totals[key][f["kind"]] = totals[key].get(f["kind"], 0) + 1
-            out[key] = c
-        per.append((name, out))
-    return per, totals
-
-
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
@@ -268,13 +188,6 @@ def main():
             import traceback
             print("FAIL", fn.__name__, "-", repr(e))
             traceback.print_exc()
-    per, totals = replay_report()
-    print("\nreplay of %d recorded line-follow runs (a trip is cleared and counting continues):" % len(per))
-    print("  encoders required (strict):  %s" % (totals["real"] or "no trips"))
-    print("  camera-only (lenient):       %s" % (totals["lenient"] or "no trips"))
-    noisy = [(n, o) for n, o in per if o["lenient"]]
-    for n, o in noisy[:12]:
-        print("    lenient trips in %-34s %s" % (n, o["lenient"]))
     sys.exit(1 if failed else 0)
 
 

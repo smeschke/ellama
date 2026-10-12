@@ -35,6 +35,7 @@ import functools
 import json
 import math
 import os
+import re
 import signal
 import socket
 import ssl
@@ -45,6 +46,7 @@ import tempfile
 import time
 import urllib.request
 import wave
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
@@ -55,12 +57,6 @@ import serial
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "calibration"))
 import bridge  # noqa: E402  (calibration/bridge.py)
 import recording  # noqa: E402  (mcp_server/recording.py)
-import line_vision  # noqa: E402  (mcp_server/line_vision.py)
-import phone_display  # noqa: E402  (mcp_server/phone_display.py)
-import person_track  # noqa: E402  (mcp_server/person_track.py)
-import person_vision  # noqa: E402  (mcp_server/person_vision.py)
-import camera_stream  # noqa: E402  (mcp_server/camera_stream.py)
-import line_follow  # noqa: E402  (mcp_server/line_follow.py)
 import hearing  # noqa: E402  (mcp_server/hearing.py)
 import perform as perform_show  # noqa: E402  (mcp_server/perform.py)
 import tilt_guard  # noqa: E402  (mcp_server/tilt_guard.py)
@@ -413,13 +409,13 @@ def _connect(port=None):
 
 def _on_guard_trip(fault):
     """Called from the IMU pump thread right after the guard trips and "stop" is sent: end any
-    autonomous run (line-follow / turn-to-me / perform). Blocking tools notice on their next
+    autonomous run (perform). Blocking tools notice on their next
     send_drive, which raises TiltFault."""
-    _follow["abort"].set()
+    _run["abort"].set()
 
 
 def _shutdown():
-    _follow["abort"].set()
+    _run["abort"].set()
     if link is not None:
         link.emergency_stop()
 
@@ -446,7 +442,8 @@ CAM_SNAPSHOT_PATHS = ("/video/snapshot", "/shot.jpg")
 # Live MJPEG endpoints of the same apps, tried in order: "Android IP Camera" (what this phone
 # runs; ~15 fps at 360x480 as of 2026-10-02) and IP Webcam.
 CAM_STREAM_PATHS = ("/video/mjpeg", "/video")
-CAM_TIMEOUT_S = 20
+CAM_PROBE_TIMEOUT_S = 8       # finding the camera / grabbing a stream frame: usually ~1-3 s
+CAM_SNAPSHOT_TIMEOUT_S = 12   # a full-res still takes ~1-8 s; past this the photo has failed
 CAM_MAX_WIDTH = 1280
 
 # auto_photo (start_recording): take a photo each time the robot comes to rest after moving.
@@ -456,6 +453,7 @@ AUTO_PHOTO_MIN_TRAVEL_IN = 4.0    # summed |left|+|right| wheel travel since the
 AUTO_PHOTO_MIN_TURN_DEG = 10.0    # or this much IMU yaw change
 AUTO_PHOTO_POLL_S = 0.1
 _cam = None  # cached (base_url, snapshot_path) once found
+CAM_CACHE_FILE = Path.home() / ".cache" / "ellama" / "camera_url"  # last address the phone answered on
 # IP Webcam's optional TLS uses a self-signed cert, so verification is off -- acceptable
 # for a read-only camera on the home LAN, and this context is used for nothing else.
 _cam_ssl = ssl.create_default_context()
@@ -479,13 +477,38 @@ def _local_ip():
         s.close()
 
 
+def _read_jpeg(r, limit=2_000_000):
+    """The first complete JPEG in a file-like (a bare JPEG or a multipart MJPEG stream), else None."""
+    buf = b""
+    while len(buf) < limit:
+        chunk = r.read(8192)
+        if not chunk:
+            break
+        buf += chunk
+        a = buf.find(b"\xff\xd8")
+        if a >= 0:
+            b = buf.find(b"\xff\xd9", a + 2)
+            if b >= 0:
+                return buf[a:b + 2]
+    return None
+
+
 def _probe(base):
-    """The snapshot path that returns a real JPEG on base, else None."""
-    for path in CAM_SNAPSHOT_PATHS:
+    """The snapshot path of the camera app on base, else None. The app is recognised by its
+    live stream returning a JPEG, which is quick even when the single-photo endpoint is slow
+    or wedged (the two path tuples are in the same app order)."""
+    for snap, stream in zip(CAM_SNAPSHOT_PATHS, CAM_STREAM_PATHS):
         try:
-            with _cam_open(base + path, CAM_TIMEOUT_S) as r:
+            with _cam_open(base + stream, CAM_PROBE_TIMEOUT_S) as r:
+                if _read_jpeg(r) is not None:
+                    return snap
+        except Exception:
+            pass
+    for snap in CAM_SNAPSHOT_PATHS:   # an app with no stream: fall back to the photo itself
+        try:
+            with _cam_open(base + snap, CAM_SNAPSHOT_TIMEOUT_S) as r:
                 if r.read(2) == b"\xff\xd8":
-                    return path
+                    return snap
         except Exception:
             pass
     return None
@@ -519,8 +542,28 @@ def _discover_camera():
     )
 
 
+def _saved_camera():
+    """(base_url, snapshot_path) from the last time the phone was found, trusted as is: a
+    stale one fails its first fetch and _fetch_snapshot rediscovers. Skips the /24 scan,
+    which takes ~6 s and seems to stall the phone's camera server."""
+    try:
+        base, path = CAM_CACHE_FILE.read_text().split()
+    except (OSError, ValueError):
+        return None
+    return base, path
+
+
+def _save_camera(cam):
+    try:
+        CAM_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CAM_CACHE_FILE.write_text(f"{cam[0]} {cam[1]}\n")
+    except OSError:
+        pass
+
+
 def _camera(rediscover=False):
-    """(base_url, snapshot_path), discovered once and cached."""
+    """(base_url, snapshot_path): the saved address if it still answers, else a subnet
+    scan; cached for the life of the process."""
     global _cam
     with _cam_lock:
         if rediscover:
@@ -530,21 +573,48 @@ def _camera(rediscover=False):
             if explicit:
                 _cam = (explicit, _probe(explicit) or CAM_SNAPSHOT_PATHS[0])
             else:
-                _cam = _discover_camera()
+                _cam = (None if rediscover else _saved_camera()) or _discover_camera()
+                _save_camera(_cam)
         return _cam
 
 
+def _reachable(base, timeout=2.0):
+    """True if something accepts TCP connections at base's host:port."""
+    from urllib.parse import urlparse
+    u = urlparse(base)
+    try:
+        with socket.create_connection((u.hostname, u.port or (443 if u.scheme == "https" else 80)),
+                                      timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _fetch_snapshot():
-    """GET a JPEG from the phone; if the cached address has gone stale (phone got a new
-    DHCP lease), rediscover once and retry."""
+    """A full-res JPEG from the phone's photo endpoint, or a RuntimeError saying why not. It
+    never substitutes a frame of the live stream. If the cached address is dead (phone got a
+    new DHCP lease) it rediscovers once and retries; if the address answers but the photo does
+    not come back, that is reported as is, without a rescan."""
     last = None
     for attempt in (0, 1):
         try:
             base, path = _camera(rediscover=attempt == 1)
-            with _cam_open(base + path, CAM_TIMEOUT_S) as r:
-                return r.read()
         except Exception as e:
             last = e
+            continue
+        try:
+            with _cam_open(base + path, CAM_SNAPSHOT_TIMEOUT_S) as r:
+                img = r.read()
+            if img[:2] == b"\xff\xd8":
+                return img
+            last = RuntimeError(f"{base}{path} did not return a JPEG")
+        except Exception as e:
+            last = e
+        if _reachable(base):
+            raise RuntimeError(
+                f"the camera app is up at {base} but its photo endpoint ({path}) returned no "
+                f"image within {CAM_SNAPSHOT_TIMEOUT_S} s ({last}); look() does not fall back to "
+                "the live stream. Try restarting the camera app on the phone.")
     raise RuntimeError(f"camera fetch failed: {last}")
 
 
@@ -562,30 +632,8 @@ def _open_stream():
     raise RuntimeError(f"no video stream: {last}")
 
 
-_follow = {"running": False, "abort": threading.Event(), "status": "idle", "info": {}, "result": None,
-           "ended": threading.Event()}
-_frames = None  # camera_stream.FrameSource, created on first use
-
-FOLLOW_MAX_CRUISE_PWM = line_follow.F_MAX  # start_line_follow's speed_pwm cap. Forward effort is touchy, so
-                                           # it stays modest; turns may go to TURN_OUTER_MAX / T_SPIN_MAX
-
-
-def _phone_display_url():
-    """Where phone/display_server.py listens: ELLAMA_PHONE_DISPLAY, else port 8080 on the phone
-    that serves the camera."""
-    explicit = os.environ.get("ELLAMA_PHONE_DISPLAY", "").rstrip("/")
-    if explicit:
-        return explicit
-    from urllib.parse import urlparse
-    return f"http://{urlparse(_camera()[0]).hostname}:8080"
-
-
-def _frame_source():
-    global _frames
-    if _frames is None:
-        _frames = camera_stream.FrameSource(_open_stream)
-    _frames.start()
-    return _frames
+_run = {"running": False, "abort": threading.Event(), "status": "idle", "info": {}, "result": None,
+        "ended": threading.Event()}
 
 
 mcp = FastMCP("ellama-robot")
@@ -630,8 +678,8 @@ def _confirm_gate(confirmed_safe: bool):
     tilt_block = _tilt_gate()
     if tilt_block:
         return tilt_block
-    if _follow["running"]:
-        return {"ok": False, "error": "an autonomous run (line-follow / turn-to-me) is in progress; call stop() first"}
+    if _run["running"]:
+        return {"ok": False, "error": "an autonomous run (perform) is in progress; call stop() first"}
     if confirmed_safe:
         return None
     return {
@@ -693,7 +741,7 @@ def stop() -> dict:
     """Immediately command zero PWM (active braking, not coasting -- see
     DRIVING_POLICY.md). Always safe to call with no confirmation, any time, including
     when nothing is currently moving."""
-    _follow["abort"].set()
+    _run["abort"].set()
     if link is None:
         return _not_connected()
     link.send_stop()
@@ -777,7 +825,7 @@ def listen() -> dict:
     matching computer_bridge.ino's serial protocol). Use this when done driving so a
     human can pick up the stick without the two fighting on the same ESP-NOW channel.
     Always safe to call, no confirmation needed."""
-    _follow["abort"].set()
+    _run["abort"].set()
     if link is None:
         return _not_connected()
     link.send_listen()
@@ -789,9 +837,11 @@ def look(width: int = 640):
     """Read-only. Take a photo with the phone camera mounted on the robot and return it, so
     you can see what the robot currently sees. Never moves the robot, no confirmation
     needed. The phone is found automatically on the local network (or via ELLAMA_CAM_URL).
-    Slow: expect ~5-8 seconds. `width` downsizes the image (default 640, max 1280) to keep
-    it cheap. This is advisory vision only -- a JPEG glance is not an obstacle sensor, so it
-    does NOT replace asking the operator before any move."""
+    A full-res photo takes ~1-8 seconds; if the phone's photo endpoint does not return one
+    within 12 s this returns an error (it never substitutes a frame of the live video
+    stream). `width` downsizes the image (default 640, max 1280) to keep it cheap. This is advisory vision only -- a JPEG glance is not an obstacle sensor, so it
+    does NOT replace asking the operator before any move. Use save_photo() to keep the
+    picture as a file on this computer."""
     width = max(64, min(int(width), CAM_MAX_WIDTH))
     try:
         img = PILImage.open(BytesIO(_fetch_snapshot()))
@@ -804,55 +854,105 @@ def look(width: int = 640):
     return Image(data=buf.getvalue(), format="jpeg")
 
 
-@mcp.tool()
-def line_view(width: int = 640):
-    """Read-only. Take a phone-camera photo, find the dark tape line in it, and return the
-    photo with the detection drawn on (red = dark pixels, green dots = line center per band
-    with its lateral offset in inches) plus the numbers: `offset_in` (+ = line is right of
-    the robot's center, nearest band), `lean_deg` (+ = line leans right going away),
-    `lookahead_offset_in` (farthest band) and `found`. Offsets use the known 3/4in tape
-    width as the scale, so they're approximate. Never moves the robot, no confirmation
-    needed; same ~5-8s snapshot as look()."""
-    width = max(64, min(int(width), CAM_MAX_WIDTH))
-    try:
-        import cv2
-        import numpy as np
-        bgr = cv2.imdecode(np.frombuffer(_fetch_snapshot(), np.uint8), cv2.IMREAD_COLOR)
-        if bgr is None:
-            return {"ok": False, "error": "camera returned something that isn't an image"}
-        if bgr.shape[1] > width:
-            bgr = cv2.resize(bgr, (width, round(bgr.shape[0] * width / bgr.shape[1])))
-        result, annotated = line_vision.analyze(bgr)
-        ok, jpg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    import json
-    return [json.dumps(result), Image(data=jpg.tobytes(), format="jpeg")]
+PHOTO_DIR = Path(os.environ.get("ELLAMA_PHOTO_DIR") or Path(__file__).resolve().parent.parent / "recordings" / "photos")
+PHOTO_MOVED_IN = 0.2    # wheel travel (|left|+|right|) during the fetch that counts as "moved"
+PHOTO_MOVED_DEG = 1.0   # or this much IMU yaw change
+
+
+def _write_photo(jpeg, dest_dir, name, meta):
+    """Save jpeg as dest_dir/<YYYYmmdd_HHMMSS>[_name].jpg with a .json sidecar holding meta.
+    The folder gets its own .gitignore so photos never show up in git status. Returns the
+    jpg path."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    gi = dest_dir / ".gitignore"
+    if not gi.exists():
+        gi.write_text("*\n")   # ignores everything here, itself included
+    stem = time.strftime("%Y%m%d_%H%M%S")
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", name or "").strip("_")[:40]
+    if slug:
+        stem += "_" + slug
+    path, n = dest_dir / f"{stem}.jpg", 2
+    while path.exists():   # two photos in the same second
+        path, n = dest_dir / f"{stem}_{n}.jpg", n + 1
+    path.write_bytes(jpeg)
+    path.with_suffix(".json").write_text(json.dumps({**meta, "file": path.name}, indent=2))
+    return path
 
 
 @mcp.tool()
-def person_view():
-    """Read-only. Grab the newest live camera frame, find people in it, and return it with
-    the detection drawn on (green = the largest person, orange = others; vertical line = their
-    horizontal center) plus the numbers: `n_people`, and per person `bearing_deg` (+ = to the
-    RIGHT of where the robot points) and `x_frac`. Legs-only views are fine -- every visible
-    keypoint votes for the center. Never moves the robot, no confirmation needed. This is
-    what turn_to_me would act on, so use it to check the detection first."""
+def save_photo(name: str = "", preview_width: int = 0, open_in_browser: bool = False):
+    """Read-only. Take a full-res photo with the phone camera and SAVE it on this computer,
+    returning its path, so you can open the file or run image recognition / any script on it
+    (all of that happens off the robot). Never moves the robot, no confirmation needed.
+
+    Returns `path` (the .jpg; a .json with the same facts sits next to it), `width`/`height`,
+    `brightness` (mean 0-255; low = consider the phone torch), `robot` (the odometry pose at
+    the moment of the photo: dist_avg_in and heading_deg since zero_odometry(), IMU
+    yaw/pitch/roll; null if the bridge isn't connected) and `moved_during_capture` (true if the
+    wheels or yaw changed during the ~1-2 s fetch, so the picture may be blurred or from a
+    slightly different spot).
+
+    The look-decide-move loop: drive_distance / turn_degrees (it stops itself) -> save_photo
+    -> look at the file, decide -> next move. Compare `robot` between photos to place them.
+    name is an optional label for the filename. preview_width > 0 also returns the picture
+    itself, downsized to that width (max 1280), so you can see it in this same call; leave 0
+    to keep the call cheap and open the file later. open_in_browser shows it in a browser
+    window on this computer. If the phone's photo endpoint doesn't answer within 12 s this
+    fails with an error; it never substitutes a frame of the live stream."""
+    def pose():
+        if link is None:
+            return None
+        with link.lock:
+            return (link.enc.dist_l, link.enc.dist_r, link.orient.yaw)
+
+    before, t0 = pose(), time.monotonic()
     try:
-        import cv2
-        src = _frame_source()
-        t0 = time.monotonic()
-        while src.latest() is None and time.monotonic() - t0 < 10:
-            time.sleep(0.05)
-        fr = src.latest()
-        if fr is None or src.age_s() > 1.0:
-            return {"ok": False, "error": "no live camera frames", "camera": src.status()}
-        result, annotated = person_vision.analyze(fr.img)
-        ok, jpg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        jpeg = _fetch_snapshot()
+        im = PILImage.open(BytesIO(jpeg))
+        im.load()
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    import json
-    return [json.dumps(result), Image(data=jpg.tobytes(), format="jpeg")]
+    elapsed, after = time.monotonic() - t0, pose()
+    moved = None
+    if before is not None and after is not None:
+        moved = (abs(after[0] - before[0]) + abs(after[1] - before[1]) > PHOTO_MOVED_IN
+                 or abs(after[2] - before[2]) > PHOTO_MOVED_DEG)
+    robot = None
+    if link is not None:
+        s = link.telemetry_snapshot()
+        robot = {k: s.get(k) for k in ("dist_avg_in", "heading_deg", "yaw_deg", "pitch_deg",
+                                       "roll_deg", "telemetry_live", "imu_live")}
+    brightness = round(sum(im.convert("L").resize((64, 64)).getdata()) / 4096)
+    meta = {"taken_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "name": name or None,
+            "width": im.width, "height": im.height, "brightness": brightness,
+            "robot": robot, "moved_during_capture": moved, "elapsed_s": round(elapsed, 2)}
+    try:
+        path = _write_photo(jpeg, PHOTO_DIR, name, meta)
+    except OSError as e:
+        return {"ok": False, "error": f"could not save the photo: {e}"}
+    result = {"ok": True, "path": str(path), "width": im.width, "height": im.height,
+              "bytes": len(jpeg), "brightness": brightness, "robot": robot,
+              "moved_during_capture": moved, "elapsed_s": round(elapsed, 2)}
+    if open_in_browser:
+        page = path.with_suffix(".html")
+        page.write_text(
+            f'<!doctype html><meta charset="utf-8"><title>{path.name}</title>'
+            '<body style="margin:0;background:#111;display:flex;justify-content:center;'
+            f'align-items:center;min-height:100vh"><img src="{path.name}" '
+            'style="max-width:100vw;max-height:100vh;object-fit:contain"></body>')
+        try:
+            result["opened_in_browser"] = bool(webbrowser.open(page.as_uri()))
+        except Exception:
+            result["opened_in_browser"] = False
+    width = max(0, min(int(preview_width), CAM_MAX_WIDTH))
+    if width <= 0:
+        return result
+    small = im.convert("RGB")
+    if small.width > width:
+        small = small.resize((width, round(small.height * width / small.width)))
+    buf = BytesIO()
+    small.save(buf, "JPEG", quality=80)
+    return [json.dumps(result), Image(data=buf.getvalue(), format="jpeg")]
 
 
 @mcp.tool()
@@ -1568,519 +1668,13 @@ def speak_then_drive(text: str, pwm: int, duration_s: float, confirmed_safe: boo
     }
 
 
-def _follow_hud(cmd, src, t_s):
-    """What the phone display's command panel shows for one line-follow command."""
-    i = cmd.info
-    lines = []
-    if "phi_deg" in i:
-        lines.append(f"aim {i['phi_deg']:+.1f} deg   offset {i.get('e_in', 0):+.1f} in")
-        lines.append(f"forward {i.get('f', 0):+d}   turn {i.get('t', 0):+d}")
-    lines.append(f"bands {i.get('bands', '-')}   {src.fps():.0f} fps")
-    return dict(left=cmd.left_raw * FORWARD_PWM_SIGN, right=cmd.right_raw * FORWARD_PWM_SIGN,
-                status=cmd.status, spin=bool(i.get("spin")), t_s=t_s, lines=lines)
-
-
-def _follow_loop(lnk, src, ctl, rec_dir, t_rec, display=None):
-    """Runs on its own thread for the whole run: newest frame -> detect -> controller -> wheels.
-    Re-sends the last command at least every DRIVE_KEEPALIVE_S (the bridge goes listen-only
-    after 500ms of silence) and ends the moment the controller says so, the operator calls
-    stop(), or encoder telemetry dies. Always finishes with a stop."""
-    import csv
-    import cv2
-    log = open(rec_dir / "follow_log.csv", "w", newline="")
-    lw = csv.writer(log)
-    lw.writerow(["time_s", "frame", "found", "n_bands", "e_near_in", "phi_deg", "spin", "f", "t",
-                 "left_raw", "right_raw", "status"])
-    times = open(rec_dir / "video_times.csv", "w", newline="")
-    tw = csv.writer(times)
-    tw.writerow(["frame", "time_s"])
-    writer = None
-    prev_x, last_seq, last_send = None, -1, 0.0
-    cmd = line_follow.Command()
-    send_now = False
-    reason = None
-    shown = None
-    lnk.motion.encoders_required = False  # camera-only: a dead encoder is logged, not a stop
-    try:
-        ctl.start(time.monotonic())
-        while True:
-            now = time.monotonic()
-            if _follow["abort"].is_set():
-                ctl.stop()
-                reason = "stopped"
-                break
-            # Heartbeat is the IMU stream, not the encoders: the follower is camera-only, so a
-            # dead encoder must not stop a run (the board link going quiet still does).
-            snap_age = lnk.telemetry_snapshot()["imu_age_s"]
-            if snap_age is None or snap_age > TELEMETRY_STALE_S:
-                ctl.status = "telemetry_stale"
-                reason = "telemetry_stale"
-                break
-            fr = src.latest()
-            if fr is not None and fr.seq != last_seq:
-                last_seq = fr.seq
-                res, ann = line_vision.analyze(fr.img, prev_x_frac=prev_x)
-                prev_x = res.get("x_frac") if res["found"] else None
-                cmd = ctl.update(res, fr.t)
-                if display is not None:
-                    shown = (ann, _follow_hud(cmd, src, t_rec()))
-                    display.push(*shown)
-                t = t_rec()
-                if writer is None:
-                    h, w = fr.img.shape[:2]
-                    writer = cv2.VideoWriter(str(rec_dir / "video.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 15, (w, h))
-                writer.write(fr.img)
-                tw.writerow([fr.seq, f"{t:.3f}"])
-                i = cmd.info
-                lw.writerow([f"{t:.3f}", fr.seq, int(res["found"]), res["n_bands"], i.get("e_in", ""),
-                             i.get("phi_deg", ""), int(bool(i.get("spin", False))), i.get("f", ""),
-                             i.get("t", ""), cmd.left_raw, cmd.right_raw, cmd.status])
-                _follow["info"] = dict(i, status=cmd.status, fps=round(src.fps(), 1))
-                log.flush()
-                times.flush()   # a crash mid-run must not lose the data that explains it
-                send_now = True
-            else:
-                cmd = ctl.check(now)
-            if cmd.status != "running":
-                reason = cmd.status
-                break
-            if send_now or now - last_send >= DRIVE_KEEPALIVE_S:
-                if _follow["abort"].is_set():   # stop() may have landed since the check above
-                    continue
-                lnk.send_drive(cmd.left_raw, cmd.right_raw)
-                last_send, send_now = now, False
-            time.sleep(0.01)
-    except Exception as e:
-        reason = f"error: {e}"
-    finally:
-        lnk.motion.encoders_required = True
-        try:
-            lnk.send_stop()
-        except Exception:
-            pass
-        if writer is not None:
-            writer.release()
-        log.close()
-        times.close()
-        summary = lnk.recorder.stop()
-        if display is not None:
-            try:
-                display.close(None if shown is None else (shown[0], dict(shown[1], status=reason or "ended", spin=False)))
-            except Exception:
-                pass
-        _follow["status"] = reason or "ended"
-        _follow["result"] = dict(status=_follow["status"], frames=ctl.frames, dir=str(rec_dir),
-                                 duration_s=None if summary is None else summary["duration_s"],
-                                 last=_follow["info"])
-        _follow["running"] = False
-        _follow["ended"].set()
-
-
-@mcp.tool()
-def start_line_follow(confirmed_safe: bool, speed_pwm: int = 58, max_seconds: float = 90.0,
-                      name: Optional[str] = None, show_on_phone: bool = False,
-                      ignore_finish_s: float = 0.0) -> dict:
-    """Start following the tape line with the phone camera, on its own thread, and return at
-    once; poll line_follow_status(wait_s=...) for the end. ONE confirmed_safe covers the whole
-    run: set it only after telling the operator the exact run (speed_pwm, max_seconds, that it
-    stops if the line is lost / the finish strip is seen / camera or telemetry go stale) and
-    getting a go-ahead. The line must already be in view (>=3 bands) and the finish strip not.
-
-    It stops by itself and reports why: finish_candidate (something like the end strip is
-    reached -- may be paint or glare), end_of_tape (the line vanished right after a cross strip
-    was seen), lost (no line for 0.5s), stale (no camera frame for 0.5s), telemetry_stale,
-    timeout, stopped (stop() or listen() was called -- call stop() at any time to abort).
-    The reason is a CLAIM, not a verdict: call line_follow_report and look at the images before
-    deciding what it was. No searching for a lost line.
-    Records telemetry, video, and a per-frame follow_log.csv to recordings/<name>/.
-    speed_pwm is the cruise forward effort, 50-64 (default 58; forward effort is touchy, so
-    it is capped low); turns may go up to 100 on the outer wheel, and a spin that is not
-    getting anywhere is boosted up to 85.
-
-    show_on_phone (default False): also show the line-detection overlay with a motor-command
-    panel (wheel bars, aim angle, status) live on the phone's screen. Needs
-    phone/display_server.py running in Termux and show.html open in the phone's browser (see
-    phone/README.md); if the phone can't be reached the run still starts and the result says
-    so. Purely cosmetic: it can't affect the run.
-
-    ignore_finish_s (default 0, max 30): for resuming mid-course after you've judged a stop
-    was a FALSE finish (chipped paint, glare mistaken for the finish strip). For this many
-    seconds after the start, a finish strip in view doesn't block the start and doesn't end
-    the run. Lost-line, stale and timeout stops still apply. Leave at 0 for a normal start."""
-    if link is None:
-        return _not_connected()
-    if not (0 <= ignore_finish_s <= 30):
-        return {"ok": False, "error": "ignore_finish_s must be 0-30"}
-    gate = _confirm_gate(confirmed_safe)
-    if gate:
-        return gate
-    if link.recorder.active:
-        return {"ok": False, "error": "a recording is already active; stop_recording() first"}
-    if not (line_follow.F_MOVE_MIN <= speed_pwm <= FOLLOW_MAX_CRUISE_PWM):
-        return {"ok": False, "error": f"speed_pwm must be {line_follow.F_MOVE_MIN}-{FOLLOW_MAX_CRUISE_PWM}"}
-    if not (0 < max_seconds <= 300):
-        return {"ok": False, "error": "max_seconds must be in (0, 300]"}
-    snap = link.telemetry_snapshot()
-    if not snap["imu_live"]:   # camera-only follower: encoders not required
-        return {"ok": False, "error": "no live IMU telemetry (board link down?)", "telemetry": snap}
-    src = _frame_source()
-    t0 = time.monotonic()
-    while src.latest() is None and time.monotonic() - t0 < 10:
-        time.sleep(0.05)
-    fr = src.latest()
-    if fr is None or src.age_s() > 1.0:
-        return {"ok": False, "error": "no live camera frames", "camera": src.status()}
-    # A stream that just (re)opened delivers its first frames late and uneven, which trips
-    # the follower's stale-frame stop within half a second. Let it settle first.
-    while not src.is_warm() and time.monotonic() - t0 < 12:
-        time.sleep(0.1)
-    if not src.is_warm():
-        return {"ok": False, "error": "camera stream not steady yet (needs ~20 frames at >=10 fps "
-                "with no gaps over 0.3s); try again in a few seconds", "camera": src.status()}
-    fr = src.latest()
-    res, _ = line_vision.analyze(fr.img)
-    ctl = line_follow.LineFollower(max_run_s=max_seconds, forward_pwm_sign=FORWARD_PWM_SIGN,
-                                   f_cruise=speed_pwm, ignore_finish_s=ignore_finish_s)
-    ok, why = ctl.can_start(res)
-    if not ok:
-        return {"ok": False, "error": why}
-    try:
-        path = link.recorder.start(name or time.strftime("follow_%Y%m%d_%H%M%S"))
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    display, display_info = None, None
-    if show_on_phone:
-        try:
-            display = phone_display.PhoneDisplay(_phone_display_url())
-            ok, err = display.check()
-            display_info = {"ok": ok, "url": display.url, **({"error": err} if err else {})}
-            if ok:
-                display.start()
-            else:
-                display = None
-        except Exception as e:
-            display, display_info = None, {"ok": False, "error": str(e)}
-    _follow["abort"].clear()
-    _follow["ended"].clear()
-    _follow.update(running=True, status="running", info={}, result=None)
-    threading.Thread(target=_follow_loop, daemon=True,
-                     args=(link, src, ctl, link.recorder.dir, link.recorder.now, display)).start()
-    out = {"ok": True, "started": True, "dir": str(link.recorder.dir), "speed_pwm": speed_pwm,
-           "max_seconds": max_seconds, "bands_at_start": res["n_bands"], "camera": src.status()}
-    if display_info is not None:
-        out["phone_display"] = display_info
-    return out
-
-
-@mcp.tool()
-def line_follow_status(wait_s: float = 0.0) -> dict:
-    """Read-only. State of the line-follow run: running / the reason it ended (finish_candidate,
-    end_of_tape, lost, stale, telemetry_stale, timeout, stopped, error: ...; these are claims --
-    verify with line_follow_report), the latest offsets and wheel efforts (info.boost > 0 means
-    the stall check is adding spin effort), and the recording folder. wait_s (max 60) blocks until the run ends or that long
-    passes -- use it instead of polling in a tight loop. Never moves the robot."""
-    if _follow["running"] and wait_s > 0:
-        _follow["ended"].wait(min(wait_s, 60.0))
-    return {"ok": True, "running": _follow["running"], "status": _follow["status"],
-            "info": _follow["info"], "result": _follow["result"],
-            "camera": None if _frames is None else _frames.status()}
-
-
-@mcp.tool()
-def line_follow_report(run: Optional[str] = None, n_rows: int = 10, n_frames: int = 6,
-                       raw: bool = True):
-    """Read-only. Everything needed to judge why a line-follow run stopped, in one call:
-    the end reason, the last `n_rows` rows of the run's follow_log.csv (offset, aim angle,
-    bands, spin, wheel efforts), a contact sheet of the last `n_frames` video frames with the
-    detection drawn on (oldest at left; red = dark pixels, green dots = line), and a fresh
-    full-resolution still of what the robot sees right now with the same overlay. With
-    `raw` (default true) it also returns the same frames and the same still WITHOUT any
-    overlay, because the red tint can hide small things (a paint chip, a glare edge, a thin
-    crossbar): the images come back in the order annotated sheet, raw sheet, annotated still,
-    raw still. `run` is a recordings/ folder name (default: the latest line-follow run). Use it
-    after any stop to tell a real finish from a false one (paint, glare), and to see which side
-    the line left on. Never moves the robot, no confirmation needed; the still takes ~5-8s."""
-    import csv
-    import json
-    try:
-        import cv2
-        import numpy as np
-        rec_root = Path(__file__).resolve().parent.parent / "recordings"
-        if run:
-            d = rec_root / run
-        else:
-            logs = sorted(rec_root.glob("*/follow_log.csv"), key=lambda q: q.stat().st_mtime)
-            if not logs:
-                return {"ok": False, "error": "no line-follow runs recorded yet"}
-            d = logs[-1].parent
-        if not (d / "follow_log.csv").exists():
-            return {"ok": False, "error": f"no follow_log.csv in {d}"}
-        rows = list(csv.DictReader(open(d / "follow_log.csv")))
-        n_rows, n_frames = max(1, min(n_rows, 40)), max(1, min(n_frames, 12))
-        last_seen = next((r for r in reversed(rows) if r["found"] == "1"), None)
-        summary = {"ok": True, "dir": str(d), "running": _follow["running"],
-                   "status": _follow["status"] if _follow["running"] else (
-                       (_follow["result"] or {}).get("status") if _follow["result"] else None),
-                   "rows_total": len(rows), "last_rows": rows[-n_rows:],
-                   "last_line_seen": None if last_seen is None else dict(
-                       time_s=last_seen["time_s"], e_near_in=last_seen["e_near_in"],
-                       phi_deg=last_seen["phi_deg"],
-                       side="right" if float(last_seen["phi_deg"] or 0) > 0 else "left")}
-        out = [json.dumps(summary)]
-        cap = cv2.VideoCapture(str(d / "video.mp4"))
-        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        tiles, raw_tiles = [], []
-        for i in range(max(0, n - n_frames), n):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            ok, f = cap.read()
-            if not ok:
-                continue
-            _, ann = line_vision.analyze(f)
-            for dst, img in ((tiles, ann), (raw_tiles, f)):
-                img = cv2.resize(img, (240, round(img.shape[0] * 240 / img.shape[1])))
-                cv2.putText(img, str(i), (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                dst.append(img)
-        for sheet in ((tiles, raw_tiles) if raw else (tiles,)):
-            if sheet:
-                hmax = max(t.shape[0] for t in sheet)
-                sheet = [cv2.copyMakeBorder(t, 0, hmax - t.shape[0], 0, 0, cv2.BORDER_CONSTANT) for t in sheet]
-                ok, jpg = cv2.imencode(".jpg", np.hstack(sheet), [cv2.IMWRITE_JPEG_QUALITY, 80])
-                out.append(Image(data=jpg.tobytes(), format="jpeg"))
-        try:
-            bgr = cv2.imdecode(np.frombuffer(_fetch_snapshot(), np.uint8), cv2.IMREAD_COLOR)
-            bgr = cv2.resize(bgr, (640, round(bgr.shape[0] * 640 / bgr.shape[1])))
-            res, ann = line_vision.analyze(bgr)
-            ok, jpg = cv2.imencode(".jpg", ann, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            out[0] = json.dumps({**summary, "still_detection": res})
-            out.append(Image(data=jpg.tobytes(), format="jpeg"))
-            if raw:
-                ok, jpg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                out.append(Image(data=jpg.tobytes(), format="jpeg"))
-        except Exception as e:
-            out[0] = json.dumps({**summary, "still_error": str(e)})
-        return out
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-TURN_MAX_SECONDS = 3600.0
-TURN_SPIN_DPS_RANGE = (5.0, 60.0)
-
-
-def _check_turn_params(max_seconds, lost_timeout_s, spin_speed_dps):
-    """Error string if any turn_to_me setting is out of range (None values are skipped)."""
-    if max_seconds is not None and not (0 <= max_seconds <= TURN_MAX_SECONDS):
-        return f"max_seconds must be 0 (no limit) to {TURN_MAX_SECONDS:.0f}"
-    if lost_timeout_s is not None and not (0 <= lost_timeout_s <= 600):
-        return "lost_timeout_s must be 0 (never end when the person is gone) to 600"
-    if spin_speed_dps is not None and not (TURN_SPIN_DPS_RANGE[0] <= spin_speed_dps <= TURN_SPIN_DPS_RANGE[1]):
-        return f"spin_speed_dps must be {TURN_SPIN_DPS_RANGE[0]:.0f}-{TURN_SPIN_DPS_RANGE[1]:.0f}"
-    return None
-
-
-def _person_loop(lnk, src, trk, rec_dir, t_rec):
-    """Runs on its own thread for the whole turn-to-me run: newest frame -> person detector ->
-    tracker (sets a world-frame yaw target) and, every ~10ms tick, IMU yaw -> spin command.
-    Shares the _follow state with the line follower (one autonomous run at a time, stop() /
-    listen() abort it). Re-sends the last command at least every DRIVE_KEEPALIVE_S and always
-    finishes with a stop."""
-    import csv
-    import cv2
-    log = open(rec_dir / "turn_log.csv", "w", newline="")
-    lw = csv.writer(log)
-    lw.writerow(["time_s", "frame", "n_people", "bearing_deg", "yaw", "target_yaw", "err_deg", "spin",
-                 "t", "left_raw", "right_raw", "status"])
-    times = open(rec_dir / "video_times.csv", "w", newline="")
-    tw = csv.writer(times)
-    tw.writerow(["frame", "time_s"])
-    writer = None
-    last_seq, last_send, last_row = -1, 0.0, 0.0
-    cmd = line_follow.Command()
-    n_people, bearing, reason = 0, None, None
-    try:
-        with lnk.lock:
-            yaw = lnk.orient.yaw
-        trk.start(time.monotonic(), yaw)
-        while True:
-            now = time.monotonic()
-            if _follow["abort"].is_set():
-                trk.stop()
-                reason = "stopped"
-                break
-            snap = lnk.telemetry_snapshot()
-            if snap["telemetry_age_s"] is None or snap["telemetry_age_s"] > TELEMETRY_STALE_S:
-                reason = "telemetry_stale"
-                break
-            if not snap["imu_live"]:
-                reason = "imu_stale"
-                break
-            with lnk.lock:
-                yaw = lnk.orient.yaw
-            fr = src.latest()
-            new_frame = fr is not None and fr.seq != last_seq
-            if new_frame:
-                last_seq = fr.seq
-                res, _ = person_vision.analyze(fr.img, draw=False)
-                n_people = res["n_people"]
-                bearing = res["bearing_deg"]
-                trk.on_frame(res, fr.t)
-                if writer is None:
-                    h, w = fr.img.shape[:2]
-                    writer = cv2.VideoWriter(str(rec_dir / "video.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 15, (w, h))
-                writer.write(fr.img)
-                tw.writerow([fr.seq, f"{t_rec():.3f}"])
-                times.flush()
-            cmd = trk.step(now, yaw)
-            i = cmd.info
-            if new_frame or now - last_row >= 0.1:
-                last_row = now
-                lw.writerow([f"{t_rec():.3f}", last_seq, n_people, "" if bearing is None else bearing,
-                             f"{yaw:.2f}", i.get("target_yaw", ""), i.get("err_deg", ""),
-                             int(bool(i.get("spin", False))), i.get("t", ""), cmd.left_raw, cmd.right_raw,
-                             cmd.status])
-                log.flush()
-                _follow["info"] = dict(i, status=cmd.status, n_people=n_people, bearing_deg=bearing,
-                                       yaw=round(yaw, 1), fps=round(src.fps(), 1))
-            if cmd.status != "running":
-                reason = cmd.status
-                break
-            if now - last_send >= DRIVE_KEEPALIVE_S or (new_frame and (cmd.left_raw or cmd.right_raw)):
-                if _follow["abort"].is_set():
-                    continue
-                lnk.send_drive(cmd.left_raw, cmd.right_raw)
-                last_send = now
-            time.sleep(0.01)
-    except Exception as e:
-        reason = f"error: {e}"
-    finally:
-        try:
-            lnk.send_stop()
-        except Exception:
-            pass
-        if writer is not None:
-            writer.release()
-        log.close()
-        times.close()
-        summary = lnk.recorder.stop()
-        _follow["status"] = reason or "ended"
-        _follow["result"] = dict(status=_follow["status"], frames=trk.frames, dir=str(rec_dir),
-                                 duration_s=None if summary is None else summary["duration_s"],
-                                 last=_follow["info"])
-        _follow["running"] = False
-        _follow["ended"].set()
-
-
-@mcp.tool()
-def turn_to_me(confirmed_safe: bool, max_seconds: float = 30.0, name: Optional[str] = None,
-               spin_speed_dps: float = 18.0, lost_timeout_s: float = 1.0) -> dict:
-    """Spin in place to face the person the phone camera sees, then HOLD: keep watching and
-    spin again whenever they move (it never drives forward/back). Runs on its own thread and
-    returns at once; poll turn_to_me_status(wait_s=...). Call stop() to end it.
-
-    BEFORE calling: tell the operator the run (max_seconds, spins in place only, stops if it
-    loses the person for lost_timeout_s) and get a go-ahead; ONE confirmed_safe covers the run. If the
-    tool says several people are in view, ASK the operator who to face / to clear the frame --
-    do not guess. Needs exactly one person in view at the start (legs only is fine; check with
-    person_view() first). It does not search for a lost person.
-
-    Tunable, and changeable mid-run with turn_to_me_set(): max_seconds (default 30; 0 = no
-    time limit), lost_timeout_s (default 1.0; 0 = never end because the person is gone, it
-    just holds its last heading), spin_speed_dps (fastest spin it will ask for, 5-60, default
-    18; faster follows a walking person better but overshoots small corrections more).
-
-    Ends by itself with a reason: lost (no person for lost_timeout_s), stale (no camera frame
-    for 0.5s), telemetry_stale / imu_stale, timeout (max_seconds), stopped (stop() or
-    listen()). While running it follows the person nearest its current target if several
-    appear. Records telemetry, video and turn_log.csv to recordings/<name>/."""
-    if link is None:
-        return _not_connected()
-    gate = _confirm_gate(confirmed_safe)
-    if gate:
-        return gate
-    if link.recorder.active:
-        return {"ok": False, "error": "a recording is already active; stop_recording() first"}
-    bad = _check_turn_params(max_seconds, lost_timeout_s, spin_speed_dps)
-    if bad:
-        return {"ok": False, "error": bad}
-    snap = link.telemetry_snapshot()
-    if not snap["telemetry_live"]:
-        return {"ok": False, "error": "no live encoder telemetry", "telemetry": snap}
-    if not snap["imu_live"]:
-        return {"ok": False, "error": "no live IMU telemetry (the spin is closed on IMU yaw)",
-                "telemetry": snap}
-    src = _frame_source()
-    t0 = time.monotonic()
-    while src.latest() is None and time.monotonic() - t0 < 10:
-        time.sleep(0.05)
-    if src.latest() is None or src.age_s() > 1.0:
-        return {"ok": False, "error": "no live camera frames", "camera": src.status()}
-    # look at a few fresh frames: need exactly one person throughout, not a lucky single frame
-    counts, seen = [], -1
-    t0 = time.monotonic()
-    while len(counts) < 4 and time.monotonic() - t0 < 3:
-        fr = src.latest()
-        if fr is not None and fr.seq != seen:
-            seen = fr.seq
-            counts.append(person_vision.analyze(fr.img, draw=False)[0]["n_people"])
-        time.sleep(0.02)
-    if len(counts) < 2:
-        return {"ok": False, "error": "couldn't get fresh camera frames", "camera": src.status()}
-    if max(counts) > 1:
-        return {"ok": False, "error": "more than one person is in view -- ask the operator who to "
-                "face (or to clear the frame) before starting", "people_per_frame": counts}
-    if min(counts) == 0:
-        return {"ok": False, "error": "no person clearly in view (not seen in every frame) -- check "
-                "with person_view()", "people_per_frame": counts}
-    trk = person_track.PersonTracker(max_run_s=max_seconds, forward_pwm_sign=FORWARD_PWM_SIGN,
-                                     spin_u_max=spin_speed_dps, lost_timeout_s=lost_timeout_s)
-    try:
-        path = link.recorder.start(name or time.strftime("turn_%Y%m%d_%H%M%S"))
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    _follow["abort"].clear()
-    _follow["ended"].clear()
-    _follow.update(running=True, status="running", info={}, result=None, tracker=trk)
-    threading.Thread(target=_person_loop, daemon=True,
-                     args=(link, src, trk, link.recorder.dir, link.recorder.now)).start()
-    return {"ok": True, "started": True, "dir": str(link.recorder.dir), "max_seconds": max_seconds,
-            "lost_timeout_s": lost_timeout_s, "spin_speed_dps": spin_speed_dps,
-            "people_per_frame": counts, "camera": src.status()}
-
-
-@mcp.tool()
-def turn_to_me_set(max_seconds: Optional[float] = None, lost_timeout_s: Optional[float] = None,
-                   spin_speed_dps: Optional[float] = None) -> dict:
-    """Change a RUNNING turn_to_me on the fly (give only what you want to change; no
-    confirmation needed since the run is already approved and this only adjusts it).
-    max_seconds: total run time limit measured from the start of the run (0 = no limit).
-    lost_timeout_s: how long with nobody in view before it gives up (0 = never; it holds its
-    last heading). spin_speed_dps: fastest spin it will ask for, 5-60 (higher = follows a
-    walking person better, overshoots small corrections more). Returns the settings now in
-    effect. Fails if no turn_to_me run is in progress."""
-    trk = _follow.get("tracker")
-    if not _follow["running"] or trk is None or trk.status != "running":
-        return {"ok": False, "error": "no turn_to_me run is in progress"}
-    bad = _check_turn_params(max_seconds, lost_timeout_s, spin_speed_dps)
-    if bad:
-        return {"ok": False, "error": bad}
-    if max_seconds is not None:
-        trk.max_run_s = max_seconds
-    if lost_timeout_s is not None:
-        trk.lost_timeout_s = lost_timeout_s
-    if spin_speed_dps is not None:
-        trk.spin_u_max = spin_speed_dps
-    return {"ok": True, "max_seconds": trk.max_run_s, "lost_timeout_s": trk.lost_timeout_s,
-            "spin_speed_dps": trk.spin_u_max}
-
-
-@mcp.tool()
-def turn_to_me_status(wait_s: float = 0.0) -> dict:
-    """Read-only. State of the turn_to_me run: running / the reason it ended (lost, stale,
-    telemetry_stale, imu_stale, timeout, stopped, error: ...), the latest bearing to the
-    person, heading error in degrees (err_deg; + = needs a left turn), whether it is facing
-    them, and the recording folder. wait_s (max 60) blocks until the run ends or that long
-    passes. Never moves the robot."""
-    return line_follow_status(wait_s)
+def _run_status(wait_s: float = 0.0) -> dict:
+    """State of the current autonomous run (perform): running / the reason it ended, the latest
+    info, and the result. wait_s (max 60) blocks until the run ends or that long passes."""
+    if _run["running"] and wait_s > 0:
+        _run["ended"].wait(min(wait_s, 60.0))
+    return {"ok": True, "running": _run["running"], "status": _run["status"],
+            "info": _run["info"], "result": _run["result"]}
 
 
 WLED_HOST = os.environ.get("ELLAMA_WLED_HOST", "192.168.0.57")
@@ -2468,7 +2062,7 @@ PERFORM_BLINK_S = 1.5   # the usual pre-move warning blink, before a dancing sho
 
 def _perform_loop(show, rend, dance, brightness, lead_in_s, start_s, end_s, audio, audio_offset_s,
                   require_telemetry, tmp_wav):
-    """Runs on its own thread for the whole show (shares _follow with the other autonomous runs:
+    """Runs on its own thread for the whole show (shares _run with the other autonomous runs:
     stop() / listen() abort it, the drive tools refuse while it runs). One loop at PERFORM_FPS
     paints the light bar from the show clock and, when dancing, re-sends the current beat's
     wheel command every DRIVE_KEEPALIVE_S. Always finishes with a stop."""
@@ -2492,7 +2086,7 @@ def _perform_loop(show, rend, dance, brightness, lead_in_s, start_s, end_s, audi
         while True:
             now = time.monotonic()
             t = start_s + (now - wall0)
-            if _follow["abort"].is_set():
+            if _run["abort"].is_set():
                 reason = "stopped"
                 break
             if t >= end_s:
@@ -2535,7 +2129,7 @@ def _perform_loop(show, rend, dance, brightness, lead_in_s, start_s, end_s, audi
                             prev_cmd = (left, right)
             if now - last_info >= 1.0:
                 last_info = now
-                _follow["info"] = {"t_s": round(t, 1), "of_s": round(end_s, 1),
+                _run["info"] = {"t_s": round(t, 1), "of_s": round(end_s, 1),
                                    "beat": max(0, bisect.bisect_right(show.beats, t) - 1), "dancing": bool(dance)}
             time.sleep(max(0.0, 1.0 / PERFORM_FPS - (time.monotonic() - now)))
     except Exception as e:
@@ -2561,10 +2155,10 @@ def _perform_loop(show, rend, dance, brightness, lead_in_s, start_s, end_s, audi
                 os.unlink(tmp_wav)
             except OSError:
                 pass
-        _follow["status"] = reason
-        _follow["result"] = dict(status=reason, ended_at_s=round(t, 1))
-        _follow["running"] = False
-        _follow["ended"].set()
+        _run["status"] = reason
+        _run["result"] = dict(status=reason, ended_at_s=round(t, 1))
+        _run["running"] = False
+        _run["ended"].set()
         _speak_lock.release()
 
 
@@ -2628,7 +2222,7 @@ def perform(midi_path: Optional[str] = None, bpm: Optional[float] = None,
             return {"ok": False, "error": "no live encoder telemetry -- refusing to dance without it "
                     "(pass require_telemetry=false only for a bench run you are watching)",
                     "telemetry": snap}
-    elif _follow["running"]:
+    elif _run["running"]:
         return {"ok": False, "error": "an autonomous run / show is in progress; call stop() first"}
     try:
         show = (perform_show.Show.from_midi(str(Path(midi_path).expanduser())) if midi_path
@@ -2657,9 +2251,9 @@ def perform(midi_path: Optional[str] = None, bpm: Optional[float] = None,
         if tmp_wav:
             os.unlink(tmp_wav)
         return {"ok": False, "error": "the strip is busy (speaking or another show)"}
-    _follow["abort"].clear()
-    _follow["ended"].clear()
-    _follow.update(running=True, status="performing", info={}, result=None)
+    _run["abort"].clear()
+    _run["ended"].clear()
+    _run.update(running=True, status="performing", info={}, result=None)
     threading.Thread(target=_perform_loop, daemon=True,
                      args=(show, rend, dancer, brightness, lead_in_s, start_s, end_s,
                            audio, audio_offset_s, require_telemetry, tmp_wav)).start()
@@ -2675,7 +2269,7 @@ def perform_status(wait_s: float = 0.0) -> dict:
     """Read-only. State of the perform() show: running / the reason it ended (finished, stopped,
     telemetry_stale, error: ...), the show clock and beat while it runs. wait_s (max 60) blocks
     until it ends or that long passes. Never moves the robot."""
-    return line_follow_status(wait_s)
+    return _run_status(wait_s)
 
 
 if __name__ == "__main__":
