@@ -48,6 +48,8 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `read_telemetry()` | No | — |
 | `look(width=640)` | No | — |
 | `save_photo(name="", preview_width=0, open_in_browser=False)` | No | — (saves a full-res photo to `recordings/photos/` with a `.json` of the robot's pose; `preview_width` > 0 also returns the picture) |
+| `phone_status()` | No | — (the phone's battery percent and torch state, from the camera app's `/info.json`; `low_battery` at or below 20%) |
+| `torch(on)` | No | — (phone flashlight on/off, state read back; turn it on when the view is dark, off when idle -- it drains the phone) |
 | `zero_odometry()` | No | — |
 | `stop()` | Commands zero PWM (active braking) | No — always safe |
 | `listen()` | Stops and releases control to the stick controller | No — always safe |

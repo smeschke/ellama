@@ -854,6 +854,67 @@ def look(width: int = 640):
     return Image(data=buf.getvalue(), format="jpeg")
 
 
+PHONE_LOW_BATTERY_PCT = 20
+
+
+def _phone_get(path, timeout=6.0):
+    """Body of GET <camera base><path>. A dead cached address (new DHCP lease) is rediscovered
+    once, the same way _fetch_snapshot does."""
+    last = None
+    for attempt in (0, 1):
+        try:
+            base, _ = _camera(rediscover=attempt == 1)
+            with _cam_open(base + path, timeout) as r:
+                return r.read()
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"phone camera app did not answer {path}: {last}")
+
+
+def _phone_info():
+    info = json.loads(_phone_get("/info.json"))
+    torch = (info.get("settings") or {}).get("torch")
+    return {
+        "battery_percent": info.get("batteryPercent"),
+        "torch_on": None if torch is None else str(torch).lower() in ("on", "true", "1"),
+    }
+
+
+@mcp.tool()
+def phone_status():
+    """Read-only. The robot's phone (camera + brain): battery percent and whether the torch is
+    on, from the camera app's /info.json. Never moves the robot, no confirmation needed. Check
+    it before a long scan or before using the torch, which drains the battery quickly;
+    `low_battery` is true at or below 20%."""
+    try:
+        s = _phone_info()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    pct = s["battery_percent"]
+    return {"ok": True, **s, "low_battery": pct is not None and pct <= PHONE_LOW_BATTERY_PCT}
+
+
+@mcp.tool()
+def torch(on: bool):
+    """Turn the phone's torch (flashlight) on or off, then read the state back. Never moves the
+    robot, no confirmation needed. Use it when the camera view is dark (see save_photo's
+    `brightness`) so tags and doorways are readable, and turn it off again when idle, stalled
+    or waiting on the operator: it drains the phone, which is also the robot's camera and
+    brain. Returns the phone's battery percent too; `torch_on` is what the phone reports after
+    the change (null if the app doesn't say)."""
+    try:
+        _phone_get(f"/?torch={'on' if on else 'off'}")
+        s = _phone_info()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    pct = s["battery_percent"]
+    result = {"ok": True, **s, "low_battery": pct is not None and pct <= PHONE_LOW_BATTERY_PCT}
+    if s["torch_on"] is not None and s["torch_on"] != bool(on):
+        result["ok"] = False
+        result["error"] = f"asked for torch {'on' if on else 'off'} but the phone reports it {'on' if s['torch_on'] else 'off'}"
+    return result
+
+
 PHOTO_DIR = Path(os.environ.get("ELLAMA_PHOTO_DIR") or Path(__file__).resolve().parent.parent / "recordings" / "photos")
 PHOTO_MOVED_IN = 0.2    # wheel travel (|left|+|right|) during the fetch that counts as "moved"
 PHOTO_MOVED_DEG = 1.0   # or this much IMU yaw change
