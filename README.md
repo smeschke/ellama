@@ -1,51 +1,70 @@
 # eLlama
 
-A four-wheel-drive outdoor robot base, walking-speed, that you drive with a handheld controller and that doubles as a mount for teleoperated or autonomous compute. You bring the battery and, if you want one, the computer.
+A suitcase-sized, four-wheel-drive outdoor robot base built on the ESP32. Drive it with the handheld controller out of the box, or send it left/right speeds from any computer. You bring the battery and, if you want one, the computer.
 
-Demo video: **[youtu.be/O5k8u-hmhis](https://youtu.be/O5k8u-hmhis)**. Try the 3D drive simulator without installing anything, hosted on Hugging Face Spaces: **[huggingface.co/spaces/r5d2/ellama-simulator](https://huggingface.co/spaces/r5d2/ellama-simulator)**.
+Demo video: **[youtu.be/O5k8u-hmhis](https://youtu.be/O5k8u-hmhis)**. Try the 3D drive simulator in your browser: **[huggingface.co/spaces/r5d2/ellama-simulator](https://huggingface.co/spaces/r5d2/ellama-simulator)**.
 
-## Who it's for
+## What it is
 
-People who know they will want a capable outdoor robot in three to five years, and want something to iterate on now, before they buy the real one. Software, sensing, and autonomy ideas get tested on a robot that is cheap, repairable, and driven outdoors for real, so the ideas are proven by the time the commercial platform is worth buying.
-
-The design leans on that. eLlama supplies only the slow-moving parts (motors, gearboxes, wheels, plywood, an ESP32, and a radio protocol) and leaves the fast-moving part, the computer, camera, and model, to the owner, in a box sized to take whatever comes next. The reasoning is in [`context-pack/01-overview.md`](context-pack/01-overview.md).
+- **Four-wheel drive, suitcase size.** 17 in track, 16 in wheelbase, 10 in pneumatic wheels, about 32 lb without a battery. One person can lift it into a car.
+- **Manual or computer control, same robot.** The chassis takes two numbers, a left speed and a right speed. The stick controller sends them, or a computer does through a USB bridge. No firmware change between the two.
+- **ESP32 throughout.** Motor board, sensors, controller and bridge are all ESP32s talking ESP-NOW. Plain Arduino sketches, no libraries beyond `esp_now.h`.
+- **Wheel encoders and an IMU.** AS5600 magnetic encoders on two wheels and an MPU-6050 or ICM-20948 IMU, streamed back to the computer.
+- **Bring your own battery.** 12 V SLA, 12 V LiFePO4 or an 18/20 V cordless-tool pack.
+- **Built for outdoors.** Over 13 miles of logged outdoor field runs, failures included, in [`context-pack/Testing.csv`](context-pack/Testing.csv).
+- **Made from parts you can replace.** Ride-on-toy gearmotors, hand-truck wheels, plywood and hardware-store fasteners.
 
 ## Specs
 
 | | |
 | --- | --- |
 | Drive | 4 x RS550 brushed motors, 100:1 gearboxes, 10 in pneumatic wheels |
-| Power | Bring your own battery: 12 V 7 Ah SLA, 18 V cordless-tool pack, or 12 V LiFePO4 (see [`context-pack/05-battery-options.md`](context-pack/05-battery-options.md); LiFePO4 not yet tested) |
+| Speed | About 1 m/s on 12 V SLA (1.72 mph average over 460 logged minutes) |
+| Power | 12 V SLA (tested), 18 V tool pack (tested with Milwaukee M18), 12 V LiFePO4 (not yet tested). Supported range 12 to 21 V. See [battery options](context-pack/05-battery-options.md). |
 | Motor drivers | 4 x BTS7960 |
-| Control | ESP32 (Llama Motor Board), ESP-NOW handheld controller or USB serial bridge to a computer |
-| Sensing | AS5600 wheel encoders, IMU (GY-521 / MPU-6050 / ICM-20948 sketches) |
+| Control | ESP32 on the Llama Motor Board; ESP-NOW handheld controller or USB serial bridge to a computer |
+| Sensing | 2 x AS5600 wheel encoders, IMU (GY-521 / MPU-6050 or ICM-20948) |
+| Weight | About 32 lb without a battery, 37 lb with one 12 V SLA |
 | Charging | Off the robot, with your battery's own charger |
-| Weight | About 32 lb without a battery, 37 lb with one 12 V SLA, 42 lb with two |
 
 ## How it works
 
 ![System architecture](images/system_architecture.png)
 
-Drive the robot with the stick controller or with a computer through the USB bridge, one at a time, with no firmware changes. Both send the same drive packets over ESP-NOW to the motor board. The encoder and IMU boards broadcast telemetry that the bridge relays back to the computer.
+The stick controller and the computer bridge send the same drive packet over ESP-NOW to the motor board. Only one should send at a time. The encoder and IMU boards broadcast telemetry, and the bridge relays it to the computer over USB.
+
+## Getting started
+
+1. Read the [user manual](<context-pack/eLlama User Manual.md>), especially the safety section.
+2. Wire it from the [wiring diagram](images/wiring_diagram.pdf) (tool-pack version: [`wiring_diagram_fuel20v.png`](images/wiring_diagram_fuel20v.png)).
+3. Flash the firmware: [`firmware/README.md`](firmware/README.md) says which sketch goes on which ESP32.
+4. Drive it with the stick controller. No computer needed.
+5. To drive from a computer, flash `computer_bridge` on a spare ESP32 and send `<left> <right>` lines over serial.
+6. To check the encoders and IMU, run [`calibration/live_view.py`](calibration/README.md).
 
 ## Status
 
-**Works:** manual and remote driving, encoder and IMU telemetry, encoder-closed-loop moves ("go forward 10 inches") from Python or an AI agent through the MCP server, camera and lidar streaming over the network, and the calibrated simulators. Over 13 miles of field runs are logged in [`context-pack/Testing.csv`](context-pack/Testing.csv), failures included.
+**Works:** manual driving, computer driving through the bridge, encoder and IMU telemetry, calibration tools and the calibrated simulator.
 
-**Not there yet:** obstacle sensing, and an emergency stop beyond the power switch. Until obstacle sensors exist, anything commanding the robot must follow [`DRIVING_POLICY.md`](DRIVING_POLICY.md).
+**Not there yet:** a single main board (the encoders and IMU are still separate ESP32 prototypes), 24 V support, an emergency stop beyond the power switch, obstacle sensing, and published KiCad source and printed-part files.
 
 ## Repo layout
 
 | Path | What's there |
 | --- | --- |
-| [`context-pack/`](context-pack/) | Design docs and the [user manual](<context-pack/eLlama User Manual.md>) |
-| [`firmware/`](firmware/) | ESP32 Arduino sketches (controller, motor board, bridge) |
-| [`teleop/`](teleop/) | Python client/server scripts for driving, video, and lidar over the network |
-| [`calibration/`](calibration/) | Sensor validation and calibration tools that read the computer bridge: live encoder/IMU view and calibration |
-| [`mcp_server/`](mcp_server/) | MCP server so an AI agent can drive the robot by encoder feedback ("go forward 10 inches") instead of guessing a duration |
-| [`simulation/`](simulation/) | Calibrated 2D/3D drive-command simulators and a CSV replay script |
-| [`images/`](images/) | Photos and diagrams |
+| [`context-pack/`](context-pack/) | Design docs, the [user manual](<context-pack/eLlama User Manual.md>), the [BOM](context-pack/bom.csv) and the field test log |
+| [`firmware/`](firmware/) | ESP32 Arduino sketches: controller, motor board, encoder and IMU senders, computer bridge, bench tests |
+| [`hardware/`](hardware/) | Llama Motor Board Gerber and drill files for JLCPCB |
+| [`calibration/`](calibration/) | Live encoder/IMU view, wheel and track calibration, and measured characterization data |
+| [`simulation/`](simulation/) | Calibrated 2D/3D drive simulators and a CSV replay script |
+| [`images/`](images/) | Photos, dimensions and wiring diagrams |
+| [`ROBOT_CHARACTERIZATION.md`](ROBOT_CHARACTERIZATION.md) | Measured speed, turning, stopping and drift |
 
+## Built on eLlama
+
+- [**droid**](https://github.com/smeschke/droid): my personal robot, an eLlama driven by an AI agent through an MCP server. It uses the platform the same way any owner would, through the computer bridge and telemetry.
+
+Built something on eLlama? Open an issue or a pull request to add it here.
 
 ## License
 

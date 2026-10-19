@@ -1,8 +1,5 @@
 video_evidence/
 __pycache__/
 build/
-mcp_server/.venv/
 *.mp4
 *~
-mcp_server/models/
-phone/models/
