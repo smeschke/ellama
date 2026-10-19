@@ -1,5 +1,7 @@
 # Robot characterization checklist
 
+> The sweep scripts this file mentions (`characterize_speed.py`, `characterize_turns.py`) and the MCP server they drove moved to [droid](https://github.com/smeschke/droid). The measured results (`calibration/*_characterization_*.csv`) stay here.
+
 Goal: give Claude the mechanical numbers it can't measure on its own, so it can
 drive the robot safely and build a path follower. Most data comes from the
 encoders and IMU (recorded with `calibration/live_view.py --csv`); the tape
