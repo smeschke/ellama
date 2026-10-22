@@ -6,10 +6,21 @@ computer_bridge.ino is listen-only until it is sent a drive line, and the
 scripts here never send one, so they can run while you drive with the stick.
 
 Serial lines this understands:
-  ENC <left> <right> <ms>                  cumulative AS5600 counts per wheel
+  ENC <left> <right> <ms>                  cumulative AS5600 counts per wheel (legacy packet)
   IMU <ax> <ay> <az> <gx> <gy> <gz> <ms>   raw accel LSB (+-2g), bias-corrected gyro LSB (+-250 dps)
-  CMD <left> <right>                       a drive command the bridge overheard (e.g. from the stick);
-                                           needs a computer_bridge.ino new enough to relay them
+                                           (legacy packet)
+  CMD <left> <right>                       a drive command the bridge overheard (e.g. from the stick)
+  <NAME> <value>... <ms>                   any SensorPacket sender, e.g. "TOF_FRONT 812 -1 48213"
+
+The last form is the current scheme (firmware/libraries/LlamaSensors/LlamaSensors.h): the
+packet carries its own name, so adding a sensor needs no table here and no change to the
+bridge firmware. Such a line parses generically into ("SENSOR", (name, values, ms)) and
+callers switch on the name -- there is deliberately no registry of known sensors to keep
+in step with the firmware.
+
+Values stay raw ints, because what counts as an invalid reading is sensor-specific: -1
+means "could not measure" for a ToF range sensor, but is a perfectly good gyro LSB. Use
+TofState for the range sensors, which applies that interpretation.
 
 Measured constants (wheel size, gear ratio, track width) live in config.json
 next to this file, so live_view.py can write calibration results there instead
@@ -29,6 +40,26 @@ import serial.tools.list_ports as list_ports
 
 BAUD_RATE = 115200
 RESET_SETTLE_S = 2.0  # opening the port resets the ESP32; wait for boot + ESP-NOW join
+
+# Mirrors SENSOR_VALUE_INVALID in LlamaSensors.h: a sensor that reported but could not
+# measure. Only meaningful for sensors whose values are physical magnitudes, like ranges.
+SENSOR_VALUE_INVALID = -1
+
+# Mirrors SENSOR_VALUE_UNAVAILABLE in LlamaSensors.h: used where -1 is a physically
+# possible reading, as an encoder's cumulative count is. The encoders sit by the wheels
+# and get damaged, so a packet with one channel unavailable is routine -- it must never be
+# mistaken for a count, and -1 * encoder_sign would not even round-trip to itself.
+SENSOR_VALUE_UNAVAILABLE = -2147483648
+
+# ToF range sensors send millimetres, one value per channel in the sending sketch's
+# sensors[] order. These labels are display only -- the firmware knows nothing about
+# them, and an unlisted sensor just falls back to "<name>[<index>]".
+TOF_CHANNEL_LABELS = {
+    "TOF_FRONT": ("front_left", "front_right"),
+    "TOF_REAR": ("rear_left", "rear_right"),
+}
+
+MM_PER_IN = 25.4
 
 # IMU scale -- must match the robot_imu_* sketch config (+-2g, +-250 dps)
 ACCEL_LSB_PER_G = 16384.0
@@ -122,19 +153,52 @@ class SerialReader:
                 self.q.put(raw)
 
 
+# A SensorPacket name as the bridge prints it: the firmware sanitises anything outside
+# [A-Za-z0-9_], and every sender here uses upper case.
+_SENSOR_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+# Words computer_bridge.ino prints that look like a sensor name but are not one.
+_BRIDGE_WORDS = frozenset({"DROPPED", "UNK"})
+
+
 def parse_line(raw):
-    """Return ("ENC", (left, right, ms)), ("IMU", (ax, ay, az, gx, gy, gz, ms)),
-    ("CMD", (left, right)), or (None, decoded_text) for anything else (bridge chatter, garbage)."""
+    """Classify one line of computer_bridge.ino output.
+
+    Returns one of:
+      ("ENC", (left, right, ms))                    legacy encoder packet, signs applied
+      ("IMU", (ax, ay, az, gx, gy, gz, ms))         legacy IMU packet
+      ("CMD", (left, right))                        an overheard drive command
+      ("SENSOR", (name, values, ms))                any SensorPacket sender; values is a
+                                                    tuple of raw ints, uninterpreted
+      (None, decoded_text)                          bridge chatter or garbage
+
+    The SENSOR branch is generic on purpose: a new sender needs no change here, which is
+    the point of the name travelling inside the packet.
+    """
     text = raw.decode("ascii", errors="ignore").strip()
     parts = text.split()
+    if not parts:
+        return None, text
     try:
-        if parts and parts[0] == "ENC" and len(parts) == 4:
+        if parts[0] == "ENC" and len(parts) == 4:
             left, right, ms = (int(x) for x in parts[1:4])
-            return "ENC", (left * ENC_SIGN[0], right * ENC_SIGN[1], ms)
-        if parts and parts[0] == "CMD" and len(parts) == 3:
+            # Check for the sentinel BEFORE applying the sign: negating it would turn it
+            # into an ordinary-looking large count. An unavailable wheel becomes None.
+            left = None if left == SENSOR_VALUE_UNAVAILABLE else left * ENC_SIGN[0]
+            right = None if right == SENSOR_VALUE_UNAVAILABLE else right * ENC_SIGN[1]
+            return "ENC", (left, right, ms)
+        if parts[0] == "CMD" and len(parts) == 3:
             return "CMD", tuple(int(x) for x in parts[1:3])
-        if parts and parts[0] == "IMU" and len(parts) == 8:
+        if parts[0] == "IMU" and len(parts) == 8:
             return "IMU", tuple(int(x) for x in parts[1:8])
+
+        # Generic SensorPacket line: a name, at least one value, then the sender's ms.
+        # Requiring every remaining field to be an integer is what keeps bridge chatter
+        # out -- "UNK len=5" fails on "len=5", and "DROPPED 3" has too few fields to be
+        # a reading, so neither needs special-casing beyond the name check.
+        if len(parts) >= 3 and parts[0] not in _BRIDGE_WORDS and _SENSOR_NAME_RE.match(parts[0]):
+            nums = tuple(int(x) for x in parts[1:])
+            return "SENSOR", (parts[0], nums[:-1], nums[-1])
     except ValueError:
         pass
     return None, text
@@ -144,14 +208,23 @@ def parse_line(raw):
 
 class EncoderState:
     """Per-wheel distance/speed since the last zero(), plus a differential-drive
-    heading estimate from the wheel difference."""
+    heading estimate from the wheel difference.
+
+    Either wheel's count may arrive as None, meaning that encoder is not responding --
+    a routine state, since the encoders sit by the wheels and get damaged. That wheel's
+    distance and speed then hold their last known values and `available` reports which
+    side is live; the other wheel keeps updating normally. heading_deg needs both wheels,
+    so it returns None while either is missing rather than silently drifting off a
+    frozen value.
+    """
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self.first = None      # (left, right) counts at the zero point
-        self.last = None       # (left, right) counts at the previous sample
+        self.first = [None, None]   # per-wheel counts at the zero point
+        self.last = [None, None]    # per-wheel counts at the previous sample
         self.last_ms = None
         self.dist_l = self.dist_r = 0.0
+        self.available = [False, False]   # [left, right] reporting as of the last packet
 
     @property
     def dist_avg(self):
@@ -159,27 +232,50 @@ class EncoderState:
 
     @property
     def heading_deg(self):
+        """Heading from the wheel difference, or None if either encoder is missing.
+
+        Returning None rather than a number computed from one live wheel and one frozen
+        one is deliberate: that figure looks plausible and drifts without bound.
+        """
+        if not all(self.available):
+            return None
         # Positive when the right wheel has travelled farther (turning left/CCW).
         return math.degrees((self.dist_r - self.dist_l) / self.cfg["track_width_in"])
 
     def zero(self):
         """Make the current position the origin for distance and heading."""
-        self.first = self.last
+        self.first = list(self.last)
         self.dist_l = self.dist_r = 0.0
 
     def update(self, left, right, ms):
+        """Fold in one ENC packet. Either count may be None (encoder not responding)."""
         k = in_per_tick(self.cfg)
-        if self.first is None:
-            self.first = (left, right)
-        self.dist_l = (left - self.first[0]) * k
-        self.dist_r = (right - self.first[1]) * k
-        speed_l = speed_r = None
+        counts = (left, right)
+        self.available = [c is not None for c in counts]
+        dists = [self.dist_l, self.dist_r]
+        speeds = [None, None]
+
+        dt = None
         if self.last_ms is not None and ms > self.last_ms:
             dt = (ms - self.last_ms) / 1000.0
-            speed_l = (left - self.last[0]) * k / dt
-            speed_r = (right - self.last[1]) * k / dt
-        self.last, self.last_ms = (left, right), ms
-        return speed_l, speed_r
+
+        for i, c in enumerate(counts):
+            if c is None:
+                # Hold the last distance; a missing encoder is not a wheel at zero. Clear
+                # `last` so the next real reading is not differenced against a stale one
+                # across the gap, which would show up as a single huge speed spike.
+                self.last[i] = None
+                continue
+            if self.first[i] is None:
+                self.first[i] = c
+            dists[i] = (c - self.first[i]) * k
+            if dt is not None and self.last[i] is not None:
+                speeds[i] = (c - self.last[i]) * k / dt
+            self.last[i] = c
+
+        self.dist_l, self.dist_r = dists
+        self.last_ms = ms
+        return tuple(speeds)
 
 
 class OrientationState:
@@ -204,3 +300,82 @@ class OrientationState:
             self.yaw += dz * dt
         self.last_ms = ms
         return agx, agy, agz, dx, dy, dz
+
+
+
+class TofState:
+    """Latest reading per ToF channel, keyed by (sensor name, channel index).
+
+    A range sensor sends SENSOR_VALUE_INVALID when it could not measure -- it is
+    reporting, just with nothing in range. That is different from a sensor that has gone
+    silent, so an invalid reading is stored as None and still refreshes the timestamp;
+    callers distinguish "nothing in range" from "board is dead" by the age of the entry.
+    """
+
+    #: samples kept per channel for median_mm(); small, since this runs per packet
+    HISTORY = 5
+
+    def __init__(self):
+        self.channels = {}   # (name, index) -> dict(mm, inches, ms, invalid)
+        self.recent = {}     # (name, index) -> list of recent valid mm, newest last
+
+    def update(self, name, values, ms):
+        """Store one sensor's packet. Returns the list of keys it touched."""
+        keys = []
+        for i, raw in enumerate(values):
+            invalid = raw == SENSOR_VALUE_INVALID
+            key = (name, i)
+            self.channels[key] = dict(
+                mm=None if invalid else raw,
+                inches=None if invalid else raw / MM_PER_IN,
+                ms=ms,
+                invalid=invalid,
+            )
+            if not invalid:
+                hist = self.recent.setdefault(key, [])
+                hist.append(raw)
+                if len(hist) > self.HISTORY:
+                    del hist[0]
+            keys.append(key)
+        return keys
+
+    @staticmethod
+    def label(name, index):
+        """Human-readable channel name for display, e.g. "front_left"."""
+        labels = TOF_CHANNEL_LABELS.get(name)
+        if labels and index < len(labels):
+            return labels[index]
+        return f"{name.lower()}[{index}]"
+
+    def mm(self, name, index):
+        """Distance in mm, or None if the sensor could not measure (or never reported)."""
+        entry = self.channels.get((name, index))
+        return entry["mm"] if entry else None
+
+    def median_mm(self, name, index):
+        """Median of the recent valid readings for one channel, or None if there are none.
+
+        The firmware deliberately sends any distance inside the sensor's physical range
+        without consulting ST's RangeStatus, because that status rejects plenty of good
+        measurements and a signal-rate threshold would only be calibrated to whatever room
+        it was measured in. The cost is that occasional noisy or short samples arrive, and
+        a median over a few samples is what removes them -- here, where it can be changed
+        without reflashing a board bolted to the robot.
+
+        Use this rather than mm() for anything that steers; use mm() when you want the
+        latest raw sample, such as a live plot.
+        """
+        hist = self.recent.get((name, index))
+        if not hist:
+            return None
+        return sorted(hist)[len(hist) // 2]
+
+    def closest_mm(self):
+        """Smallest valid distance across every channel, or None if nothing is in range.
+
+        This is the figure obstacle avoidance actually wants, and keeping it here means
+        callers never have to remember to filter the invalid readings out first.
+        """
+        medians = [self.median_mm(*key) for key in self.channels]
+        valid = [m for m in medians if m is not None]
+        return min(valid) if valid else None

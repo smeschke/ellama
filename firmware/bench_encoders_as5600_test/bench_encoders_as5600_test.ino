@@ -19,10 +19,10 @@
 #include <Wire.h>
 
 // ================= I2C pins =================
-#define SDA_L 21
-#define SCL_L 22
-#define SDA_R 18
-#define SCL_R 19
+#define SDA_L 18
+#define SCL_L 19
+#define SDA_R 33
+#define SCL_R 32
 
 // ================= AS5600 registers =================
 const uint8_t AS5600_ADDR   = 0x36;
@@ -47,11 +47,24 @@ const float GEAR_RATIO = 6.33f;
 struct Encoder {
   const char *name;
   TwoWire *bus;
+  int sda, scl;
   int32_t counts;      // cumulative 12-bit counts, no wraparound
   int32_t lastPrintCounts;
   int lastRaw;
+  bool present;        // false = nothing answering on this bus
 };
-Encoder enc[2] = { {"left", &Wire, 0, 0, -1}, {"right", &Wire1, 0, 0, -1} };
+Encoder enc[2] = {
+  {"left",  &Wire,  SDA_L, SCL_L, 0, 0, -1, false},
+  {"right", &Wire1, SDA_R, SCL_R, 0, 0, -1, false},
+};
+
+// The encoders sit next to the wheels and get damaged, so one of them being gone is a
+// normal state, not an error. Everything below carries on with whatever is still there:
+// a missing encoder is re-probed periodically (so it reappears on its own if reconnected
+// or replaced) and reported as absent rather than reading as a stationary wheel, which is
+// what a fabricated 0 would look like.
+const uint32_t RECHECK_DT_MS = 2000;
+uint32_t lastRecheckMs = 0;
 
 uint32_t lastPrintMs = 0;
 
@@ -73,36 +86,76 @@ uint16_t readReg16(TwoWire &w, uint8_t reg) {
   return ((hi << 8) | lo) & 0x0FFF;
 }
 
+// The AS5600's address is fixed at 0x36, so an address ping says whether anything is on
+// this bus at all -- which separates a dead/unplugged encoder from a live one whose
+// magnet is missing or misaligned (the latter answers, but reads AGC/magnitude 0).
+bool busHasEncoder(TwoWire &w, int sda, int scl) {
+  w.end();
+  w.begin(sda, scl);
+  w.setClock(400000);
+  w.beginTransmission(AS5600_ADDR);
+  return w.endTransmission() == 0;
+}
+
+// Try the configured pin order, then the swapped order. SDA/SCL transposed against a
+// sketch's own wiring comment has caused more than one "the sensor is dead" hunt in this
+// firmware, so check rather than trust the #defines.
+bool probeEncoder(Encoder &e) {
+  if (busHasEncoder(*e.bus, e.sda, e.scl)) return true;
+  if (busHasEncoder(*e.bus, e.scl, e.sda)) {
+    Serial.printf("[%s] found with SDA/SCL SWAPPED (SDA=%d SCL=%d) -- fix the #defines\n",
+                  e.name, e.scl, e.sda);
+    return true;
+  }
+  busHasEncoder(*e.bus, e.sda, e.scl);   // leave the bus on the configured order
+  return false;
+}
+
+// Read the magnet status and seed the counter. Only called for an encoder that answered.
+void reportMagnet(Encoder &e) {
+  uint8_t status = readReg8(*e.bus, REG_STATUS);
+  Serial.printf("[%s] ", e.name);
+  if (!(status & STATUS_MD)) {
+    Serial.println("responding, but NO MAGNET detected -- check alignment.");
+  } else {
+    Serial.print("Magnet detected.");
+    if (status & STATUS_ML) Serial.print(" Too weak, move magnet closer.");
+    if (status & STATUS_MH) Serial.print(" Too strong, move magnet farther.");
+    Serial.println();
+  }
+  Serial.printf("[%s] AGC: %u  Magnitude: %u\n", e.name,
+                readReg8(*e.bus, REG_AGC), readReg16(*e.bus, REG_MAGNITUDE));
+  e.lastRaw = readReg16(*e.bus, REG_RAW_ANGLE);
+  e.counts = e.lastRaw;
+  e.lastPrintCounts = e.counts;
+}
+
 // ================= Setup =================
 void setup() {
   Serial.begin(115200);
   delay(200);
 
-  Wire.begin(SDA_L, SCL_L, 400000);
-  Wire1.begin(SDA_R, SCL_R, 400000);
-
   Serial.println("===== Dual AS5600 Encoder Test =====");
 
+  uint8_t found = 0;
   for (int i = 0; i < 2; i++) {
     Encoder &e = enc[i];
-    uint8_t status = readReg8(*e.bus, REG_STATUS);
-    Serial.printf("[%s] ", e.name);
-    if (!(status & STATUS_MD)) {
-      Serial.println("WARNING: magnet not detected -- check wiring/alignment.");
+    e.present = probeEncoder(e);
+    if (e.present) {
+      Serial.printf("[%s] AS5600 at 0x%02X on SDA=%d SCL=%d\n",
+                    e.name, AS5600_ADDR, e.sda, e.scl);
+      reportMagnet(e);
+      found++;
     } else {
-      Serial.print("Magnet detected.");
-      if (status & STATUS_ML) Serial.print(" Too weak, move magnet closer.");
-      if (status & STATUS_MH) Serial.print(" Too strong, move magnet farther.");
-      Serial.println();
+      Serial.printf("[%s] NOT RESPONDING on SDA=%d SCL=%d (either order) -- "
+                    "check VCC/GND/wiring\n", e.name, e.sda, e.scl);
     }
-    Serial.printf("[%s] AGC: %u  Magnitude: %u\n", e.name,
-                  readReg8(*e.bus, REG_AGC), readReg16(*e.bus, REG_MAGNITUDE));
-
-    e.lastRaw = readReg16(*e.bus, REG_RAW_ANGLE);
-    e.counts = e.lastRaw;
-    e.lastPrintCounts = e.counts;
   }
+  Serial.printf("%u of 2 encoders responding; re-probing missing ones every %lu ms.\n",
+                found, (unsigned long)RECHECK_DT_MS);
+
   lastPrintMs = millis();
+  lastRecheckMs = millis();
 }
 
 // ================= Loop =================
@@ -112,6 +165,10 @@ void loop() {
   int raws[2];
   for (int i = 0; i < 2; i++) {
     Encoder &e = enc[i];
+    if (!e.present) {
+      raws[i] = -1;
+      continue;       // nothing to read; do not invent a count
+    }
     int raw = readReg16(*e.bus, REG_RAW_ANGLE);
     int delta = raw - e.lastRaw;
     if (delta > 2048) delta -= 4096;
@@ -121,11 +178,32 @@ void loop() {
     raws[i] = raw;
   }
 
+  // Re-probe anything missing, so a reconnected or replaced encoder comes back without
+  // a reboot. Costs one address ping per bus every RECHECK_DT_MS.
+  if (millis() - lastRecheckMs >= RECHECK_DT_MS) {
+    lastRecheckMs = millis();
+    for (int i = 0; i < 2; i++) {
+      Encoder &e = enc[i];
+      if (e.present) continue;
+      if (probeEncoder(e)) {
+        e.present = true;
+        Serial.printf("[%s] came back on SDA=%d SCL=%d\n", e.name, e.sda, e.scl);
+        reportMagnet(e);
+      }
+    }
+  }
+
   uint32_t now = millis();
   if (now - lastPrintMs >= PRINT_DT_MS) {
     float dt_s = (now - lastPrintMs) / 1000.0f;
     for (int i = 0; i < 2; i++) {
       Encoder &e = enc[i];
+      if (!e.present) {
+        // A distinct line, not a row of zeros: zeros are indistinguishable from a wheel
+        // that simply is not turning, which is the one reading that must never be faked.
+        Serial.printf("%-5s NOT_RESPONDING\n", e.name);
+        continue;
+      }
       float angleDeg = raws[i] * 360.0f / 4096.0f;
       float revs = e.counts / 4096.0f;
       float rpm = ((e.counts - e.lastPrintCounts) / 4096.0f) / dt_s * 60.0f;

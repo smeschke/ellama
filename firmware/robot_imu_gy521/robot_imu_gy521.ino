@@ -1,7 +1,7 @@
 // ===== Llama Robot: GY-521 IMU Sender (ESP-NOW) =====
 //
 // Runs on the IMU ESP32. Dedicated GY-521 breakout sender -- a hardened
-// rewrite of robot_imu_mpu6050.ino. Same 16-byte ImuPacket, same ESP-NOW
+// rewrite of robot_imu_mpu6050.ino. Now sends a SensorPacket, same ESP-NOW
 // broadcast, same scale factors, so computer_bridge.ino and the PC side need
 // no changes. What's different from robot_imu_mpu6050.ino:
 //   - auto-detects the I2C address (0x68 with AD0->GND, 0x69 with AD0->3.3V)
@@ -18,7 +18,8 @@
 //     moved during it
 //
 // Wiring: GY-521 VCC->3.3V (the board's onboard regulator also accepts 5V),
-// GND->GND, SDA->GPIO21, SCL->GPIO22, AD0->GND (address 0x68). XDA, XCL and
+// GND->GND, SDA->GPIO21, SCL->GPIO22, AD0 either way (0x68 low / 0x69 high, both
+// auto-detected; the board on this robot is 0x69). XDA, XCL and
 // INT unconnected.
 //
 // Keep the robot still for ~1s after boot -- that's the gyro bias
@@ -31,10 +32,14 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <LlamaSensors.h>
 
 // ================= I2C pins =================
-#define SDA_PIN 22
-#define SCL_PIN 21
+// NOTE: these were transposed (SDA 22 / SCL 21) until 2025-10-21, contradicting the
+// wiring comment above and bench_imu_mpu6050_test.ino, so this sketch could never find
+// the chip -- it reported "no GY-521 at 0x68 or 0x69" on perfectly good wiring.
+#define SDA_PIN 21
+#define SCL_PIN 22
 
 // ================= MPU6050 registers =================
 const uint8_t ADDR_AD0_LOW  = 0x68;
@@ -60,12 +65,22 @@ uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 // NOTE: this struct's layout and size must match the copy in
 // computer_bridge.ino exactly -- packet type is told apart purely by length
-// (4 = DrivePacket, 12 = EncoderPacket, 16 = ImuPacket).
-typedef struct __attribute__((packed)) {
-  int16_t ax, ay, az; // raw accel LSB, +-2g full scale, gravity included (not bias-calibrated)
-  int16_t gx, gy, gz; // raw gyro LSB, +-250 deg/s full scale, bias-corrected at boot
-  uint32_t ms;         // this ESP32's millis() at send time
-} ImuPacket;
+// (4 = DrivePacket, 41 = SensorPacket; the old 16-byte ImuPacket is retired).
+// Broadcast as a SensorPacket (LlamaSensors.h) rather than the old fixed-length
+// ImuPacket. The packet now carries its own name, so the bridge needs no table of
+// senders and a second IMU would be distinguishable from this one.
+//
+// values[0..5] = ax, ay, az, gx, gy, gz
+//   accel: raw LSB, +-2g full scale, gravity included (not bias-calibrated)
+//   gyro:  raw LSB, +-250 deg/s full scale, bias-corrected at boot
+// Widened from int16 to int32 by the shared packet; the values themselves are unchanged,
+// and sign-extension makes that lossless.
+//
+// The name is "IMU" deliberately: the bridge prints "<name> <values...> <ms>", so this
+// comes out as "IMU <ax> <ay> <az> <gx> <gy> <gz> <ms>" -- byte-identical to what the
+// old 16-byte ImuPacket produced. calibration/bridge.py and live_view.py therefore need
+// no change at all, and the changeover is invisible on the PC side.
+static const char SENSOR_NAME[] = "IMU";
 
 void onSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
   // no-op; add Serial.println(status) here if you need send-failure debugging
@@ -232,7 +247,8 @@ void setup() {
     peer.encrypt = false;
     memcpy(peer.peer_addr, broadcastMac, 6);
     esp_now_add_peer(&peer);
-    Serial.println("ESP-NOW broadcasting ImuPacket on channel 1.");
+    Serial.printf("ESP-NOW broadcasting SensorPacket \"%s\" (%u bytes) on channel 1.\n",
+                  SENSOR_NAME, (unsigned)sizeof(SensorPacket));
   }
 
   lastPrintMs = millis();
@@ -266,6 +282,9 @@ void loop() {
   Serial.print(gyCorr / GYRO_LSB_PER_DPS, 1); Serial.print(",");
   Serial.println(gzCorr / GYRO_LSB_PER_DPS, 1);
 
-  ImuPacket p{ ax, ay, az, gxCorr, gyCorr, gzCorr, now };
+  SensorPacket p;
+  sensorPacketInit(&p, SENSOR_NAME, 6, now);
+  p.values[0] = ax;  p.values[1] = ay;  p.values[2] = az;
+  p.values[3] = gxCorr;  p.values[4] = gyCorr;  p.values[5] = gzCorr;
   esp_now_send(broadcastMac, (uint8_t*)&p, sizeof(p));
 }

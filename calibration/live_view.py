@@ -1,317 +1,394 @@
 #!/usr/bin/env python3
+"""Live OpenCV dashboard for everything computer_bridge.ino relays.
+
+One window showing all four streams at once, so you can drive with the stick and
+watch the robot respond:
+
+  DRIVE    the left/right PWM the bridge overheard from the stick controller
+  ENCODERS per-wheel distance and speed, and the differential-drive heading
+  IMU      pitch/roll/yaw as a horizon and compass, plus the raw accel axes
+  RANGE    the VL53L0X distances, one bar per channel, by sensor name
+
+The point of the layout is liveness. Every stream has its own packet rate and
+age in the status strip, so "the sensor is dead" and "the sensor is reporting
+nothing interesting" look completely different: a silent stream goes red and
+says how long it has been quiet, while a sensor that is reporting but has
+nothing in range says so in words. Nothing on screen is ever a fabricated zero.
+
+READ-ONLY: this never writes to the serial port, so the bridge stays in
+listen-only mode and will not fight the stick controller for the motor board.
+Safe to leave running while you drive.
+
+Usage: python live_view.py [--port /dev/ttyUSB0]
+Needs: pip install pyserial opencv-python numpy
+Keys:  q/ESC quit, z zero distance and yaw, r clear the history plots.
+
+Opening the port resets the bridge ESP32, so expect a second of silence and its
+boot banner right after this script connects.
+
+The previous version of this file was a matplotlib viewer that also carried the
+wheel-diameter and track-width calibration commands (d/t keys writing to
+config.json). Those are not here -- this is a monitor, not a calibrator.
 """
-Live read-only viewer + calibrator for the two wheel encoders and the IMU.
-Never sends anything to the robot -- drive with the stick, watch the numbers,
-and use them to calibrate.
-
-Setup: computer_bridge.ino on the ESP32 plugged into this computer (it is
-listen-only until sent a drive command, which this script never does), with
-robot_encoders_as5600 and a robot_imu_* sketch running on the robot.
-
-The window shows a rolling history of per-wheel distance and speed, IMU
-pitch/roll/yaw (plus the encoder-derived heading, dashed), and accel. The big
-readout at the top is distance and heading SINCE THE LAST ZERO.
-
-Drive-a-foot workflow:
-  1. Put the robot at a mark and press  z  in the plot window (or type z in
-     this terminal). Distance and heading reset to 0.
-  2. Drive it a known distance with the stick, e.g. one foot.
-  3. Read the distance off the screen. If it's wrong, type the distance you
-     actually measured (inches) in this terminal:   d 12
-     That rescales the wheel diameter in calibration/config.json so the screen
-     matches, and applies it right away. Repeat z / drive / check until it
-     reads right.
-  4. Turn calibration: press z, spin the robot in place through a measured
-     angle (e.g. mark a 90 or 180 degree turn), then type the real angle:  t 90
-     That rescales track_width_in. Do the distance calibration first -- the
-     turn estimate depends on it.
-
-Terminal commands:  z  |  d <inches>  |  t <degrees>  |  show  |  help
-Close the window or Ctrl+C to quit. Nothing is recorded unless you pass --csv.
-
-Limits: distance calibration assumes the robot drove straight (both wheels
-scaled together); the IMU yaw shown is gyro-integrated and drifts slowly.
-
-Usage:
-    python3 calibration/live_view.py
-    python3 calibration/live_view.py --port /dev/ttyUSB0 --window 30
-    python3 calibration/live_view.py --csv run1.csv     # also save every sample
-    python3 calibration/live_view.py --csv              # auto-named live_<timestamp>.csv
-
-Requires: matplotlib
-"""
-
 import argparse
 import collections
-import csv
+import math
 import queue
-import sys
-import threading
 import time
 
+import cv2
+import numpy as np
 import serial
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 
-from bridge import (BAUD_RATE, RESET_SETTLE_S, SerialReader, EncoderState,
-                    OrientationState, load_config, save_config, parse_line, pick_port)
+from bridge import (BAUD_RATE, RESET_SETTLE_S, SENSOR_VALUE_INVALID, EncoderState,
+                    OrientationState, SerialReader, TofState, load_config, parse_line,
+                    pick_port)
 
-INK_PRIMARY = "#0b0b0b"
-GRIDLINE = "#e1e0d9"
-SURFACE = "#fcfcfb"
-CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
+W, H = 1280, 820
+HIST = 400
+RANGE_MAX_MM = 2000
+ACCEL_FULL_G = 2.0
+PWM_FULL = 255
 
-MIN_CAL_DISTANCE_IN = 2.0   # refuse to calibrate off a tiny move
-MIN_CAL_TURN_DEG = 10.0
+# A stream quiet for longer than this is treated as dead. The slowest sensor here is
+# the ToF board at ~6 Hz, so 1.5 s is several missed packets rather than one late one.
+STALE_S = 1.5
+
+# BGR, matching the per-sketch viewers in firmware/*/visualize.py so the whole project
+# reads as one set of tools.
+C_LEFT = (255, 160, 60)
+C_RIGHT = (80, 200, 255)
+C_THIRD = (120, 220, 140)
+C_FOURTH = (200, 150, 255)
+WHITE = (235, 235, 235)
+GREY = (110, 110, 110)
+DIM = (70, 70, 70)
+GREEN = (90, 220, 120)
+AMBER = (60, 190, 240)
+RED = (80, 90, 230)
+PANEL_BG = (34, 34, 34)
+TRACK = (48, 48, 48)
+
+cfg = load_config()
+enc = EncoderState(cfg)
+ori = OrientationState()
+tof = TofState()
+
+# Per-stream liveness. stamps feeds the rate figure; last_rx drives the age.
+streams = {name: dict(stamps=collections.deque(maxlen=40), last_rx=0.0, count=0)
+           for name in ("DRIVE", "ENC", "IMU", "RANGE")}
+
+cmd = dict(left=0, right=0)
+accel_g = (0.0, 0.0, 0.0)
+hist = dict(dist_l=collections.deque(maxlen=HIST), dist_r=collections.deque(maxlen=HIST),
+            yaw=collections.deque(maxlen=HIST))
+tof_hist = {}            # (name, index) -> deque of mm or None
+yaw_ref = 0.0
+boot_lines = collections.deque(maxlen=4)
+
+
+def note(stream):
+    s = streams[stream]
+    now = time.monotonic()
+    s["stamps"].append(now)
+    s["last_rx"] = now
+    s["count"] += 1
+
+
+def rate(stream):
+    st = streams[stream]["stamps"]
+    if len(st) < 2:
+        return None
+    span = st[-1] - st[0]
+    return (len(st) - 1) / span if span > 0 else None
+
+
+def age(stream):
+    last = streams[stream]["last_rx"]
+    return None if not last else time.monotonic() - last
+
+
+def is_live(stream):
+    a = age(stream)
+    return a is not None and a <= STALE_S
+
+
+# ---------------- drawing helpers ----------------
+
+def text(img, s, org, scale=0.5, color=WHITE, thick=1):
+    cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
+
+
+def panel(img, x, y, w, h, title):
+    cv2.rectangle(img, (x, y), (x + w, y + h), PANEL_BG, -1)
+    cv2.rectangle(img, (x, y), (x + w, y + h), (58, 58, 58), 1)
+    text(img, title, (x + 14, y + 26), 0.6, WHITE, 2)
+    return x + 14, y + 50
+
+
+def centred_bar(img, x, y, w, h, value, full, colour, label):
+    """Bar growing left or right from a centre line -- for signed values."""
+    cv2.rectangle(img, (x, y), (x + w, y + h), TRACK, -1)
+    mid = x + w // 2
+    cv2.line(img, (mid, y), (mid, y + h), GREY, 1)
+    frac = max(-1.0, min(1.0, value / full)) if full else 0.0
+    px = int((w // 2) * frac)
+    if px >= 0:
+        cv2.rectangle(img, (mid, y), (mid + px, y + h), colour, -1)
+    else:
+        cv2.rectangle(img, (mid + px, y), (mid, y + h), colour, -1)
+    text(img, label, (x + w + 12, y + h - 3), 0.45, GREY)
+
+
+def level_bar(img, x, y, w, h, value, full, colour):
+    """Bar growing from the left -- for unsigned values like a distance."""
+    cv2.rectangle(img, (x, y), (x + w, y + h), TRACK, -1)
+    frac = max(0.0, min(1.0, value / full)) if full else 0.0
+    cv2.rectangle(img, (x, y), (x + int(w * frac), y + h), colour, -1)
+
+
+def sparkline(img, x, y, w, h, values, colour, lo=None, hi=None):
+    """Tiny line plot. None entries break the line, so gaps stay visible as gaps."""
+    pts = [v for v in values if v is not None]
+    if len(pts) < 2:
+        return
+    lo = min(pts) if lo is None else lo
+    hi = max(pts) if hi is None else hi
+    span = max(hi - lo, 1e-6)
+    step = w / max(len(values) - 1, 1)
+    run = []
+    for i, v in enumerate(values):
+        if v is None:
+            if len(run) > 1:
+                cv2.polylines(img, [np.array(run, np.int32)], False, colour, 1, cv2.LINE_AA)
+            run = []
+            continue
+        run.append((int(x + i * step), int(y + h - h * (v - lo) / span)))
+    if len(run) > 1:
+        cv2.polylines(img, [np.array(run, np.int32)], False, colour, 1, cv2.LINE_AA)
+
+
+def status_strip(img, y):
+    """One chip per stream: rate, age, and whether it is live. The liveness display."""
+    chip_w, gap = 300, 12
+    for i, name in enumerate(("DRIVE", "ENC", "IMU", "RANGE")):
+        x = 30 + i * (chip_w + gap)
+        a, r = age(name), rate(name)
+        if a is None:
+            col, state = DIM, "never seen"
+        elif a <= STALE_S:
+            col, state = GREEN, f"{r:.0f} Hz" if r else "live"
+        else:
+            # The stick only transmits while you are driving, so a quiet DRIVE stream is
+            # normal rather than a fault -- say so instead of raising an alarm.
+            col = AMBER if name == "DRIVE" else RED
+            state = f"idle {a:.0f}s" if name == "DRIVE" else f"SILENT {a:.0f}s"
+        cv2.rectangle(img, (x, y), (x + chip_w, y + 38), PANEL_BG, -1)
+        cv2.rectangle(img, (x, y), (x + 5, y + 38), col, -1)
+        text(img, name, (x + 16, y + 25), 0.55, WHITE, 2)
+        text(img, state, (x + 110, y + 25), 0.5, col)
+        text(img, f"n={streams[name]['count']}", (x + 220, y + 25), 0.42, DIM)
+
+
+# ---------------- panels ----------------
+
+def draw_drive(img, x, y, w, h):
+    px, py = panel(img, x, y, w, h, "DRIVE  (stick commands overheard)")
+    if streams["DRIVE"]["count"] == 0:
+        text(img, "no drive commands seen yet", (px, py + 30), 0.55, GREY)
+        text(img, "power the stick controller and drive", (px, py + 56), 0.45, DIM)
+        return
+    idle = not is_live("DRIVE")
+    for i, (name, value, colour) in enumerate((("left", cmd["left"], C_LEFT),
+                                               ("right", cmd["right"], C_RIGHT))):
+        by = py + 10 + i * 46
+        text(img, name, (px, by + 20), 0.5, colour)
+        centred_bar(img, px + 60, by, w - 170, 26,
+                    0 if idle else value, PWM_FULL,
+                    DIM if idle else colour, f"{value:+4d}")
+    if idle:
+        text(img, f"stick idle {age('DRIVE'):.0f}s -- bars zeroed, last command shown",
+             (px, py + 112), 0.42, AMBER)
+
+
+def draw_encoders(img, x, y, w, h):
+    px, py = panel(img, x, y, w, h, "ENCODERS")
+    if streams["ENC"]["count"] == 0:
+        text(img, "no ENC packets -- is the encoder board powered?", (px, py + 30), 0.5, GREY)
+        return
+    for i, (name, dist, avail, colour) in enumerate(
+            (("left", enc.dist_l, enc.available[0], C_LEFT),
+             ("right", enc.dist_r, enc.available[1], C_RIGHT))):
+        by = py + 6 + i * 44
+        text(img, name, (px, by + 20), 0.5, colour)
+        if not avail:
+            # The encoders sit by the wheels and get damaged; a missing one must never
+            # look like a wheel sitting still.
+            text(img, "NOT RESPONDING", (px + 60, by + 20), 0.5, RED)
+        else:
+            text(img, f"{dist:+8.2f} in", (px + 60, by + 20), 0.55, WHITE)
+            sparkline(img, px + 210, by, w - 250, 26,
+                      list(hist["dist_l"] if i == 0 else hist["dist_r"]), colour)
+    hdg = enc.heading_deg
+    if hdg is None:
+        text(img, "heading: needs both wheels", (px, py + 108), 0.45, AMBER)
+    else:
+        text(img, f"heading {hdg:+7.1f} deg", (px, py + 108), 0.5, WHITE)
+
+
+def draw_imu(img, x, y, w, h):
+    px, py = panel(img, x, y, w, h, "IMU  (GY-521)")
+    if streams["IMU"]["count"] == 0:
+        text(img, "no IMU packets -- is the IMU board powered?", (px, py + 30), 0.5, GREY)
+        return
+
+    # Artificial horizon: tilts with roll, slides with pitch.
+    cx, cy, r = px + 80, py + 80, 68
+    cv2.circle(img, (cx, cy), r, TRACK, -1)
+    off = max(-r, min(r, ori.pitch * r / 60.0))
+    a = math.radians(-ori.roll)
+    dx, dy = math.cos(a), math.sin(a)
+    mx, my = cx + dy * off, cy + dx * off
+    cv2.line(img, (int(mx - dx * r), int(my - dy * r)),
+             (int(mx + dx * r), int(my + dy * r)), WHITE, 2, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), r, GREY, 1)
+    cv2.line(img, (cx - 24, cy), (cx - 7, cy), AMBER, 2)
+    cv2.line(img, (cx + 7, cy), (cx + 24, cy), AMBER, 2)
+    text(img, "pitch/roll", (cx - 34, cy + r + 18), 0.4, GREY)
+
+    # Compass for yaw. Gyro-integrated, so it drifts -- 'z' re-zeros it.
+    cx2 = px + 240
+    yaw = ori.yaw - yaw_ref
+    cv2.circle(img, (cx2, cy), r, TRACK, -1)
+    cv2.circle(img, (cx2, cy), r, GREY, 1)
+    ang = math.radians(yaw - 90)
+    cv2.line(img, (cx2, cy),
+             (int(cx2 + math.cos(ang) * (r - 10)), int(cy + math.sin(ang) * (r - 10))),
+             C_THIRD, 3, cv2.LINE_AA)
+    text(img, f"yaw {yaw:+.0f}", (cx2 - 30, cy + r + 18), 0.4, GREY)
+
+    tx = px + 340
+    text(img, f"pitch {ori.pitch:+7.1f}", (tx, py + 30), 0.5, C_LEFT)
+    text(img, f"roll  {ori.roll:+7.1f}", (tx, py + 56), 0.5, C_RIGHT)
+    text(img, f"yaw   {yaw:+7.1f}  (drifts)", (tx, py + 82), 0.5, C_THIRD)
+    for i, (axis, g) in enumerate(zip("xyz", accel_g)):
+        by = py + 106 + i * 24
+        text(img, f"a{axis}", (tx, by + 12), 0.42, GREY)
+        centred_bar(img, tx + 30, by, 150, 14, g, ACCEL_FULL_G, C_FOURTH, f"{g:+5.2f} g")
+
+
+def draw_range(img, x, y, w, h):
+    px, py = panel(img, x, y, w, h, "RANGE  (VL53L0X)")
+    if not tof.channels:
+        text(img, "no range packets -- is the ToF board powered?", (px, py + 30), 0.5, GREY)
+        return
+    for i, key in enumerate(sorted(tof.channels)):
+        entry = tof.channels[key]
+        by = py + 6 + i * 44
+        colour = (C_LEFT, C_RIGHT, C_THIRD, C_FOURTH)[i % 4]
+        text(img, TofState.label(*key), (px, by + 20), 0.45, colour)
+        mm = entry["mm"]
+        if mm is None:
+            # Reporting, but nothing within 2 m. Different from a dead sensor.
+            text(img, "no target in range", (px + 150, by + 20), 0.45, DIM)
+        else:
+            level_bar(img, px + 150, by, w - 330, 26, mm, RANGE_MAX_MM, colour)
+            text(img, f"{mm:5d} mm  {mm/25.4:5.1f} in", (px + w - 170, by + 20), 0.45, WHITE)
+        sparkline(img, px + 150, by + 28, w - 330, 12,
+                  list(tof_hist.get(key, ())), colour, lo=0, hi=RANGE_MAX_MM)
+    closest = tof.closest_mm()
+    text(img, "closest (median-filtered): " +
+         ("nothing in range" if closest is None else f"{closest} mm / {closest/25.4:.1f} in"),
+         (px, py + h - 70), 0.5, WHITE if closest is not None else GREY)
+
+
+# ---------------- main ----------------
+
+def drain(reader):
+    global accel_g
+    while True:
+        try:
+            raw = reader.q.get_nowait()
+        except queue.Empty:
+            return
+        kind, data = parse_line(raw)
+        if kind == "ENC":
+            enc.update(*data)
+            note("ENC")
+            hist["dist_l"].append(enc.dist_l if enc.available[0] else None)
+            hist["dist_r"].append(enc.dist_r if enc.available[1] else None)
+        elif kind == "IMU":
+            agx, agy, agz, *_ = ori.update(*data)
+            accel_g = (agx, agy, agz)
+            note("IMU")
+            hist["yaw"].append(ori.yaw - yaw_ref)
+        elif kind == "CMD":
+            cmd["left"], cmd["right"] = data
+            note("DRIVE")
+        elif kind == "SENSOR":
+            name, values, ms = data
+            if name.startswith("TOF"):
+                for key in tof.update(name, values, ms):
+                    h = tof_hist.setdefault(key, collections.deque(maxlen=HIST))
+                    h.append(tof.channels[key]["mm"])
+                note("RANGE")
+        elif kind is None and data.strip():
+            boot_lines.append(data.strip())
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Live read-only encoder + IMU viewer and calibrator.")
-    parser.add_argument("--port", help="Serial port for the bridge ESP32 (default: auto-detect)")
-    parser.add_argument("--window", type=float, default=20.0, help="Seconds of history to show (default: 20)")
-    parser.add_argument("--csv", nargs="?", const="auto", metavar="FILE",
-                        help="Also record every sample to a CSV (no FILE = live_<timestamp>.csv in the current directory)")
-    args = parser.parse_args()
+    global yaw_ref
+    ap = argparse.ArgumentParser(description="Live dashboard for all bridge telemetry.")
+    ap.add_argument("--port", help="bridge serial port (default: autodetect)")
+    args = ap.parse_args()
 
-    cfg = load_config()
     port = pick_port(args.port)
-    print(f"Connecting to {port}...")
-    ser = serial.Serial(port, BAUD_RATE, timeout=0.1)
+    ser = serial.Serial(port, BAUD_RATE, timeout=0.05)
+    print(f"Reading {port} at {BAUD_RATE}; waiting {RESET_SETTLE_S}s for the ESP32 to boot.")
+    time.sleep(RESET_SETTLE_S)
+
     reader = SerialReader(ser)
     reader.start()
-    time.sleep(RESET_SETTLE_S)
-    print("Connected. Commands: z | d <inches> | t <degrees> | show | help.  Close window or Ctrl+C to quit.")
-
-    enc = EncoderState(cfg)
-    ori = OrientationState()
-    t0 = time.monotonic()
-
-    def buf():
-        return collections.deque()
-
-    t_enc, dist_l, dist_r, speed_l, speed_r, enc_hdg = (buf() for _ in range(6))
-    t_imu, pitch, roll, yaw, acc_x, acc_y, acc_z = (buf() for _ in range(7))
-    all_bufs = [t_enc, dist_l, dist_r, speed_l, speed_r, enc_hdg,
-                t_imu, pitch, roll, yaw, acc_x, acc_y, acc_z]
-    last_seen = {"enc": None, "imu": None}
-
-    # Terminal commands are read on a thread so typing never freezes the plot.
-    cmd_q = queue.Queue()
-
-    def stdin_loop():
-        for line in sys.stdin:
-            cmd_q.put(line.strip())
-
-    threading.Thread(target=stdin_loop, daemon=True).start()
-
-    fig, axes = plt.subplots(4, 1, figsize=(9, 10), sharex=True, facecolor=SURFACE)
-    ax_d, ax_s, ax_o, ax_a = axes
-    (l_dist_l,) = ax_d.plot([], [], color=CAT[0], linewidth=2, label="left")
-    (l_dist_r,) = ax_d.plot([], [], color=CAT[1], linewidth=2, label="right")
-    (l_speed_l,) = ax_s.plot([], [], color=CAT[0], linewidth=1.5, label="left")
-    (l_speed_r,) = ax_s.plot([], [], color=CAT[1], linewidth=1.5, label="right")
-    (l_pitch,) = ax_o.plot([], [], color=CAT[0], linewidth=2, label="pitch")
-    (l_roll,) = ax_o.plot([], [], color=CAT[1], linewidth=2, label="roll")
-    (l_yaw,) = ax_o.plot([], [], color=CAT[2], linewidth=2, label="yaw (imu, drifts)")
-    (l_ehdg,) = ax_o.plot([], [], color=CAT[3], linewidth=2, linestyle="--", label="heading (encoders)")
-    (l_ax,) = ax_a.plot([], [], color=CAT[0], linewidth=1.5, label="x")
-    (l_ay,) = ax_a.plot([], [], color=CAT[1], linewidth=1.5, label="y")
-    (l_az,) = ax_a.plot([], [], color=CAT[2], linewidth=1.5, label="z")
-
-    ax_d.set_ylabel("distance (in)")
-    ax_s.set_ylabel("speed (in/s)")
-    ax_o.set_ylabel("degrees")
-    ax_a.set_ylabel("accel (g)")
-    ax_a.set_xlabel("time (s)")
-    for ax in axes:
-        ax.legend(frameon=False, loc="upper left")
-        ax.set_facecolor(SURFACE)
-        ax.grid(color=GRIDLINE, linewidth=1)
-        ax.tick_params(colors=INK_PRIMARY)
-    fig.tight_layout(rect=(0, 0, 1, 0.90))
-    readout = fig.text(0.5, 0.985, "waiting for data...", ha="center", va="top",
-                       fontsize=12, family="monospace", color=INK_PRIMARY)
-
-    def do_zero():
-        enc.zero()
-        ori.zero_yaw()
-        for b in all_bufs:
-            b.clear()
-        print("-> zeroed distance, heading and yaw")
-
-    def clear_history():
-        for b in all_bufs:
-            b.clear()
-
-    def do_calibrate_distance(measured_in):
-        travelled = abs(enc.dist_avg)
-        if travelled < MIN_CAL_DISTANCE_IN:
-            print(f"-> only {travelled:.2f} in since zero; drive further (>= {MIN_CAL_DISTANCE_IN:g} in) before calibrating")
-            return
-        if measured_in <= 0:
-            print("-> measured distance must be positive")
-            return
-        old = cfg["wheel_diameter_in"]
-        cfg["wheel_diameter_in"] = old * measured_in / travelled
-        save_config(cfg)
-        clear_history()
-        print(f"-> screen said {travelled:.2f} in, you measured {measured_in:g} in: "
-              f"wheel_diameter_in {old:.3f} -> {cfg['wheel_diameter_in']:.3f} (saved). "
-              f"Press z and drive again to confirm.")
-
-    def do_calibrate_turn(actual_deg):
-        turned = abs(enc.heading_deg)
-        if turned < MIN_CAL_TURN_DEG:
-            print(f"-> encoders only show {turned:.1f} deg since zero; spin further (>= {MIN_CAL_TURN_DEG:g} deg)")
-            return
-        if actual_deg <= 0:
-            print("-> actual angle must be positive")
-            return
-        old = cfg["track_width_in"]
-        cfg["track_width_in"] = old * turned / actual_deg
-        save_config(cfg)
-        clear_history()
-        print(f"-> encoders said {turned:.1f} deg (imu yaw {abs(ori.yaw):.1f}), actual {actual_deg:g}: "
-              f"track_width_in {old:.2f} -> {cfg['track_width_in']:.2f} (saved). "
-              f"Press z and spin again to confirm.")
-
-    def handle_command(line):
-        parts = line.split()
-        if not parts:
-            return
-        cmd = parts[0].lower()
-        try:
-            if cmd == "z":
-                do_zero()
-            elif cmd == "d" and len(parts) == 2:
-                do_calibrate_distance(float(parts[1]))
-            elif cmd == "t" and len(parts) == 2:
-                do_calibrate_turn(float(parts[1]))
-            elif cmd == "show":
-                print(f"-> config: {cfg}")
-            else:
-                print("commands: z | d <measured inches> | t <actual degrees> | show")
-        except ValueError:
-            print("-> couldn't read that number")
-
-    def on_key(event):
-        if event.key == "z":
-            do_zero()
-
-    fig.canvas.mpl_connect("key_press_event", on_key)
-
-    # Optional CSV recording: one row per incoming ENC or IMU sample, holding the
-    # latest value of the other stream so every row is fully populated.
-    csv_file = csv_writer = None
-    if args.csv:
-        csv_path = args.csv
-        if csv_path == "auto":
-            csv_path = time.strftime("live_%Y%m%d_%H%M%S.csv")
-        csv_file = open(csv_path, "w", newline="")
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["time_s", "source", "dist_l_in", "dist_r_in", "dist_avg_in",
-                             "speed_l_in_s", "speed_r_in_s", "enc_heading_deg",
-                             "pitch_deg", "roll_deg", "yaw_deg", "acc_x_g", "acc_y_g", "acc_z_g"])
-        print(f"Recording to {csv_path}")
-    held = {"speed_l": 0.0, "speed_r": 0.0, "acc": (0.0, 0.0, 0.0)}
-
-    def log_row(t, source):
-        if csv_writer is None:
-            return
-        csv_writer.writerow([f"{t:.3f}", source,
-                             f"{enc.dist_l:.4f}", f"{enc.dist_r:.4f}", f"{enc.dist_avg:.4f}",
-                             f"{held['speed_l']:.4f}", f"{held['speed_r']:.4f}", f"{enc.heading_deg:.3f}",
-                             f"{ori.pitch:.3f}", f"{ori.roll:.3f}", f"{ori.yaw:.3f}",
-                             *(f"{a:.4f}" for a in held["acc"])])
-
-    def drain():
-        while True:
-            try:
-                raw = reader.q.get_nowait()
-            except queue.Empty:
-                return
-            kind, data = parse_line(raw)
-            t = time.monotonic() - t0
-            if kind == "ENC":
-                sl, sr = enc.update(*data)
-                t_enc.append(t); dist_l.append(enc.dist_l); dist_r.append(enc.dist_r)
-                speed_l.append(sl if sl is not None else 0.0)
-                speed_r.append(sr if sr is not None else 0.0)
-                enc_hdg.append(enc.heading_deg)
-                last_seen["enc"] = t
-                held["speed_l"], held["speed_r"] = speed_l[-1], speed_r[-1]
-                log_row(t, "ENC")
-            elif kind == "IMU":
-                agx, agy, agz, *_ = ori.update(*data)
-                t_imu.append(t)
-                pitch.append(ori.pitch); roll.append(ori.roll); yaw.append(ori.yaw)
-                acc_x.append(agx); acc_y.append(agy); acc_z.append(agz)
-                last_seen["imu"] = t
-                held["acc"] = (agx, agy, agz)
-                log_row(t, "IMU")
-
-    def trim(now, *groups):
-        for tq, *qs in groups:
-            while tq and tq[0] < now - args.window:
-                tq.popleft()
-                for q in qs:
-                    q.popleft()
-
-    def update(_frame):
-        while True:
-            try:
-                handle_command(cmd_q.get_nowait())
-            except queue.Empty:
-                break
-        drain()
-        now = time.monotonic() - t0
-        trim(now, (t_enc, dist_l, dist_r, speed_l, speed_r, enc_hdg),
-             (t_imu, pitch, roll, yaw, acc_x, acc_y, acc_z))
-
-        l_dist_l.set_data(t_enc, dist_l)
-        l_dist_r.set_data(t_enc, dist_r)
-        l_speed_l.set_data(t_enc, speed_l)
-        l_speed_r.set_data(t_enc, speed_r)
-        l_pitch.set_data(t_imu, pitch)
-        l_roll.set_data(t_imu, roll)
-        l_yaw.set_data(t_imu, yaw)
-        l_ehdg.set_data(t_enc, enc_hdg)
-        l_ax.set_data(t_imu, acc_x)
-        l_ay.set_data(t_imu, acc_y)
-        l_az.set_data(t_imu, acc_z)
-
-        ax_d.set_xlim(max(0, now - args.window), max(args.window, now))
-        for ax in axes:
-            ax.relim()
-            ax.autoscale_view(scalex=False)
-
-        def age(k):
-            return "no data" if last_seen[k] is None else f"{now - last_seen[k]:.1f}s ago"
-
-        if last_seen["enc"] is not None:
-            d = enc.dist_avg
-            line1 = (f"SINCE ZERO  {d:+8.2f} in  ({d / 12:+.3f} ft)   "
-                     f"L {enc.dist_l:+.2f}  R {enc.dist_r:+.2f} in")
-            line2 = (f"heading enc {enc.heading_deg:+7.1f} deg   imu yaw {ori.yaw:+7.1f} deg   "
-                     f"pitch {ori.pitch:+.1f} roll {ori.roll:+.1f}")
-        else:
-            line1 = "SINCE ZERO  (no encoder data yet)"
-            line2 = f"imu yaw {ori.yaw:+.1f} deg"
-        readout.set_text(f"{line1}\n{line2}\n"
-                         f"enc {age('enc')} | imu {age('imu')} | z = zero, type d/t in terminal to calibrate")
-        return []
-
-    anim = FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)
+    win = "Llama robot -- live telemetry"
+    cv2.namedWindow(win)
     try:
-        plt.show()
-    except KeyboardInterrupt:
-        pass
+        while True:
+            drain(reader)
+
+            img = np.zeros((H, W, 3), np.uint8)
+            img[:] = (24, 24, 24)
+            text(img, "Llama robot -- live telemetry", (30, 40), 0.75, WHITE, 2)
+            text(img, f"{port} @ {BAUD_RATE}   read-only, safe while driving",
+                 (420, 40), 0.45, GREY)
+            text(img, "q/ESC quit   z zero dist+yaw   r clear plots", (W - 400, 40), 0.45, GREY)
+
+            status_strip(img, 62)
+
+            draw_drive(img, 30, 120, 610, 160)
+            draw_encoders(img, 30, 296, 610, 170)
+            draw_imu(img, 660, 120, 590, 220)
+            draw_range(img, 660, 356, 590, 300)
+
+            for i, line in enumerate(boot_lines):
+                text(img, line[:150], (30, H - 70 + i * 15), 0.35, DIM)
+
+            cv2.imshow(win, img)
+            k = cv2.waitKey(20) & 0xFF
+            if k in (ord("q"), 27):
+                break
+            if k == ord("z"):
+                enc.zero()
+                ori.zero_yaw()
+                yaw_ref = 0.0
+            if k == ord("r"):
+                for q in hist.values():
+                    q.clear()
+                for q in tof_hist.values():
+                    q.clear()
     finally:
         reader.stop()
         ser.close()
-        if csv_file:
-            csv_file.close()
-    return anim
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

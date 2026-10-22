@@ -14,6 +14,16 @@
 // the gyro bias calibration window (see calibrateGyroBias()). Then rock it
 // by hand and watch pitch/roll track; yaw will drift over time since
 // there's no magnetometer to reference it against, which is expected.
+//
+// Prints two lines per cycle: the human-readable one below for the Serial Monitor, and a
+// "RAW ax=.. ay=.. az=.. gx=.. gy=.. gz=.. pitch=.. roll=.. yaw=.. t=.." line that
+// visualize.py in this folder parses into a live display -- same arrangement as
+// bench_tof_vl53l0x_test.ino.
+//
+// The six raw values on that line are in the SAME ORDER, with the same bias correction,
+// that robot_imu_gy521.ino puts in its SensorPacket. So what you verify here is exactly
+// what goes on the wire, and the orientation maths on the PC side
+// (calibration/bridge.py's OrientationState) consumes identical numbers.
 
 #include <Wire.h>
 
@@ -22,7 +32,17 @@
 #define SCL_PIN 22
 
 // ================= MPU6050 registers =================
-const uint8_t MPU_ADDR       = 0x68;
+// AD0 low = 0x68, AD0 high = 0x69. Probed at boot rather than hardcoded, because a
+// floating or pulled-up AD0 pin is one of the two usual reasons a GY-521 looks dead, and
+// robot_imu_gy521.ino already auto-detects -- the bench test should not be the fussier of
+// the two.
+const uint8_t ADDR_AD0_LOW  = 0x68;
+const uint8_t ADDR_AD0_HIGH = 0x69;
+uint8_t MPU_ADDR = ADDR_AD0_LOW;   // set by detectAddress()
+
+// Genuine MPU6050 reports 0x68; relabelled GY-521 clones commonly report one of these.
+// Same list as robot_imu_gy521.ino.
+const uint8_t WHO_AM_I_OK[] = {0x68, 0x70, 0x71, 0x72, 0x73, 0x98};
 const uint8_t REG_PWR_MGMT_1 = 0x6B;
 const uint8_t REG_WHO_AM_I   = 0x75;
 const uint8_t REG_GYRO_CONFIG  = 0x1B;
@@ -100,6 +120,45 @@ void calibrateGyroBias() {
   Serial.print(" z="); Serial.println(gyroBiasZ, 3);
 }
 
+// List everything answering on the bus. A bench test that only says "WHO_AM_I: 0x0" tells
+// you the chip did not answer but not whether ANYTHING is out there -- and "nothing at
+// all" (power or wiring) needs a different fix from "something, but at the other address".
+void scanBus() {
+  Serial.print("I2C scan:");
+  uint8_t found = 0;
+  for (uint8_t a = 1; a < 127; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      Serial.print(" 0x"); Serial.print(a, HEX);
+      found++;
+    }
+  }
+  if (!found) Serial.print(" nothing");
+  Serial.println();
+}
+
+bool deviceAt(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+bool whoAmIRecognised(uint8_t id) {
+  for (uint8_t ok : WHO_AM_I_OK) if (id == ok) return true;
+  return false;
+}
+
+// Returns true and sets MPU_ADDR if a device answers at either address.
+bool detectAddress() {
+  for (uint8_t addr : {ADDR_AD0_LOW, ADDR_AD0_HIGH}) {
+    if (deviceAt(addr)) {
+      MPU_ADDR = addr;
+      Serial.print("GY-521 found at 0x"); Serial.println(addr, HEX);
+      return true;
+    }
+  }
+  return false;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -109,11 +168,19 @@ void setup() {
 
   Serial.println("===== GY-521 (MPU6050) IMU Test =====");
 
-  uint8_t whoAmI = readReg8(REG_WHO_AM_I);
-  Serial.print("WHO_AM_I: 0x"); Serial.println(whoAmI, HEX);
-  if (whoAmI != 0x68) {
-    Serial.println("WARNING: unexpected WHO_AM_I -- check wiring/address (AD0 pin).");
+  // Find the chip before talking to it: reading WHO_AM_I at a hardcoded address reports
+  // 0x0 whether the board is at the other address, unpowered, or absent.
+  scanBus();
+  if (!detectAddress()) {
+    Serial.println("ERROR: nothing at 0x68 or 0x69 -- check VCC/GND/SDA/SCL and AD0.");
+    Serial.println("Halting: calibrating a gyro bias from a dead bus produces a bogus");
+    Serial.println("offset that silently corrupts every reading afterwards.");
+    while (true) delay(1000);
   }
+
+  uint8_t whoAmI = readReg8(REG_WHO_AM_I);
+  Serial.print("WHO_AM_I: 0x"); Serial.print(whoAmI, HEX);
+  Serial.println(whoAmIRecognised(whoAmI) ? " (ok)" : " (unrecognised -- continuing anyway)");
 
   writeReg8(REG_PWR_MGMT_1, 0x00);   // wake from sleep, use internal 8MHz oscillator
   delay(50);
@@ -160,5 +227,18 @@ void loop() {
     Serial.print("  || pitch="); Serial.print(pitch, 1);
     Serial.print(" roll="); Serial.print(roll, 1);
     Serial.print(" yaw="); Serial.println(yaw, 1);
+
+    // Machine-readable twin for visualize.py. ax..gz are the raw LSBs the packet
+    // carries: accel as read (+-2g => 16384 LSB/g), gyro bias-corrected and converted
+    // back to LSBs (+-250 dps => 131 LSB/dps), matching robot_imu_gy521.ino exactly.
+    // pitch/roll/yaw are this sketch's own filter output, for comparison only -- they
+    // are not transmitted; the PC recomputes them from the raw values.
+    Serial.printf("RAW ax=%d ay=%d az=%d gx=%d gy=%d gz=%d "
+                  "pitch=%.2f roll=%.2f yaw=%.2f t=%lu\n",
+                  ax, ay, az,
+                  (int)lroundf(gyroDpsX * GYRO_LSB_PER_DPS),
+                  (int)lroundf(gyroDpsY * GYRO_LSB_PER_DPS),
+                  (int)lroundf(gyroDpsZ * GYRO_LSB_PER_DPS),
+                  pitch, roll, yaw, (unsigned long)now);
   }
 }

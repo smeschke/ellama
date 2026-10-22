@@ -29,6 +29,10 @@ LINE_RE = re.compile(
     r"\s+\|\|\s+wheel_revs=\s*(-?[\d.]+)\s+wheel_rpm=\s*(-?[\d.]+)"
 )
 STATUS_RE = re.compile(r"^\[(left|right)\]\s+(.*)$")
+# "left  NOT_RESPONDING" -- the sketch prints this instead of a row of zeros when nothing
+# answers on that encoder's bus. The encoders sit by the wheels and get damaged, so this
+# is an expected state: the view keeps running on whichever encoder is left.
+MISSING_RE = re.compile(r"^(left|right)\s+NOT_RESPONDING$")
 
 W, H = 1000, 640
 HIST = 300              # ~30 s of RPM history at 10 Hz
@@ -40,7 +44,8 @@ DIAL_CENTERS = {"left": (260, 190), "right": (740, 190)}
 # Per-encoder state
 enc = {
     n: dict(angle=0.0, revs=0.0, rpm=0.0, raw=0, wheel_revs=0.0, wheel_rpm=0.0,
-            revs_off=0.0, seen=False, status="waiting for boot check...", hist=collections.deque(maxlen=HIST))
+            revs_off=0.0, seen=False, missing=False,
+            status="waiting for boot check...", hist=collections.deque(maxlen=HIST))
     for n in NAMES
 }
 
@@ -53,19 +58,36 @@ def handle_line(text):
         e = enc[name]
         e["angle"], e["revs"], e["rpm"], e["raw"], e["wheel_revs"], e["wheel_rpm"] = f
         e["seen"] = True
+        e["missing"] = False
         e["hist"].append(e["rpm"])
+        return
+    m = MISSING_RE.match(text)
+    if m:
+        e = enc[m.group(1)]
+        e["missing"] = True
+        e["status"] = "not responding -- check wiring/power"
+        # Feed 0 rpm so the plot keeps its time axis honest rather than freezing the
+        # last value, which would read as a wheel still turning.
+        e["hist"].append(0.0)
         return
     m = STATUS_RE.match(text)
     if m:
         name, msg = m.groups()
-        if "Magnet detected" in msg or "magnet not detected" in msg or "WARNING" in msg:
+        if ("Magnet detected" in msg or "MAGNET" in msg or "NOT RESPONDING" in msg
+                or "came back" in msg or "WARNING" in msg):
             enc[name]["status"] = msg.strip()
+            if "came back" in msg or "Magnet detected" in msg:
+                enc[name]["missing"] = False
+            elif "NOT RESPONDING" in msg:
+                enc[name]["missing"] = True
         elif "AGC" in msg:
             enc[name]["agc"] = msg.strip()
 
 
 def status_color(status):
     s = status.lower()
+    if "not responding" in s:
+        return (60, 60, 255)      # red
     if "not detected" in s or "warning" in s:
         return (60, 60, 255)      # red
     if "too weak" in s or "too strong" in s:
@@ -87,19 +109,36 @@ def draw_dial(img, name):
         p0 = (int(cx + r0 * np.sin(a)), int(cy - r0 * np.cos(a)))
         p1 = (int(cx + DIAL_R * np.sin(a)), int(cy - DIAL_R * np.cos(a)))
         cv2.line(img, p0, p1, (110, 110, 110), 1, cv2.LINE_AA)
-    if e["seen"]:
+    if e["missing"]:
+        # No needle at all: a needle frozen at its last angle looks like a stopped wheel.
+        cv2.putText(img, "NOT", (cx - 34, cy - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (60, 60, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, "RESPONDING", (cx - 72, cy + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (60, 60, 255), 1, cv2.LINE_AA)
+    elif e["seen"]:
         a = np.radians(e["angle"])
         tip = (int(cx + (DIAL_R - 10) * np.sin(a)), int(cy - (DIAL_R - 10) * np.cos(a)))
         cv2.line(img, (cx, cy), tip, col, 3, cv2.LINE_AA)
-    cv2.circle(img, (cx, cy), 5, col, -1, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), 5, col if not e["missing"] else (70, 70, 70), -1, cv2.LINE_AA)
 
     ty = cy + DIAL_R + 28
-    live = "no data" if not e["seen"] else f"angle {e['angle']:6.1f} deg   raw {int(e['raw'])}"
+    if e["missing"]:
+        live = "--- no data ---"
+    elif not e["seen"]:
+        live = "no data"
+    else:
+        live = f"angle {e['angle']:6.1f} deg   raw {int(e['raw'])}"
     cv2.putText(img, live, (cx - 130, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 1, cv2.LINE_AA)
-    cv2.putText(img, f"revs {e['revs'] - e['revs_off']:8.3f}    rpm {e['rpm']:7.1f}",
-                (cx - 130, ty + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 1, cv2.LINE_AA)
-    cv2.putText(img, f"wheel revs {e['wheel_revs'] - e['revs_off'] / 6.33:7.3f}  rpm {e['wheel_rpm']:6.1f}",
-                (cx - 130, ty + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (170, 170, 170), 1, cv2.LINE_AA)
+    if e["missing"]:
+        cv2.putText(img, "revs    ---        rpm    ---", (cx - 130, ty + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120, 120, 120), 1, cv2.LINE_AA)
+        cv2.putText(img, "wheel revs  ---    rpm   ---", (cx - 130, ty + 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (110, 110, 110), 1, cv2.LINE_AA)
+    else:
+        cv2.putText(img, f"revs {e['revs'] - e['revs_off']:8.3f}    rpm {e['rpm']:7.1f}",
+                    (cx - 130, ty + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 1, cv2.LINE_AA)
+        cv2.putText(img, f"wheel revs {e['wheel_revs'] - e['revs_off'] / 6.33:7.3f}  rpm {e['wheel_rpm']:6.1f}",
+                    (cx - 130, ty + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (170, 170, 170), 1, cv2.LINE_AA)
     cv2.putText(img, e["status"][:44], (cx - 130, ty + 72), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                 status_color(e["status"]), 1, cv2.LINE_AA)
 
