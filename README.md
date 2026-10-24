@@ -63,7 +63,6 @@ The stick controller and the computer bridge send the same drive packet over ESP
 | [`mcp_server/`](mcp_server/) | MCP server that lets an AI agent drive by encoder feedback ("go forward 10 inches"), with a live sensor inventory the agent decides from, switchable motion and tilt guards, recording, voice and lights |
 | [`DRIVING_POLICY.md`](DRIVING_POLICY.md) | Rules anything driving the robot must follow. Read it first. |
 | [`teleop/`](teleop/) | Network driving, video and lidar client/server scripts for an onboard Pi |
-| [`phone/`](phone/) | Phone camera and display |
 | [`tools/`](tools/) | Speed and turn characterization sweeps that drive through the MCP server, and ArUco tag detection |
 | `recordings/` | Run recordings the server writes. Not committed. |
 
