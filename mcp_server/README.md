@@ -39,10 +39,8 @@ So this server **reports what it has** and **enforces what it was told to need**
 - Guards follow from the sensors, because every guard reads one. **No IMU means no tilt
   guard** — reported as a fact by `guards()`, never as a refusal to move. Whether driving
   in that state is acceptable was already settled by the policy.
-- `set_guard(...)` turns guards and individual motion detectors on and off and retunes
-  their thresholds while running: `set_guard("motion", bump=false)` to push something
-  heavy without the bump detector firing on the push, `set_guard("tilt", limit_deg=40)`
-  for a ramp the robot is meant to climb.
+- `set_guard(...)` turns the tilt guard on and off and retunes its thresholds while
+  running: `set_guard("tilt", limit_deg=40)` for a ramp the robot is meant to climb.
 
 Three sensor states that must not be collapsed into each other, and which `sensors()` and
 `read_range()` keep apart:
@@ -87,7 +85,6 @@ All of these are startup defaults; the sensor and guard ones are settable at run
 | `ELLAMA_REQUIRED_SENSORS` | comma/space separated starting policy, default `enc,imu`; set it empty to require none |
 | `ELLAMA_CAM_URL` | explicit phone-camera base URL; default scans the local /24 |
 | `ELLAMA_TILT_LIMIT_DEG`, `ELLAMA_TILT_LOOKAHEAD_S`, `ELLAMA_TILT_GUARD` | tilt guard start values (`set_guard` changes them live) |
-| `ELLAMA_MOTION_GUARD` | `on` / `warn` / `off` at start (`set_guard` changes it live) |
 
 Register with an MCP client via `.mcp.json` (already set up at the repo root) or run
 directly to sanity-check it starts:
@@ -105,7 +102,7 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `read_range()` | No | — (closest obstacle from the forward ToF cones; distinguishes "nothing in range" from "not reporting") |
 | `set_required_sensors(names, confirmed_safe)` | No | `confirmed_safe` — it changes what the robot will do with no feedback |
 | `guards()` | No | — |
-| `set_guard(name, mode=None, limit_deg=…, stall/direction/slip/bump=…, …)` | No | No (it cannot clear a latched fault) |
+| `set_guard(name="tilt", mode=None, limit_deg=…, lookahead_s=…)` | No | No (it cannot clear a latched fault) |
 | `look(width=640)` | No | — |
 | `save_photo(name="", preview_width=0, open_in_browser=False)` | No | — (saves a full-res photo to `recordings/photos/` with a `.json` of the robot's pose; `preview_width` > 0 also returns the picture) |
 | `phone_status()` | No | — (the phone's battery percent and torch state, from the camera app's `/info.json`; `low_battery` at or below 20%) |
@@ -124,7 +121,6 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `drive_until_range(target_mm, pwm, confirmed_safe, facing="auto", sensor=None, tolerance_mm=15, min_pwm=50)` | Yes (straight, toward whatever the ToF faces, until it reads `target_mm`) | Yes |
 | `jog(left_pwm, right_pwm, duration_s, confirmed_safe, require_telemetry=True)` | Yes (raw, time-based) | Yes |
 | `speak_then_drive(text, pwm, duration_s, confirmed_safe, direction="forward", warn_lights=True)` | Yes (`speak` then straight open-loop `jog`, one call, no model round trip between) | Yes |
-| `clear_motion_fault(confirmed_safe)` | No (releases a tripped motion guard) | `confirmed_safe` — only after the operator has LOOKED at the robot |
 | `set_level_reference(confirmed_level)` | No (records the current orientation as "level" for the tilt guard; refused while moving or if it would shift the reference by > half the limit) | `confirmed_level` — only after the operator says the robot is on level ground |
 | `clear_tilt_fault(confirmed_safe)` | No (releases a tripped tilt guard; refused while still leaning within 5° of the limit) | `confirmed_safe` — only after the operator has looked at the robot |
 | `lights(on=True, brightness, color, effect, speed, intensity)` | No (WLED strip at `ELLAMA_WLED_HOST`, default 192.168.0.57) | — |
@@ -329,46 +325,6 @@ that watches the lean of the chassis and stops the robot before it goes over.
 - **Tests:** `ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_tilt_guard.py` (no hardware;
   also replays the recordings).
 
-## Motion guard (`motion_guard.py`)
-
-Stops the robot, in real time (~0.2 s to stopped wheels), when the sensors stop agreeing with
-what it was told to do -- same latch + `send_drive` choke point as the tilt guard, so every drive
-tool and autonomous run is covered. It is *not* an obstacle sensor; it notices that "the data
-stopped matching".
-
-| Detector | Fires when | Means |
-|---|---|---|
-| `stall` | a wheel commanded above the deadband (50, or 65 in a spin) for >= 1 s reads < 0.5 in/s for 0.4 s, and the IMU agrees the robot is stuck | snagged / no traction |
-| `encoder_fault` | same, but the gyro says the robot is NOT pivoting the way the encoders imply -- or a wheel runs the wrong way for 0.5 s -- or (in a spin) a wheel reads nothing and the IMU can't tell held from dead | the sensor, not the wheel |
-| `slip` | over 1 s the wheels turned the robot >= 20 deg but the gyro saw < 1/3.5 of it (a normal spin scrubs 1.6-2x; a robot held by a foot read 5x) | wheels turning, chassis not |
-| `bump` | a >= 0.6 g spike while driving, or a >= 0.35 g spike with wheel speed collapsing to < 40% in 0.3 s and the command held | hit something |
-
-- **Why the IMU decides stall vs encoder fault:** in the 10-03 line-follow runs (since removed) the right encoder read
-  exactly 0 for 25-58% of "commanded" samples while the robot drove fine. A stuck wheel makes the
-  chassis pivot (gyro agrees with the encoders); a dead encoder doesn't (gyro says straight).
-- **`encoder_fault` only stops encoder-dependent tools** (`drive_*`, `turn_degrees`, `jog`).
-  `perform` sets `encoders_required=False` -- a dead encoder is logged, a real
-  stall/slip/bump still stops it.
-- **Tuned on real data (runs since removed; see "Removed experiments"):** replaying 39 recorded
-  line-follow runs, camera-only mode tripped on exactly 2: `follow_run1` (the robot sat motionless for 5 s with the follower commanding
-  left -90) and `follow_newcam_run9b` (right wheel 6.8 -> 0 in/s in 0.1 s with a 0.35 g spike).
-  Neither looks false. Strict mode also reports 15 `encoder_fault` events, all on the dead-encoder runs.
-- **Not validated on a real obstacle yet.** Bump sensitivity in particular is set above normal
-  vibration (0.43 g peak), so a gentle bump at low speed may only be caught by the stall rule ~1.4 s
-  later. Treat the first live collision test as the real calibration.
-- **Modes:** `ELLAMA_MOTION_GUARD=on` (default) | `warn` (log events in `read_telemetry().motion`,
-  never stop -- use this to tune on a robot) | `off`. `set_guard("motion", mode=...)` changes
-  it live.
-- **Each detector switches off on its own:** `set_guard("motion", bump=false)` while pushing
-  something heavy (the push itself reads as an impact) leaves `stall` and `direction`
-  watching. Thresholds `stall_speed_in_s`, `slip_ratio`, `bump_hard_g`, `bump_soft_g` are
-  settable the same way. A detector whose sensor is absent simply never fires: with no IMU
-  there is no bump or slip detection, which `guards()` reports.
-- **Limits:** a robot that is moving fine but *should* stop (a person in front of it) is the
-  camera's job; wheels spinning with the robot not moving at all looks like a stall (good), but a
-  wheel that slips while the robot still moves is not detectable from encoders + IMU alone.
-- **Tests:** `python3 test_motion_guard.py` (synthetic scenarios, no hardware).
-
 ## Tests
 
 All offline, no robot needed:
@@ -376,7 +332,6 @@ All offline, no robot needed:
 ```
 ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_sensors.py       # 24: registry, policy, degraded modes
 ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_tilt_guard.py    # 14: + the send_drive choke point
-.venv/bin/python test_motion_guard.py                               # 16: replayed detector scenarios
 ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_drive_feedback.py # 35: encoder= selection, range approach, jog guard restore
 ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_phone_status.py  #  6
 ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_save_photo.py    #  6

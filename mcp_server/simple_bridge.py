@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """The smallest thing that lets a local model drive the robot.
 
-No approvals: whatever the model asks for runs immediately. The tilt guard is on, the
-motion guard is off. That is a controlled-environment setup -- nothing here stands between
-the model and the motors, so only run it somewhere a wrong move is harmless.
+No approvals: whatever the model asks for runs immediately. The tilt guard is on. That is a
+controlled-environment setup -- nothing here stands between the model and the motors, so
+only run it somewhere a wrong move is harmless.
 
     mcp_server/.venv/bin/python mcp_server/simple_bridge.py
     >>> jog forward slowly for a few seconds
@@ -54,7 +54,6 @@ answer it in one short sentence and call nothing. A question is never a reason t
 
 GUARDS = {
     "ELLAMA_TILT_GUARD": "on",      # keep: it is the one that catches a fall
-    "ELLAMA_MOTION_GUARD": "off",   # drop: no stall / slip / bump detection
 }
 
 
@@ -103,7 +102,7 @@ async def main():
                      for t in (await session.list_tools()).tools if t.name in TOOLS]
 
             print(f"{MODEL}, tools: {', '.join(TOOLS)}")
-            print("tilt guard ON, motion guard OFF, NO APPROVALS -- it just runs\n")
+            print("tilt guard ON, NO APPROVALS -- it just runs\n")
 
             while True:
                 try:

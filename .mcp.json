@@ -2,8 +2,7 @@
   "mcpServers": {
     "ellama-robot": {
       "command": "mcp_server/.venv/bin/python",
-      "args": ["mcp_server/robot_server.py"],
-      "env": { "ELLAMA_MOTION_GUARD": "on" }
+      "args": ["mcp_server/robot_server.py"]
     }
   }
 }

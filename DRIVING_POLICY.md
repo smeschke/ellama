@@ -169,8 +169,8 @@ formality: `["enc", "imu"]` is the robot's own closed-loop feedback,
 is watching — a ceiling camera and a marker, or a person with a hand on the
 stick. Requiring nothing when nothing is in fact watching is how you get an
 open-loop robot nobody is measuring. Guards follow the same logic: turn one
-off when it is wrong for the job (pushing something trips `bump` on the
-push itself), not because it is inconvenient.
+off when it is wrong for the job (a ramp the robot is meant to climb is a
+real lean to the tilt guard), not because it is inconvenient.
 
 **Example: noticing a stall the tool didn't report.** During a camera scan in
 35° in-place steps, one step took 5.9 s instead of ~1.9 s, and the wheel

@@ -299,47 +299,6 @@ def test_an_arc_whose_measuring_wheel_is_silent_says_which_one():
     assert "right encoder is not reporting" in out["error"], out
 
 
-# ---- jog, and what it leaves the motion guard set to ------------------------------------
-
-def test_a_bench_jog_puts_the_motion_guard_back_as_it_found_it():
-    link = bench_link()
-    link.motion.encoders_required = False   # as set_guard(encoders_required=false) leaves it
-    with Feeder(link, per_packet=(10, 0)):
-        out = rs.jog(40, 40, 0.05, True, warn_lights=False, require_telemetry=False)
-    assert out["ok"], out
-    # Forcing this back to True used to re-arm the encoder-fault latch behind the
-    # operator's back, so the next move tripped on a channel they had already dismissed.
-    assert link.motion.encoders_required is False, "jog must restore, not assume"
-
-
-def test_a_normal_jog_leaves_the_guard_armed():
-    link = bench_link()
-    link.motion.encoders_required = True
-    with Feeder(link, per_packet=(10, 10)):
-        out = rs.jog(40, 40, 0.05, True, warn_lights=False, require_telemetry=True)
-    assert out["ok"], out
-    assert link.motion.encoders_required is True, out
-
-
-def test_a_bench_jog_relaxes_the_guard_while_it_runs():
-    link = bench_link()
-    link.motion.encoders_required = True
-    seen = []
-
-    def watch():
-        for _ in range(40):
-            seen.append(link.motion.encoders_required)
-            time.sleep(0.01)
-
-    thread = threading.Thread(target=watch, daemon=True)
-    with Feeder(link, per_packet=(10, 0)):
-        thread.start()
-        rs.jog(40, 40, 0.15, True, warn_lights=False, require_telemetry=False)
-    thread.join(timeout=2)
-    assert False in seen, "bench mode must relax the latch while the wheels turn"
-    assert link.motion.encoders_required is True, "and hand it back afterwards"
-
-
 # ---- drive_until_range -----------------------------------------------------------------
 
 def feed_tof(link, name, values, ms):

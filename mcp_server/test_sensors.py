@@ -21,7 +21,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sensors as sensorlib  # noqa: E402
 import recording  # noqa: E402
 import tilt_guard as tg  # noqa: E402
-import motion_guard as mg  # noqa: E402
 import robot_server as rs  # noqa: E402
 
 bridge = rs.bridge
@@ -156,7 +155,6 @@ def make_link():
     link.sensors.set_stale_after("imu", rs.IMU_STALE_FAULT_S)
     link.policy = sensorlib.SensorPolicy()
     link.tilt = tg.TiltGuard(mode="off")      # not under test here
-    link.motion = mg.MotionGuard(mode="off")
     link.recorder = NoRecorder()
     link.last_imu = None
     return link
@@ -344,11 +342,6 @@ def test_guards_can_be_retuned_and_switched_off_at_runtime():
     link = make_link()
     ok, msg = link.tilt.configure(limit_deg=40)
     assert ok and link.tilt.limit_deg == 40, msg
-    ok, msg = link.motion.configure(checks={"bump": False})
-    assert ok and link.motion.checks["bump"] is False, msg
-    assert link.motion.checks["stall"] is True      # the others keep watching
-    ok, msg = link.motion.configure(checks={"nonsense": False})
-    assert not ok and "unknown detector" in msg, msg
 
 
 def test_switching_a_guard_off_suspends_it_without_erasing_what_it_saw():
@@ -372,11 +365,11 @@ def test_a_tripped_guard_still_blocks_when_every_sensor_is_present():
     link = make_link()
     encoders_live(link)
     imu_live(link)
-    link.motion.mode = "on"
-    link.motion.tripped = True
-    link.motion.fault = {"reason": "stall: wheel snagged"}
+    link.tilt = tg.TiltGuard()
+    link.tilt.tripped = True
+    link.tilt.fault = {"reason": "leaned 30 deg"}
     why = link._drive_refusal()
-    assert why and "motion guard tripped" in why, why
+    assert why and "tilt guard tripped" in why, why
 
 
 # ---- recording --------------------------------------------------------------------------

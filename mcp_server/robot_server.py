@@ -79,7 +79,6 @@ import recording  # noqa: E402  (mcp_server/recording.py)
 import hearing  # noqa: E402  (mcp_server/hearing.py)
 import perform as perform_show  # noqa: E402  (mcp_server/perform.py)
 import tilt_guard  # noqa: E402  (mcp_server/tilt_guard.py)
-import motion_guard  # noqa: E402  (mcp_server/motion_guard.py)
 
 from mcp.server.mcpserver import MCPServer as FastMCP  # mcp>=2.0 renamed FastMCP -> MCPServer
 from mcp.server.mcpserver import Image
@@ -348,23 +347,11 @@ TILT = tilt_guard.TiltGuard(limit_deg=TILT_LIMIT_DEG, lookahead_s=TILT_LOOKAHEAD
                             enabled=TILT_GUARD_ENABLED)
 
 
-# Motion guard (mcp_server/motion_guard.py): stall / encoder-fault / slip / bump -- the
-# sensors stopped agreeing with what was commanded. Same latch + choke point as the tilt guard.
-#   ELLAMA_MOTION_GUARD=on|warn|off   (default on; warn logs events without ever stopping)
-MOTION_MODE = os.environ.get("ELLAMA_MOTION_GUARD", "on").lower()
-if MOTION_MODE not in ("on", "warn", "off"):
-    MOTION_MODE = "on"
-MOTION = motion_guard.MotionGuard(
-    forward_pwm_sign=FORWARD_PWM_SIGN,
-    track_width_in=bridge.load_config()["track_width_in"],
-    mode=MOTION_MODE)
-
-
 class GuardFault(Exception):
-    """Raised by RobotLink.send_drive when a guard (tilt or motion) refuses a drive command.
+    """Raised by RobotLink.send_drive when the tilt guard refuses a drive command.
     Drive loops let it propagate: the tool's own `finally` sends the stop, and the tool returns
     the fault (see _tilt_guarded); autonomous threads end with reason "error: ... guard ...".
-    `info` carries a snapshot of both guards."""
+    `info` carries a snapshot of the guard."""
 
     def __init__(self, message, info=None):
         super().__init__(message)
@@ -425,7 +412,6 @@ class RobotLink:
         # there, ~20 ms after the offending IMU sample), so a line must never interleave.
         self._wlock = threading.RLock()
         self.tilt = TILT  # module-level: a latched fault and the level reference survive connect()
-        self.motion = MOTION  # likewise: connect() must not wipe a latched motion fault
         self.on_tilt_trip = None  # callable(fault_dict); set by the server to abort autonomous runs
 
         self._stop_pump = threading.Event()
@@ -465,8 +451,6 @@ class RobotLink:
                     self.sensors.observe("enc", (left, right), ms,
                                          available=list(self.enc.available), when=now)
                     self.recorder.on_enc(self.enc, self.orient, sl, sr)
-                    if sl is not None and sr is not None:
-                        tripped = self.motion.on_enc(sl, sr, now)
                 elif kind == "CMD":
                     self.recorder.on_cmd(*payload)  # the stick's command, overheard by the bridge
                 elif kind == "IMU":
@@ -477,8 +461,6 @@ class RobotLink:
                     self.last_imu = dict(ax=ax, ay=ay, az=az, gx=gx, gy=gy, gz=gz, ms=ms)
                     tripped = self.tilt.update(self.orient.pitch, self.orient.roll, ms,
                                                gyro_dps=math.hypot(dx, dy))
-                    mf = self.motion.on_imu(dz, agx, agy, now)
-                    tripped = tripped or mf
                 elif kind == "SENSOR":
                     # Any SensorPacket sender. Generic on the name on purpose: the name
                     # travels in the packet, so flashing a second ToF board as "TOF_REAR"
@@ -547,7 +529,7 @@ class RobotLink:
            required is reported in the result and never blocks.
         2. Has a guard that is switched on actually tripped? A trip is a measurement that
            something went wrong, so it stays latched until an operator looks at the robot
-           and calls clear_tilt_fault / clear_motion_fault.
+           and calls clear_tilt_fault.
 
         A guard whose sensor is absent is NOT a refusal. With no IMU there is no tilt
         guard, which sensors() states as a fact; whether to drive anyway was already
@@ -560,9 +542,6 @@ class RobotLink:
                     "that costs in sensors())"
                     % ("; ".join(self._missing_detail(n) for n in missing),
                        " / ".join(missing)))
-        m = self.motion
-        if m.mode != "off" and m.tripped:
-            return "motion guard tripped: " + m.fault["reason"]
         t = self.tilt
         if t.mode == "off":
             return None
@@ -588,16 +567,13 @@ class RobotLink:
                 if why is not None:
                     self.emergency_stop()
                     raise GuardFault(why, self._guard_info())
-            self.motion.on_command(left, right, time.monotonic())
             self.send_line(f"{left} {right}")
 
     def _guard_info(self):
-        """Both guards, each annotated with whether the sensor it reads is even present --
-        an "off" tilt guard and one with no IMU look identical without this."""
+        """The tilt guard, annotated with whether the sensor it reads is even present --
+        an "off" guard and one with no IMU look identical without this."""
         tilt = self.tilt.snapshot()
-        motion = self.motion.snapshot()
         imu_live = self.sensors.trusted_live("imu")
-        enc_live = self.sensors.trusted_live("enc")
         tilt["sensor"] = "imu"
         tilt["sensor_live"] = imu_live
         tilt["active"] = tilt["mode"] == "on" and imu_live and tilt["ready"]
@@ -605,20 +581,9 @@ class RobotLink:
             tilt["inactive_because"] = "no live IMU: nothing measures lean"
         elif not tilt["ready"]:
             tilt["inactive_because"] = "no level reference captured yet"
-        motion["sensors"] = ["enc", "imu"]
-        motion["sensor_live"] = {"enc": enc_live, "imu": imu_live}
-        motion["active"] = motion["mode"] == "on" and (enc_live or imu_live)
-        if not (enc_live or imu_live):
-            motion["inactive_because"] = "no live encoders or IMU: nothing to compare commands against"
-        elif not imu_live:
-            motion["inactive_because"] = "no live IMU: bump and slip detection are blind"
-        elif not enc_live:
-            motion["inactive_because"] = "no live encoders: stall and direction detection are blind"
-        return {"tilt": tilt, "motion": motion,
-                "policy": self.policy.snapshot(self.sensors)}
+        return {"tilt": tilt, "policy": self.policy.snapshot(self.sensors)}
 
     def send_stop(self):
-        self.motion.on_command(0, 0, time.monotonic())
         self.send_line("stop")
 
     def send_listen(self):
@@ -734,7 +699,6 @@ class RobotLink:
                 roll_deg=round(self.orient.roll, 2),
                 yaw_deg=round(self.orient.yaw, 2),
                 tilt=self.tilt.snapshot(),
-                motion=self.motion.snapshot(),
                 telemetry_age_s=None if age is None else round(age, 2),
                 telemetry_live=age is not None and age < TELEMETRY_STALE_S,
                 imu_age_s=None if imu_age is None else round(imu_age, 2),
@@ -1039,11 +1003,6 @@ def _tilt_gate():
                 "decide this run does not need it: set_required_sensors() lists what each one "
                 "costs. sensors() shows everything that IS reporting."
                 % " / ".join(missing))
-    elif link.motion.tripped and link.motion.mode != "off":
-        hint = ("look at the robot first -- something stopped it (see fault) -- then "
-                "clear_motion_fault(confirmed_safe=true) after asking the operator. If the "
-                "detector is wrong for this job (pushing something trips bump), "
-                "set_guard('motion', checks={'bump': false}) turns just that one off.")
     elif link.tilt.tripped:
         hint = ("if the robot is upright and still: clear_tilt_fault(confirmed_safe=true) after "
                 "asking the operator. On a slope the robot is meant to climb, "
@@ -1249,7 +1208,7 @@ def set_required_sensors(names: list[str], confirmed_safe: bool) -> dict:
 
 @mcp.tool()
 def guards() -> dict:
-    """Read-only. Both guards: mode, thresholds, whether the sensor each one reads is live,
+    """Read-only. The tilt guard: mode, thresholds, whether the IMU it reads is live,
     whether it has tripped and why. Does not move the robot.
 
     A guard reporting active=false with inactive_because set is not broken -- it has no
@@ -1263,54 +1222,31 @@ def guards() -> dict:
 
 @mcp.tool()
 def set_guard(
-    name: Literal["tilt", "motion"],
+    name: Literal["tilt"] = "tilt",
     mode: Optional[Literal["on", "warn", "off"]] = None,
     limit_deg: Optional[float] = None,
     lookahead_s: Optional[float] = None,
-    stall: Optional[bool] = None,
-    direction: Optional[bool] = None,
-    slip: Optional[bool] = None,
-    bump: Optional[bool] = None,
-    stall_speed_in_s: Optional[float] = None,
-    slip_ratio: Optional[float] = None,
-    bump_hard_g: Optional[float] = None,
-    bump_soft_g: Optional[float] = None,
-    encoders_required: Optional[bool] = None,
 ) -> dict:
-    """Turn a guard (or one of the motion guard's detectors) on or off and retune it, while
-    running. Does not move the robot.
+    """Turn the tilt guard on or off and retune it, while running. Does not move the robot.
 
     `mode` is "on" (trips and latches), "warn" (records what it would have tripped on and
     never stops the robot -- use this to tune on a real robot) or "off".
 
-    tilt:   limit_deg (default 25), lookahead_s. Raise limit_deg for a ramp the robot is
-            meant to climb; the guard measures lean from where it was level, so a ramp is a
-            real lean to it.
-    motion: the four detectors stall / direction / slip / bump switch on and off
-            individually, plus stall_speed_in_s, slip_ratio, bump_hard_g, bump_soft_g.
-            Pushing something heavy trips bump on the push itself -- turn bump off for that
-            job and leave stall and direction watching. encoders_required=false stops an
-            encoder fault from latching on a run that does not use the encoders.
+    limit_deg (default 25) and lookahead_s are the thresholds. Raise limit_deg for a ramp
+    the robot is meant to climb; the guard measures lean from where it was level, so a ramp
+    is a real lean to it.
 
-    What this deliberately does NOT do: clear a latched fault. Switching a guard off
+    What this deliberately does NOT do: clear a latched fault. Switching the guard off
     suspends its enforcement, but what it saw stays on the record and comes back if you
-    switch it on again. Only clear_tilt_fault / clear_motion_fault release a latch, and
-    they require the operator to have actually looked at the robot.
+    switch it on again. Only clear_tilt_fault releases a latch, and it requires the
+    operator to have actually looked at the robot.
 
     Changes are written into any active recording, so a run's CSV shows the guard config it
     was driven under.
     """
     if link is None:
         return _not_connected()
-    if name == "tilt":
-        ok, msg = link.tilt.configure(mode=mode, limit_deg=limit_deg, lookahead_s=lookahead_s)
-    else:
-        checks = {k: v for k, v in (("stall", stall), ("direction", direction),
-                                    ("slip", slip), ("bump", bump)) if v is not None}
-        ok, msg = link.motion.configure(
-            mode=mode, checks=checks or None, encoders_required=encoders_required,
-            stall_speed_in_s=stall_speed_in_s, slip_ratio=slip_ratio,
-            bump_hard_g=bump_hard_g, bump_soft_g=bump_soft_g)
+    ok, msg = link.tilt.configure(mode=mode, limit_deg=limit_deg, lookahead_s=lookahead_s)
     if not ok:
         return {"ok": False, "error": msg, "guards": link._guard_info()}
     link.recorder.on_config("%s guard: %s" % (name, msg))
@@ -1360,25 +1296,6 @@ def clear_tilt_fault(confirmed_safe: bool) -> dict:
     with link.lock:
         ok, msg = link.tilt.clear()
     return {"ok": ok, "message": msg, "tilt_guard": link.tilt.snapshot()}
-
-
-@mcp.tool()
-def clear_motion_fault(confirmed_safe: bool) -> dict:
-    """Release the motion guard after it stopped the robot because the sensors stopped matching
-    the commands: a wheel commanded to turn that wasn't (stall), an encoder not producing what
-    the gyro says it should (encoder_fault), wheels turning while the chassis wasn't (slip), or
-    an impact (bump). Every drive tool is refused until this is called. Does not move the robot.
-    Set confirmed_safe=true only after the human operator has LOOKED at the robot and what it
-    was doing -- the fault says what the data looked like, not what is in the way -- and said
-    it is clear. For an `encoder_fault` the cause is the sensor, so check the encoder (magnet
-    gap, wiring) before driving something that depends on it again."""
-    if link is None:
-        return _not_connected()
-    if not confirmed_safe:
-        return {"ok": False, "error": "confirmed_safe must be true, set only after the operator "
-                "has looked at the robot and says it is clear", "motion_guard": link.motion.snapshot()}
-    ok, msg = link.motion.clear()
-    return {"ok": ok, "message": msg, "motion_guard": link.motion.snapshot()}
 
 
 @mcp.tool()
@@ -2711,10 +2628,7 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool,
     insists on live encoders only if "enc" is in the required set, which it is by default.
     Pass True or False to override for one call -- False ONLY for a bench test the operator
     is watching (e.g. robot on blocks while the encoder link is down): it still needs
-    confirmed_safe, and the distances come back as null. False also relaxes the motion
-    guard's encoder-fault latch for the duration of the move, since there are no encoders
-    to fault on; whatever the latch was set to before is put back afterwards, so a jog
-    never re-arms a check the operator switched off with set_guard().
+    confirmed_safe, and the distances come back as null.
     """
     if link is None:
         return _not_connected()
@@ -2742,19 +2656,11 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool,
 
     start = link.last_counts()
     t_start = time.monotonic()
-    # Bench mode (require_telemetry=false) has no encoders to fault on, so relax the
-    # motion guard for the duration -- but only ever relax it, and put back exactly what
-    # was there. Forcing it back to True on the way out used to silently undo an
-    # operator's set_guard(encoders_required=false), re-arming the encoder-fault latch
-    # behind their back on the next move.
-    prior_encoders_required = link.motion.encoders_required
-    link.motion.encoders_required = prior_encoders_required and bool(require_telemetry)
     try:
         while time.monotonic() - t_start < duration_s:
             link.send_drive(left_pwm, right_pwm)
             time.sleep(min(DRIVE_KEEPALIVE_S, max(0.0, duration_s - (time.monotonic() - t_start))))
     finally:
-        link.motion.encoders_required = prior_encoders_required
         link.send_stop()
         _lights_restore(prior_lights)
         time.sleep(STOP_SETTLE_S)
@@ -3264,8 +3170,6 @@ def _perform_loop(show, rend, dance, brightness, lead_in_s, start_s, end_s, audi
     lead_sec = None
     t = start_s
     lnk = link
-    if lnk is not None and dance:
-        lnk.motion.encoders_required = bool(require_telemetry)  # open-loop: encoders optional
     try:
         _mouth.acquire(brightness)
         if dance:
@@ -3328,7 +3232,6 @@ def _perform_loop(show, rend, dance, brightness, lead_in_s, start_s, end_s, audi
         reason = f"error: {e}"
     finally:
         if lnk is not None and dance:
-            lnk.motion.encoders_required = True
             try:
                 lnk.send_stop()
             except Exception:

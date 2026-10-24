@@ -18,7 +18,6 @@ from pathlib import Path
 os.environ.setdefault("ELLAMA_SERIAL_PORT", "/dev/none_for_tests")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tilt_guard as tg  # noqa: E402
-import motion_guard as mg  # noqa: E402
 
 MOUNT = (1.0, -7.5)  # the IMU rests like this on a flat floor (pitch, roll), as measured
 
@@ -174,7 +173,6 @@ def make_link(rs, **guard_kw):
     link._wlock = threading.RLock()
     link.ser = FakeSer()
     link.tilt = tg.TiltGuard(**guard_kw)
-    link.motion = mg.MotionGuard()
     link.sensors = sensorlib.SensorRegistry(rs.TELEMETRY_STALE_S)
     link.sensors.set_stale_after("imu", rs.IMU_STALE_FAULT_S)
     link.policy = sensorlib.SensorPolicy()      # the default: enc + imu
@@ -260,41 +258,13 @@ def test_tool_returns_fault_instead_of_raising():
         rs.link = None
 
 
-def test_motion_guard_through_the_link():
-    import robot_server as rs
-    link = make_link(rs, enabled=False)   # tilt guard off: isolate the motion guard
-    link.motion = mg.MotionGuard(forward_pwm_sign=rs.FORWARD_PWM_SIGN)
-    # commands reach the guard, and a stop resets it
-    link.send_drive(-60, -60)
-    assert link.motion.cmd == (-60, -60)
-    link.send_stop()
-    assert link.motion.cmd == (0, 0)
-    # a stall latched in the motion guard blocks the next drive with a "motion guard" message,
-    # and what goes on the wire is "stop"
-    link.motion.on_command(-70, -70, 0.0)
-    for i in range(1, 120):
-        link.motion.on_enc(0.0, 0.0, i * 0.02)
-    assert link.motion.tripped and link.motion.fault["kind"] == "stall", link.motion.fault
-    n = len(link.ser.lines)
-    try:
-        link.send_drive(-60, -60)
-        assert False, "must refuse"
-    except rs.GuardFault as e:
-        assert "motion guard tripped" in str(e) and "stall" in str(e), str(e)
-        assert set(e.info) == {"tilt", "motion", "policy"}, e.info
-    assert link.ser.lines[n:] == ["stop"]
-    link.send_drive(0, 0)  # zero always goes out
-    ok, _ = link.motion.clear()
-    assert ok
-    link.send_drive(-60, -60)  # and drives again after the operator clears it
-
-
 def test_server_registers_the_guard_tools():
     import asyncio
     import robot_server as rs
     names = {t.name for t in asyncio.run(rs.mcp.list_tools())}
-    assert {"clear_tilt_fault", "clear_motion_fault", "set_level_reference",
+    assert {"clear_tilt_fault", "set_level_reference",
             "sensors", "read_range", "set_required_sensors", "guards", "set_guard"} <= names, names
+    assert "clear_motion_fault" not in names, "the motion guard is gone"
 
 
 # ---- replay recorded runs -----------------------------------------------------------

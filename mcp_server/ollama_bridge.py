@@ -160,7 +160,6 @@ async def main():
     here = os.path.dirname(os.path.abspath(__file__))
     params = StdioServerParameters(
         command=sys.executable, args=[os.path.join(here, "robot_server.py")],
-        env={**os.environ, "ELLAMA_MOTION_GUARD": "on"},
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
