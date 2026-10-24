@@ -41,12 +41,13 @@ The stick controller and the computer bridge send the same drive packet over ESP
 4. Drive it with the stick controller. No computer needed.
 5. To drive from a computer, flash `computer_bridge` on a spare ESP32 and send `<left> <right>` lines over serial.
 6. To check the encoders and IMU, run [`calibration/live_view.py`](calibration/README.md).
+7. To let an AI agent drive it, set up [`mcp_server/`](mcp_server/README.md) and read [`DRIVING_POLICY.md`](DRIVING_POLICY.md) first.
 
 ## Status
 
-**Works:** manual driving, computer driving through the bridge, encoder and IMU telemetry, calibration tools and the calibrated simulator.
+**Works:** manual driving, computer driving through the bridge, encoder and IMU telemetry, calibration tools, the calibrated simulator, and agent driving through the MCP server with encoder- and IMU-closed-loop moves.
 
-**Not there yet:** a single main board (the encoders and IMU are still separate ESP32 prototypes), 24 V support, an emergency stop beyond the power switch, obstacle sensing, and published KiCad source and printed-part files.
+**Not there yet:** a single main board (the encoders and IMU are still separate ESP32 prototypes), 24 V support, an emergency stop beyond the power switch, and published KiCad source and printed-part files. The agent side changes often and is not a product.
 
 ## Repo layout
 
@@ -59,12 +60,24 @@ The stick controller and the computer bridge send the same drive packet over ESP
 | [`simulation/`](simulation/) | Calibrated 2D/3D drive simulators and a CSV replay script |
 | [`images/`](images/) | Photos, dimensions and wiring diagrams |
 | [`ROBOT_CHARACTERIZATION.md`](ROBOT_CHARACTERIZATION.md) | Measured speed, turning, stopping and drift |
+| [`mcp_server/`](mcp_server/) | MCP server that lets an AI agent drive by encoder feedback ("go forward 10 inches"), with a live sensor inventory the agent decides from, switchable motion and tilt guards, recording, voice and lights |
+| [`DRIVING_POLICY.md`](DRIVING_POLICY.md) | Rules anything driving the robot must follow. Read it first. |
+| [`teleop/`](teleop/) | Network driving, video and lidar client/server scripts for an onboard Pi |
+| [`phone/`](phone/) | Phone camera and display |
+| [`tools/`](tools/) | Speed and turn characterization sweeps that drive through the MCP server, and ArUco tag detection |
+| `recordings/` | Run recordings the server writes. Not committed. |
 
-## Built on eLlama
+## Driving it with an AI
 
-- [**droid**](https://github.com/smeschke/droid): my personal robot, an eLlama driven by an AI agent through an MCP server. It uses the platform the same way any owner would, through the computer bridge and telemetry.
+The same robot, driven by an agent instead of a hand: [`mcp_server/`](mcp_server/README.md)
+exposes closed-loop tools over MCP, so "go forward 10 inches" stops on encoder ticks and
+"turn 90 degrees left" stops on IMU gyro yaw, rather than running the motors for a guessed
+number of seconds. It uses the platform the way any owner would — through the computer
+bridge, `calibration/bridge.py` and whatever sensors happen to be transmitting.
+[`mcp_server/TECHNICAL_NOTE.md`](mcp_server/TECHNICAL_NOTE.md) has the measured results and
+the safeguards; [`DRIVING_POLICY.md`](DRIVING_POLICY.md) has the rules.
 
-Built something on eLlama? Open an issue or a pull request to add it here.
+Built something on eLlama? Open an issue or a pull request.
 
 ## License
 

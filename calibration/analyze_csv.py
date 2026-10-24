@@ -65,7 +65,7 @@ def summarize(cols, enc_idx):
     src = cols["source"]
     print(f"{len(t)} rows over {t[-1] - t[0]:.1f} s "
           f"({len(enc_idx)} encoder, {src.count('IMU')} imu samples)")
-    # MARK / PHOTO rows come from the MCP server's recorder (in the droid repo).
+    # MARK / PHOTO rows come from the MCP server's recorder (mcp_server/recording.py).
     notes = [i for i, s_ in enumerate(src) if s_ in ("MARK", "PHOTO")]
     if notes:
         print("\nmarkers:")
