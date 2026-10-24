@@ -40,7 +40,8 @@ class FakeLink:
 
 
 class Patched:
-    """Point PHOTO_DIR at a temp dir, fake the fetch and the link; restore on exit."""
+    """Point PHOTO_DIR at a temp dir, fake the fetch (it takes a lens now) and the
+    link; restore on exit."""
     def __init__(self, fetch, link=None):
         self.fetch, self.link = fetch, link
 
@@ -56,7 +57,7 @@ class Patched:
 
 
 def test_saves_file_sidecar_and_gitignore_without_a_robot():
-    with Patched(lambda: jpeg()) as d:
+    with Patched(lambda lens=None: jpeg()) as d:
         r = rs.save_photo(name="front door!")
         assert r["ok"] and r["robot"] is None and r["moved_during_capture"] is None, r
         p = Path(r["path"])
@@ -68,13 +69,13 @@ def test_saves_file_sidecar_and_gitignore_without_a_robot():
 
 
 def test_two_photos_in_one_second_do_not_overwrite():
-    with Patched(lambda: jpeg()):
+    with Patched(lambda lens=None: jpeg()):
         a, b = rs.save_photo()["path"], rs.save_photo()["path"]
         assert a != b and Path(a).exists() and Path(b).exists()
 
 
 def test_brightness_reports_a_dark_scene():
-    with Patched(lambda: jpeg((8, 8, 8))):
+    with Patched(lambda lens=None: jpeg((8, 8, 8))):
         assert rs.save_photo()["brightness"] < 20
 
 
@@ -82,10 +83,10 @@ def test_records_pose_and_detects_motion_during_the_fetch():
     link = FakeLink()
     link.enc.dist_l = link.enc.dist_r = 10.0
 
-    def still():
+    def still(lens=None):
         return jpeg()
 
-    def moving():
+    def moving(lens=None):
         link.enc.dist_l += 1.0
         link.enc.dist_r += 1.0
         return jpeg()
@@ -98,7 +99,7 @@ def test_records_pose_and_detects_motion_during_the_fetch():
         assert rs.save_photo()["moved_during_capture"] is True
     link.orient.yaw = 0.0
 
-    def turning():
+    def turning(lens=None):
         link.orient.yaw += 5.0
         return jpeg()
 
@@ -107,7 +108,7 @@ def test_records_pose_and_detects_motion_during_the_fetch():
 
 
 def test_camera_failure_is_an_error_and_writes_nothing():
-    def boom():
+    def boom(lens=None):
         raise RuntimeError("the camera app is up at X but its photo endpoint returned no image")
 
     with Patched(boom) as d:
@@ -117,7 +118,7 @@ def test_camera_failure_is_an_error_and_writes_nothing():
 
 
 def test_preview_returns_the_picture_and_the_json():
-    with Patched(lambda: jpeg(size=(1000, 500))):
+    with Patched(lambda lens=None: jpeg(size=(1000, 500))):
         out = rs.save_photo(preview_width=400)
         assert isinstance(out, list) and len(out) == 2
         meta = json.loads(out[0])

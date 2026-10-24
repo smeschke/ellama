@@ -36,8 +36,9 @@ Env (all of these are startup defaults; the sensor and guard ones are settable a
                              via calibration/bridge.py's port picker.
     ELLAMA_REQUIRED_SENSORS  comma/space separated sensors the drive tools insist on;
                              default "enc,imu". Set it empty to require none.
-    ELLAMA_CAM_URL           explicit IP Webcam base URL (e.g. https://192.168.0.50:4444);
-                             default scans the local /24 subnet for the phone.
+    ELLAMA_CAM_URL           the robot phone's camera address (e.g. 192.168.0.50, or
+                             https://192.168.0.50:4444). Optional: set_camera() gives it
+                             at runtime instead. Never searched for.
 """
 
 import array
@@ -60,7 +61,6 @@ import time
 import urllib.request
 import wave
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Literal, Optional
@@ -779,18 +779,30 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
-# Phone camera (Android IP-camera app) -- read-only vision, never moves the robot.
-# Camera images are advisory: they do NOT replace the confirmed_safe gate above.
+# Phone camera -- read-only vision, never moves the robot. Camera images are advisory:
+# they do NOT replace the confirmed_safe gate above.
+#
+# ONE device. The robot carries a single Android phone running "Android IP Camera", and
+# its address is handed to this server at runtime (set_camera, or ELLAMA_CAM_URL at
+# startup). Nothing here searches the network for it and nothing remembers it between
+# runs: an address that is wrong is an error to fix, not something to go hunting for.
+#
+# That one phone has two lenses, chosen with lens="back" (the main camera, pointing where
+# the robot drives) or lens="front". The app serves ONE of them at a time, so choosing a
+# lens is a state change on the phone, not a per-request parameter -- see _select_lens.
 # ---------------------------------------------------------------------------
 
-CAM_PORTS = (8080, 4444)  # IP Webcam's default, and the one this phone is set to
-# Single-JPEG endpoints of the apps we know: "Android IP Camera" (what this phone runs, over
-# https on 4444; a snapshot takes ~5-8s) and Pavel Khlebovich's "IP Webcam".
-CAM_SNAPSHOT_PATHS = ("/video/snapshot", "/shot.jpg")
-# Live MJPEG endpoints of the same apps, tried in order: "Android IP Camera" (what this phone
-# runs; ~15 fps at 360x480 as of 2026-10-02) and IP Webcam.
-CAM_STREAM_PATHS = ("/video/mjpeg", "/video")
-CAM_PROBE_TIMEOUT_S = 8       # finding the camera / grabbing a stream frame: usually ~1-3 s
+CAM_DEFAULT_SCHEME = "https"  # the app serves TLS on 4444 with a self-signed cert
+CAM_DEFAULT_PORT = 4444
+CAM_SNAPSHOT_PATH = "/video/snapshot"   # full-res still; takes ~1-8 s
+CAM_STREAM_PATH = "/video/mjpeg"        # live MJPEG; ~15 fps at 360x480
+CAM_INFO_PATH = "/info.json"            # battery, torch, current lens
+# The app takes settings as query parameters on / the way the torch does (/?torch=on).
+# NOT yet verified against the phone: if lens switching answers but the picture does not
+# change, these two lines are the only thing to correct.
+CAM_LENS_PARAM = "camera"
+CAM_LENS_VALUES = {"back": "back", "front": "front"}
+CAM_LENS_SETTLE_S = 1.0       # the app reopens the camera; an immediate grab is the old lens
 CAM_SNAPSHOT_TIMEOUT_S = 12   # a full-res still takes ~1-8 s; past this the photo has failed
 CAM_MAX_WIDTH = 1280
 
@@ -800,9 +812,9 @@ AUTO_PHOTO_STILL_SPEED_IN_S = 0.5
 AUTO_PHOTO_MIN_TRAVEL_IN = 4.0    # summed |left|+|right| wheel travel since the last photo
 AUTO_PHOTO_MIN_TURN_DEG = 10.0    # or this much IMU yaw change
 AUTO_PHOTO_POLL_S = 0.1
-_cam = None  # cached (base_url, snapshot_path) once found
-CAM_CACHE_FILE = Path.home() / ".cache" / "ellama" / "camera_url"  # last address the phone answered on
-# IP Webcam's optional TLS uses a self-signed cert, so verification is off -- acceptable
+_cam = None        # the phone's base URL, once someone has given it to us
+_cam_lens = None   # the lens the phone was last told to use ("back"/"front"), or None
+# The camera app's TLS uses a self-signed cert, so verification is off -- acceptable
 # for a read-only camera on the home LAN, and this context is used for nothing else.
 _cam_ssl = ssl.create_default_context()
 _cam_ssl.check_hostname = False
@@ -815,115 +827,59 @@ def _cam_open(url, timeout):
 _cam_lock = threading.Lock()
 
 
-def _local_ip():
-    """Primary LAN IP, via the connect-a-UDP-socket trick (sends no packets)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def _normalize_cam_url(text):
+    """"192.168.0.54" -> "https://192.168.0.54:4444". Takes a bare IP or host, a host:port,
+    or a full URL, and fills in the scheme and port this app uses. Raises ValueError on
+    something that is not an address."""
+    from urllib.parse import urlparse
+    raw = (text or "").strip().rstrip("/")
+    if not raw:
+        raise ValueError("no address given")
+    u = urlparse(raw if "://" in raw else f"{CAM_DEFAULT_SCHEME}://{raw}")
+    if not u.hostname:
+        raise ValueError("%r is not an address I can use -- try 192.168.0.54 or "
+                         "https://192.168.0.54:4444" % text)
+    return f"{u.scheme}://{u.hostname}:{u.port or CAM_DEFAULT_PORT}"
+
+
+if os.environ.get("ELLAMA_CAM_URL", "").strip():
     try:
-        s.connect(("10.255.255.255", 1))
-        return s.getsockname()[0]
-    finally:
-        s.close()
+        _cam = _normalize_cam_url(os.environ["ELLAMA_CAM_URL"])
+    except ValueError as e:
+        raise SystemExit("ELLAMA_CAM_URL: %s" % e)
 
 
-def _read_jpeg(r, limit=2_000_000):
-    """The first complete JPEG in a file-like (a bare JPEG or a multipart MJPEG stream), else None."""
-    buf = b""
-    while len(buf) < limit:
-        chunk = r.read(8192)
-        if not chunk:
-            break
-        buf += chunk
-        a = buf.find(b"\xff\xd8")
-        if a >= 0:
-            b = buf.find(b"\xff\xd9", a + 2)
-            if b >= 0:
-                return buf[a:b + 2]
-    return None
-
-
-def _probe(base):
-    """The snapshot path of the camera app on base, else None. The app is recognised by its
-    live stream returning a JPEG, which is quick even when the single-photo endpoint is slow
-    or wedged (the two path tuples are in the same app order)."""
-    for snap, stream in zip(CAM_SNAPSHOT_PATHS, CAM_STREAM_PATHS):
-        try:
-            with _cam_open(base + stream, CAM_PROBE_TIMEOUT_S) as r:
-                if _read_jpeg(r) is not None:
-                    return snap
-        except Exception:
-            pass
-    for snap in CAM_SNAPSHOT_PATHS:   # an app with no stream: fall back to the photo itself
-        try:
-            with _cam_open(base + snap, CAM_SNAPSHOT_TIMEOUT_S) as r:
-                if r.read(2) == b"\xff\xd8":
-                    return snap
-        except Exception:
-            pass
-    return None
-
-
-def _discover_camera():
-    """Scan the local /24 for a phone camera server: cheap TCP connect on each candidate
-    port of every host first, then verify (http, then https) only the ones that answered.
-    Returns (base_url, snapshot_path)."""
-    prefix = _local_ip().rsplit(".", 1)[0]
-
-    def port_open(hp):
-        try:
-            with socket.create_connection(hp, timeout=1.5):  # phones on Wi-Fi are slow to wake
-                return hp
-        except OSError:
-            return None
-
-    targets = [(f"{prefix}.{i}", p) for i in range(1, 255) for p in CAM_PORTS]
-    with ThreadPoolExecutor(max_workers=128) as ex:
-        open_targets = [t for t in ex.map(port_open, targets) if t]
-    for host, port in open_targets:
-        for scheme in ("https", "http"):
-            base = f"{scheme}://{host}:{port}"
-            path = _probe(base)
-            if path:
-                return base, path
-    raise RuntimeError(
-        f"no phone camera found on {prefix}.0/24 ports {CAM_PORTS} -- is the app's server "
-        "started and the phone on the same Wi-Fi? Or set ELLAMA_CAM_URL."
-    )
-
-
-def _saved_camera():
-    """(base_url, snapshot_path) from the last time the phone was found, trusted as is: a
-    stale one fails its first fetch and _fetch_snapshot rediscovers. Skips the /24 scan,
-    which takes ~6 s and seems to stall the phone's camera server."""
-    try:
-        base, path = CAM_CACHE_FILE.read_text().split()
-    except (OSError, ValueError):
-        return None
-    return base, path
-
-
-def _save_camera(cam):
-    try:
-        CAM_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CAM_CACHE_FILE.write_text(f"{cam[0]} {cam[1]}\n")
-    except OSError:
-        pass
-
-
-def _camera(rediscover=False):
-    """(base_url, snapshot_path): the saved address if it still answers, else a subnet
-    scan; cached for the life of the process."""
-    global _cam
+def _camera():
+    """The phone's base URL, or a RuntimeError saying nobody has given one. This server does
+    not scan the network and does not remember an address between runs."""
     with _cam_lock:
-        if rediscover:
-            _cam = None
         if _cam is None:
-            explicit = os.environ.get("ELLAMA_CAM_URL", "").rstrip("/")
-            if explicit:
-                _cam = (explicit, _probe(explicit) or CAM_SNAPSHOT_PATHS[0])
-            else:
-                _cam = (None if rediscover else _saved_camera()) or _discover_camera()
-                _save_camera(_cam)
+            raise RuntimeError(
+                "no phone camera address set: call set_camera('192.168.0.54') with the "
+                "address the camera app is showing on the phone, or start the server with "
+                "ELLAMA_CAM_URL")
         return _cam
+
+
+def _select_lens(lens):
+    """Point the phone at one of its two lenses, and return the lens in use.
+
+    The app serves one lens at a time, so this is a state change on the phone that outlives
+    the call: a front-lens still leaves the phone on the front lens until something switches
+    it back. There is therefore no way to read both lenses at the same moment, and no way to
+    run a front and a rear stream at once. lens=None means "whatever it is already on".
+    """
+    global _cam_lens
+    if lens is None:
+        return _cam_lens
+    if lens not in CAM_LENS_VALUES:
+        raise ValueError("lens must be 'front' or 'back', not %r" % (lens,))
+    if _cam_lens == lens:
+        return lens
+    _phone_get("/?%s=%s" % (CAM_LENS_PARAM, CAM_LENS_VALUES[lens]))
+    _cam_lens = lens
+    time.sleep(CAM_LENS_SETTLE_S)
+    return lens
 
 
 def _reachable(base, timeout=2.0):
@@ -938,46 +894,40 @@ def _reachable(base, timeout=2.0):
         return False
 
 
-def _fetch_snapshot():
+def _fetch_snapshot(lens=None):
     """A full-res JPEG from the phone's photo endpoint, or a RuntimeError saying why not. It
-    never substitutes a frame of the live stream. If the cached address is dead (phone got a
-    new DHCP lease) it rediscovers once and retries; if the address answers but the photo does
-    not come back, that is reported as is, without a rescan."""
-    last = None
-    for attempt in (0, 1):
-        try:
-            base, path = _camera(rediscover=attempt == 1)
-        except Exception as e:
-            last = e
-            continue
-        try:
-            with _cam_open(base + path, CAM_SNAPSHOT_TIMEOUT_S) as r:
-                img = r.read()
-            if img[:2] == b"\xff\xd8":
-                return img
-            last = RuntimeError(f"{base}{path} did not return a JPEG")
-        except Exception as e:
-            last = e
+    never substitutes a frame of the live stream. `lens` switches the phone first and leaves
+    it there (see _select_lens)."""
+    base = _camera()
+    _select_lens(lens)
+    try:
+        with _cam_open(base + CAM_SNAPSHOT_PATH, CAM_SNAPSHOT_TIMEOUT_S) as r:
+            img = r.read()
+    except Exception as e:
         if _reachable(base):
             raise RuntimeError(
-                f"the camera app is up at {base} but its photo endpoint ({path}) returned no "
-                f"image within {CAM_SNAPSHOT_TIMEOUT_S} s ({last}); look() does not fall back to "
-                "the live stream. Try restarting the camera app on the phone.")
-    raise RuntimeError(f"camera fetch failed: {last}")
+                f"the camera app is up at {base} but its photo endpoint "
+                f"({CAM_SNAPSHOT_PATH}) returned no image within {CAM_SNAPSHOT_TIMEOUT_S} s "
+                f"({e}); look() does not fall back to the live stream. Try restarting the "
+                "camera app on the phone.")
+        raise RuntimeError(
+            f"nothing answered at {base} ({e}) -- check the phone is awake and on this "
+            "Wi-Fi, and that set_camera() was given the address the app shows.")
+    if img[:2] != b"\xff\xd8":
+        raise RuntimeError(f"{base}{CAM_SNAPSHOT_PATH} did not return a JPEG")
+    return img
 
 
-def _open_stream():
-    """Open the phone's MJPEG stream (for recording). Rediscovers the phone once if the
-    cached address is stale. Returns a file-like to read multipart MJPEG from."""
-    last = None
-    for attempt in (0, 1):
-        base, _ = _camera(rediscover=attempt == 1)
-        for path in CAM_STREAM_PATHS:
-            try:
-                return _cam_open(base + path, 10)
-            except Exception as e:
-                last = e
-    raise RuntimeError(f"no video stream: {last}")
+def _stream_url(lens=None):
+    """The phone's MJPEG URL, with the phone switched to `lens` first."""
+    base = _camera()
+    _select_lens(lens)
+    return base + CAM_STREAM_PATH
+
+
+def _open_stream(lens=None):
+    """Open the phone's MJPEG stream (for recording). Returns a file-like of multipart MJPEG."""
+    return _cam_open(_stream_url(lens), 10)
 
 
 _run = {"running": False, "abort": threading.Event(), "status": "idle", "info": {}, "result": None,
@@ -1344,10 +1294,18 @@ def listen() -> dict:
 
 
 @mcp.tool()
-def look(width: int = 640):
+def look(width: int = 640, lens: Optional[Literal["back", "front"]] = None):
     """Read-only. Take a photo with the phone camera mounted on the robot and return it, so
     you can see what the robot currently sees. Never moves the robot, no confirmation
-    needed. The phone is found automatically on the local network (or via ELLAMA_CAM_URL).
+    needed. The phone's address comes from set_camera() or ELLAMA_CAM_URL -- this server
+    does not search for it.
+
+    `lens` picks which of the one phone's two cameras to use: "back" is the main camera
+    pointing where the robot drives, "front" is the selfie camera. The phone serves one at
+    a time, so this SWITCHES it and leaves it switched -- the next look() with no `lens`
+    uses whichever it was left on (phone_status() reports which). Omit it to use the current
+    one and save ~1 s.
+
     A full-res photo takes ~1-8 seconds; if the phone's photo endpoint does not return one
     within 12 s this returns an error (it never substitutes a frame of the live video
     stream). `width` downsizes the image (default 640, max 1280) to keep it cheap. This is advisory vision only -- a JPEG glance is not an obstacle sensor, so it
@@ -1355,7 +1313,7 @@ def look(width: int = 640):
     picture as a file on this computer."""
     width = max(64, min(int(width), CAM_MAX_WIDTH))
     try:
-        img = PILImage.open(BytesIO(_fetch_snapshot()))
+        img = PILImage.open(BytesIO(_fetch_snapshot(lens)))
         if img.width > width:
             img = img.resize((width, round(img.height * width / img.width)))
         buf = BytesIO()
@@ -1478,34 +1436,89 @@ PHONE_LOW_BATTERY_PCT = 20
 
 
 def _phone_get(path, timeout=6.0):
-    """Body of GET <camera base><path>. A dead cached address (new DHCP lease) is rediscovered
-    once, the same way _fetch_snapshot does."""
-    last = None
-    for attempt in (0, 1):
-        try:
-            base, _ = _camera(rediscover=attempt == 1)
-            with _cam_open(base + path, timeout) as r:
-                return r.read()
-        except Exception as e:
-            last = e
-    raise RuntimeError(f"phone camera app did not answer {path}: {last}")
+    """Body of GET <camera base><path>."""
+    base = _camera()
+    try:
+        with _cam_open(base + path, timeout) as r:
+            return r.read()
+    except Exception as e:
+        raise RuntimeError(f"the phone camera app at {base} did not answer {path}: {e}")
 
 
 def _phone_info():
-    info = json.loads(_phone_get("/info.json"))
-    torch = (info.get("settings") or {}).get("torch")
+    info = json.loads(_phone_get(CAM_INFO_PATH))
+    settings = info.get("settings") or {}
+    torch = settings.get("torch")
+    reported_lens = settings.get(CAM_LENS_PARAM)
     return {
         "battery_percent": info.get("batteryPercent"),
         "torch_on": None if torch is None else str(torch).lower() in ("on", "true", "1"),
+        # what the app says it is pointing at, falling back to what we last told it
+        "lens": str(reported_lens).lower() if reported_lens is not None else _cam_lens,
     }
 
 
 @mcp.tool()
+def set_camera(address: str) -> dict:
+    """Tell the server where the robot's phone is, while it is running. Never moves the
+    robot, no confirmation needed.
+
+    `address` is what the camera app shows on the phone: a bare IP ("192.168.0.54"), a
+    host:port, or a full URL. Missing pieces are filled in with https and port 4444, which
+    is what this app serves. The address is used as given -- nothing is scanned for and
+    nothing is remembered after the server stops, so call this once at the start of a
+    session (or set ELLAMA_CAM_URL before starting).
+
+    The new address is checked immediately by reading the app's info endpoint, so a typo or
+    a sleeping phone fails here rather than inside the next look(). On failure the previous
+    address is left in place.
+    """
+    global _cam, _cam_lens
+    try:
+        url = _normalize_cam_url(address)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    with _cam_lock:
+        previous, _cam, _cam_lens = _cam, url, None
+    try:
+        info = _phone_info()
+    except Exception as e:
+        with _cam_lock:
+            _cam = previous
+        return {"ok": False, "error": "%s is not answering: %s" % (url, e),
+                "camera": previous, "note": "the previous address is still in use"}
+    return {"ok": True, "camera": url, **info}
+
+
+@mcp.tool()
+def camera_stream(lens: Optional[Literal["back", "front"]] = None) -> dict:
+    """Read-only. The URL of the phone's live MJPEG video stream, for a browser, VLC, ffmpeg
+    or any script to open. Never moves the robot, no confirmation needed. This returns an
+    address, not video: an MCP tool result cannot carry a stream.
+
+    `lens` switches the phone to its "back" (main) or "front" camera first. The phone serves
+    ONE lens at a time, so a front stream and a rear stream cannot run at once -- asking for
+    the other lens redirects the single stream, including one something else is already
+    watching. Omit `lens` to leave it where it is.
+
+    The stream is lower resolution than look() and save_photo(), which take a full-res
+    still. start_recording(video=True) saves this same stream to video.mp4.
+    """
+    try:
+        url = _stream_url(lens)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "stream_url": url, "lens": _cam_lens,
+            "note": "the phone serves one lens at a time; switching redirects this stream"}
+
+
+@mcp.tool()
 def phone_status():
-    """Read-only. The robot's phone (camera + brain): battery percent and whether the torch is
-    on, from the camera app's /info.json. Never moves the robot, no confirmation needed. Check
-    it before a long scan or before using the torch, which drains the battery quickly;
-    `low_battery` is true at or below 20%."""
+    """Read-only. The robot's phone (camera + brain): battery percent, whether the torch is
+    on, and which lens it is pointing at ("back"/"front", null if the app does not say and
+    nothing has switched it this session), from the camera app's info endpoint. Never moves
+    the robot, no confirmation needed. Check it before a long scan or before using the
+    torch, which drains the battery quickly; `low_battery` is true at or below 20%."""
     try:
         s = _phone_info()
     except Exception as e:
@@ -1561,7 +1574,8 @@ def _write_photo(jpeg, dest_dir, name, meta):
 
 
 @mcp.tool()
-def save_photo(name: str = "", preview_width: int = 0, open_in_browser: bool = False):
+def save_photo(name: str = "", preview_width: int = 0, open_in_browser: bool = False,
+               lens: Optional[Literal["back", "front"]] = None):
     """Read-only. Take a full-res photo with the phone camera and SAVE it on this computer,
     returning its path, so you can open the file or run image recognition / any script on it
     (all of that happens off the robot). Never moves the robot, no confirmation needed.
@@ -1579,7 +1593,10 @@ def save_photo(name: str = "", preview_width: int = 0, open_in_browser: bool = F
     itself, downsized to that width (max 1280), so you can see it in this same call; leave 0
     to keep the call cheap and open the file later. open_in_browser shows it in a browser
     window on this computer. If the phone's photo endpoint doesn't answer within 12 s this
-    fails with an error; it never substitutes a frame of the live stream."""
+    fails with an error; it never substitutes a frame of the live stream.
+
+    `lens` is "back" (the main camera) or "front", and switches the phone for this and every
+    later photo until something switches it back -- see look()."""
     def pose():
         if link is None:
             return None
@@ -1588,7 +1605,7 @@ def save_photo(name: str = "", preview_width: int = 0, open_in_browser: bool = F
 
     before, t0 = pose(), time.monotonic()
     try:
-        jpeg = _fetch_snapshot()
+        jpeg = _fetch_snapshot(lens)
         im = PILImage.open(BytesIO(jpeg))
         im.load()
     except Exception as e:

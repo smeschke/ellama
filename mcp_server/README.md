@@ -83,7 +83,7 @@ All of these are startup defaults; the sensor and guard ones are settable at run
 |---|---|
 | `ELLAMA_SERIAL_PORT` | explicit serial port; default auto-detects |
 | `ELLAMA_REQUIRED_SENSORS` | comma/space separated starting policy, default `enc,imu`; set it empty to require none |
-| `ELLAMA_CAM_URL` | explicit phone-camera base URL; default scans the local /24 |
+| `ELLAMA_CAM_URL` | the phone's camera address (`192.168.0.54`, or a full URL). Optional — `set_camera()` gives it at runtime instead. Never searched for |
 | `ELLAMA_TILT_LIMIT_DEG`, `ELLAMA_TILT_LOOKAHEAD_S`, `ELLAMA_TILT_GUARD` | tilt guard start values (`set_guard` changes them live) |
 
 Register with an MCP client via `.mcp.json` (already set up at the repo root) or run
@@ -103,9 +103,11 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `set_required_sensors(names, confirmed_safe)` | No | `confirmed_safe` — it changes what the robot will do with no feedback |
 | `guards()` | No | — |
 | `set_guard(name="tilt", mode=None, limit_deg=…, lookahead_s=…)` | No | No (it cannot clear a latched fault) |
-| `look(width=640)` | No | — |
-| `save_photo(name="", preview_width=0, open_in_browser=False)` | No | — (saves a full-res photo to `recordings/photos/` with a `.json` of the robot's pose; `preview_width` > 0 also returns the picture) |
-| `phone_status()` | No | — (the phone's battery percent and torch state, from the camera app's `/info.json`; `low_battery` at or below 20%) |
+| `look(width=640, lens=None)` | No | — (`lens` is `"back"`/`"front"`, and leaves the phone switched) |
+| `set_camera(address)` | No | — (the phone's address, checked immediately; nothing is scanned or remembered) |
+| `camera_stream(lens=None)` | No | — (returns the MJPEG **URL**, not video; one lens at a time) |
+| `save_photo(name="", preview_width=0, open_in_browser=False, lens=None)` | No | — (saves a full-res photo to `recordings/photos/` with a `.json` of the robot's pose; `preview_width` > 0 also returns the picture) |
+| `phone_status()` | No | — (the phone's battery percent, torch state and current lens, from the camera app's `/info.json`; `low_battery` at or below 20%) |
 | `torch(on)` | No | — (phone flashlight on/off, state read back; turn it on when the view is dark, off when idle -- it drains the phone) |
 | `zero_odometry()` | No | — |
 | `stop()` | Commands zero PWM (active braking) | No — always safe |
@@ -151,14 +153,31 @@ and the tools are in `robot_server.py`.
   sway is really a pivot on one wheel. Not yet run on the robot; try it on blocks first.
 - No MIDI of a copyrighted song is bundled; supply your own `.mid` (and recording).
 
-`look()` returns a full-res photo from the phone camera on the robot (Android "IP Camera" or
-"IP Webcam" app), or a clear error; it never substitutes a frame of the live stream. The
-address is remembered in `~/.cache/ellama/camera_url`; if that is missing or the phone has
-moved, the phone is found by scanning the local /24 for ports 8080/4444 (slow, 10-30 s, and it
-seems to stall the phone's server), or set `ELLAMA_CAM_URL` (e.g. `https://192.168.0.54:4444`)
-to skip the scan. A photo takes ~1-8 s and fails after 12 s. If the app answers but no photo
-comes back, the error says so (restart the camera app on the phone). It is advisory vision
-only and does not replace `confirmed_safe`.
+### One phone, given at runtime
+
+The robot carries **one** Android phone running "Android IP Camera". Its address is handed to
+the server and never guessed at: `set_camera("192.168.0.54")` while it runs, or
+`ELLAMA_CAM_URL` before it starts. A bare IP gets `https` and port `4444` filled in. Nothing
+scans the network and nothing is cached between runs, so a wrong address is an error that
+says so rather than a 30 s search. `set_camera` reads the app's info endpoint before
+accepting, and keeps the previous address if the new one does not answer.
+
+That one phone has **two lenses**, and the app serves one at a time. `lens="back"` is the
+main camera pointing where the robot drives; `lens="front"` is the selfie camera. Passing
+`lens` *switches the phone and leaves it switched* — it is a state change, not a per-call
+parameter, so there is no way to read both lenses at the same moment and no way to run a
+front and a rear stream at once. `phone_status()` reports which lens it is on. Omitting
+`lens` uses whatever it is already on and saves ~1 s of settling.
+
+> The lens-switch request (`/?camera=back|front`) is **not yet verified against the phone**.
+> If switching answers but the picture does not change, `CAM_LENS_PARAM` and
+> `CAM_LENS_VALUES` in `robot_server.py` are the only two lines to correct.
+
+`look()` returns a full-res photo, or a clear error; it never substitutes a frame of the live
+stream. A photo takes ~1-8 s and fails after 12 s. If the app answers but no photo comes
+back, the error says so (restart the camera app on the phone). It is advisory vision only and
+does not replace `confirmed_safe`. `camera_stream()` returns the MJPEG **URL** for a browser,
+VLC, ffmpeg or a script to open — an MCP result cannot carry a stream.
 
 `save_photo()` is the same camera, saved to a file instead of shown: it writes
 `recordings/photos/<time>[_name].jpg` (override with `ELLAMA_PHOTO_DIR`) plus a `.json` with the
