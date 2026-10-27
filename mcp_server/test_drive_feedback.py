@@ -299,6 +299,35 @@ def test_an_arc_whose_measuring_wheel_is_silent_says_which_one():
     assert "right encoder is not reporting" in out["error"], out
 
 
+# ---- turn_degrees ----------------------------------------------------------------------
+
+def test_a_spin_with_no_imu_is_refused_rather_than_measured_by_the_encoders():
+    """Encoders are not a fallback for a spin in place. Wheel scrub makes them over-read
+    one by ~2x, by a ratio that moves with the surface, so there is no divisor that
+    recovers it -- 2026-09-27 measured ~2x and a 2026-09-29 re-run on the same floor ~1.7x.
+    The encoders measure arcs and straight lines on this robot, never spins."""
+    link = bench_link()
+    feed_enc(link, 1000, 1000, 10)      # encoders perfectly healthy ...
+    feed_enc(link, 1100, 900, 20)       # ... and turning, which must not be enough
+    out = rs.turn_degrees(90, "left", 60, True, warn_lights=False)
+    assert not out["ok"], out
+    assert "no live IMU" in out["error"], out
+    assert "not a substitute" in out["error"], out
+    assert link.ser.lines == [], "a refused call must not touch the hardware"
+
+
+def test_a_spin_turns_by_the_imu_and_says_so():
+    link = bench_link()
+    with Feeder(link, per_packet=(80, -80), yaw_dps=400.0):
+        out = rs.turn_degrees(45, "left", 60, True, warn_lights=False)
+    assert out["ok"], out
+    assert out["feedback_source"] == "imu", out
+    assert out["actual_degrees_turned"] == out["imu_degrees"], out
+    # The encoder differential is still reported, and still labelled as not to be trusted.
+    assert out["encoder_degrees_estimate"] is not None, out
+    assert "scrub" in out["encoder_estimate_unreliable"], out
+
+
 # ---- drive_until_range -----------------------------------------------------------------
 
 def feed_tof(link, name, values, ms):

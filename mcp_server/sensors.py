@@ -320,8 +320,8 @@ CAPABILITY_COST = {
     "imu": [
         "no tilt guard (nothing measures lean)",
         "no bump or slip detection (both need the accelerometer/gyro)",
-        "turn_degrees falls back to the encoder heading, which over-reads in-place turns "
-        "~2x from wheel scrub",
+        "turn_degrees refuses outright: the encoders are not a fallback for a spin in "
+        "place, where wheel scrub makes them over-read by ~2x",
         "drive_arc cannot steer its curvature loop",
     ],
     "enc": [

@@ -34,12 +34,15 @@ import argparse
 import collections
 import math
 import queue
+import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
 import serial
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # for bridge/
 from bridge import (BAUD_RATE, RESET_SETTLE_S, SENSOR_VALUE_INVALID, EncoderState,
                     OrientationState, SerialReader, TofState, load_config, parse_line,
                     pick_port)
@@ -343,7 +346,9 @@ def main():
     args = ap.parse_args()
 
     port = pick_port(args.port)
-    ser = serial.Serial(port, BAUD_RATE, timeout=0.05)
+    # exclusive=True: refuse to attach to a port something else already owns, rather
+    # than resetting the ESP32 and splitting the byte stream with it.
+    ser = serial.Serial(port, BAUD_RATE, timeout=0.05, exclusive=True)
     print(f"Reading {port} at {BAUD_RATE}; waiting {RESET_SETTLE_S}s for the ESP32 to boot.")
     time.sleep(RESET_SETTLE_S)
 

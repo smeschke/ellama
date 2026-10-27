@@ -3,7 +3,7 @@
 loop on the wheel encoders instead of driving open-loop for a fixed duration.
 
 Talks over the same USB-serial link as calibration/live_view.py and toandfro.py did --
-reuses calibration/bridge.py for serial I/O, line parsing and the distance/heading math,
+reuses bridge/ for serial I/O, line parsing and the distance/heading math,
 so there is exactly one place that logic lives.
 
 Nothing here assumes a fixed set of sensors. The firmware's SensorPacket carries the
@@ -33,16 +33,12 @@ Setup:
 
 Env (all of these are startup defaults; the sensor and guard ones are settable at runtime):
     ELLAMA_SERIAL_PORT       explicit serial port (e.g. /dev/ttyUSB0); default auto-detects
-                             via calibration/bridge.py's port picker.
+                             via bridge/'s port picker.
     ELLAMA_REQUIRED_SENSORS  comma/space separated sensors the drive tools insist on;
                              default "enc,imu". Set it empty to require none.
-    ELLAMA_CAM_URL           the robot phone's camera address (e.g. 192.168.0.50, or
-                             https://192.168.0.50:4444). Optional: set_camera() gives it
-                             at runtime instead. Never searched for.
 """
 
 import array
-import base64
 import atexit
 import bisect
 import functools
@@ -52,7 +48,6 @@ import os
 import re
 import signal
 import socket
-import ssl
 import subprocess
 import sys
 import threading
@@ -60,29 +55,24 @@ import tempfile
 import time
 import urllib.request
 import wave
-import webbrowser
-from io import BytesIO
 from pathlib import Path
 from typing import Literal, Optional
 
 import serial
 
-# calibration/bridge.py is the PC-side client library for computer_bridge.ino: the serial
-# reader, parse_line(), and the EncoderState/OrientationState/TofState math. It is imported
+# bridge/ is the PC-side client library for computer_bridge.ino: the serial reader,
+# parse_line(), and the EncoderState/OrientationState/TofState math. It is imported
 # rather than copied so this server and calibration/live_view.py compute distance, heading
 # and range from the same code.
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "calibration"))
-import bridge  # noqa: E402  (calibration/bridge.py)
+sys.path.insert(0, str(REPO_ROOT))
+import bridge  # noqa: E402  (bridge/__init__.py)
 import sensors as sensorlib  # noqa: E402  (mcp_server/sensors.py; `sensors` is a tool name)
 import recording  # noqa: E402  (mcp_server/recording.py)
 import hearing  # noqa: E402  (mcp_server/hearing.py)
-import perform as perform_show  # noqa: E402  (mcp_server/perform.py)
 import tilt_guard  # noqa: E402  (mcp_server/tilt_guard.py)
 
 from mcp.server.mcpserver import MCPServer as FastMCP  # mcp>=2.0 renamed FastMCP -> MCPServer
-from mcp.server.mcpserver import Image
-from PIL import Image as PILImage
 
 # ---------------------------------------------------------------------------
 # Safety constants -- sourced from DRIVING_POLICY.md, not guessed. If the policy
@@ -121,12 +111,13 @@ if _required_env is not None:
 # from a curve, never a measurement, and every result that uses it says so.
 PWM_SPEED_IN_S = ((50, 4.11), (60, 6.13), (80, 9.36), (100, 12.03), (125, 14.46))
 
-# Wheel scrub during an in-place spin: the encoder differential read ~92 deg per real ~47
-# deg turn (ROBOT_CHARACTERIZATION.md section 4 and turn_degrees' docstring), so the
-# encoder estimate is divided by this when there is no IMU to measure rotation properly.
-# A fallback, not an equal: scrub varies with the surface, which is why the IMU is used
-# whenever it is there.
-TURN_SCRUB_FACTOR = 1.96
+# No TURN_SCRUB_FACTOR here any more. It existed to rescue an encoder-measured in-place
+# turn by dividing out ~2x of wheel scrub, but scrub varies with the surface, so the
+# divisor was only ever right on the floor it was calibrated on. turn_degrees now requires
+# the IMU rather than correcting a measurement it should not be taking: operator policy,
+# 2026-10-24 -- encoders measure arcs and straight lines on this robot, never spins.
+# simulation/ keeps its own TURN_SCRUB_FACTOR; that one predicts open-loop turn rate and
+# is a different quantity (an effective-track-width multiplier).
 # Below this the robot did not move at all in either direction (pwm 40: 0.02 in/s).
 PWM_DEADBAND = 45
 
@@ -165,7 +156,13 @@ RANGE_MEDIAN_LAG_SAMPLES = bridge.TofState.HISTORY // 2
 RANGE_LATENCY_S = (1.0 + RANGE_MEDIAN_LAG_SAMPLES) / RANGE_SAMPLE_HZ + RANGE_STOP_LEAD_S
 # speed_for_pwm is a prediction off a curve, not a measurement, so leave headroom rather
 # than driving at exactly the speed the arithmetic says is stoppable.
-RANGE_APPROACH_MARGIN = 1.25
+# Raised 1.25 -> 5.0 on 2026-10-24. At 1.25 the taper started far too late to ever finish:
+# four approaches to a wall (targets 250/100/150/150, pwm 60-110) all ended by the tyres
+# touching it at ~102mm, and every one reported pulses: 0 -- the continuous phase never
+# wound down far enough to hand over to the pulse endgame, so the careful part of this
+# tool had never once run. pwm_used.min bottomed out at 66 on the last of them, well above
+# the 60 floor it was given. The arithmetic said 1.25 was enough; the robot disagreed.
+RANGE_APPROACH_MARGIN = 5.0
 # After a pulse, the median needs a full window of new samples before it means anything.
 RANGE_MEDIAN_REFRESH_S = (bridge.TofState.HISTORY + 1) / RANGE_SAMPLE_HZ
 # Long enough that a slow creep still registers as progress, short enough that driving
@@ -274,26 +271,14 @@ def approach_pwm(remaining_mm, pwm_max, pwm_min):
 # a stop in between" unconditionally rather than trying to detect reversals.
 STOP_SETTLE_S = 0.25
 
-# Per-call caps so one tool call can't send the robot further/further-turned than a
-# human watching the chat can react to. Chain multiple confirmed calls for more --
-# that is the stop-check-decide-move loop DRIVING_POLICY.md asks for, not a limitation
-# to work around.
-MAX_SINGLE_MOVE_IN = 60.0
-MAX_SINGLE_TURN_DEG = 180.0
-
-# jog() is open-loop and time-based, not encoder-target-based -- cap how long one call
-# can run so a bad (left_pwm, right_pwm) can't run away unattended.
-MAX_JOG_DURATION_S = 10.0
-
 # computer_bridge.ino drops to listen-only if no serial line arrives for 500ms
 # (SERIAL_IDLE_TIMEOUT_MS), so every drive loop re-sends its command at least this often.
 # Verified 2026-09-28: without this, drive_distance(6in, pwm=50) stopped after ~3in.
 DRIVE_KEEPALIVE_S = 0.1
 
 # drive_arc() caps. A circle is one continuous closed-loop motion, so it gets its own
-# path-length cap instead of MAX_SINGLE_MOVE_IN; it still aborts the moment telemetry
-# goes stale. Radius floor keeps it from degenerating into an in-place spin (use
-# turn_degrees for that).
+# path-length cap; it still aborts the moment telemetry goes stale. Radius floor keeps it
+# from degenerating into an in-place spin (use turn_degrees for that).
 MAX_SINGLE_ARC_DEG = 360.0
 MAX_SINGLE_ARC_IN = 160.0
 MIN_ARC_RADIUS_IN = 6.0
@@ -308,20 +293,30 @@ ARC_GAIN = 0.15
 ARC_MAX_INNER_REVERSE_PWM = int(0.9 * MAX_PWM_CEILING)  # 112; at -60 it bottomed out at ~7.9in radius
 ARC_MAX_STEP_PWM = 5
 
-# Encoder count direction when that wheel rolls forward. On 2026-09-28 this read (1, -1):
-# a 6in forward drive_distance gave left +6.77in, right -6.66in. Re-verified 2026-09-29 and
-# it is now (1, 1): a 22in forward drive_distance moved left +14617 ticks and right +14922
-# ticks, and reversing moved both negative -- the right encoder is no longer mirrored.
-# With the stale (1, -1), drive_arc's path estimate had the right wheel backwards, so its
-# curvature loop never engaged on a reverse arc. Only drive_arc uses this; re-check it
-# after any encoder wiring or firmware change.
-ENCODER_FORWARD_SIGN = (1, 1)
+# Encoder count direction when that wheel rolls forward. (-1, -1) since 2026-10-24.
+# Every earlier value here -- (1, -1) on 2026-09-28, (1, 1) on 2026-09-29 -- was read off a
+# drive_distance(direction="forward") move, which applies FORWARD_PWM_SIGN. That sign was
+# itself wrong until 2026-10-24, so those tests recorded the tick direction of a BACKWARD
+# move and labelled it forward. The two constants then agreed with each other no matter
+# which way the robot really went, and no encoder-based check could catch it.
+# Settled by watching the robot instead: with FORWARD_PWM_SIGN = 1, a jog(+50, +50, 1s)
+# moved it physically forward (operator confirmed by eye; there is now an arrow on the
+# chassis, since a symmetrical robot gives you nothing else to go on) while the right
+# encoder ran -2247 ticks / -3.83in. So forward counts DOWN on this robot.
+# Only the right channel was verified -- the left was dead (reporting null) at the time,
+# and its -1 is assumed by symmetry. Confirm it once that encoder reports again.
+# Only drive_arc uses this; re-check it after any encoder wiring or firmware change, and
+# check it by where the robot ends up, never by a "forward" command's own ticks.
+ENCODER_FORWARD_SIGN = (-1, -1)
 
-# Verified 2026-09-27, robot on blocks, wheels free to spin: direction="forward" at
-# +50 PWM on both sides drove all four wheels backwards, confirmed by eye. -1 makes
-# direction="forward" match real forward rotation. Re-check this after any change to
-# wiring, motor board firmware, or which physical wheel is "left" vs "right".
-FORWARD_PWM_SIGN = -1
+# Re-verified 2026-10-24, robot on the ground and driving: with this at -1, repeated
+# direction="forward" moves at pwm=60 carried the robot visibly backwards, confirmed by
+# the operator watching it. +1 makes direction="forward" match real forward travel. This
+# supersedes the 2026-09-27 on-blocks check, which read the wheel rotation by eye with
+# the robot jacked up and concluded the opposite; trust the on-the-ground result.
+# Re-check this after any change to wiring, motor board firmware, or which physical
+# wheel is "left" vs "right".
+FORWARD_PWM_SIGN = 1
 
 # ---------------------------------------------------------------------------
 # Tilt guard (mcp_server/tilt_guard.py). The robot is low and can run banks up to ~25 deg;
@@ -386,7 +381,11 @@ class RobotLink:
         self.cfg["gear_ratio"] = TRUE_GEAR_RATIO
 
         port = _pick_port(port)
-        self.ser = serial.Serial(port, bridge.BAUD_RATE, timeout=0.05)
+        # exclusive=True so a second process opening this port fails loudly instead of
+        # silently stealing bytes. Nothing locks a tty by default: two readers each consume
+        # from the same buffer and both get torn lines, and opening the port a second time
+        # resets the ESP32 (see bridge.RESET_SETTLE_S) -- mid-drive, if the robot is moving.
+        self.ser = serial.Serial(port, bridge.BAUD_RATE, timeout=0.05, exclusive=True)
         time.sleep(bridge.RESET_SETTLE_S)  # opening the port resets the ESP32
         self.ser.reset_input_buffer()
 
@@ -405,14 +404,12 @@ class RobotLink:
         self.policy = POLICY   # module-level: survives connect(), like the guards
         self.lock = threading.Lock()
         self.recorder = recording.Recorder(REPO_ROOT / "recordings")
-        self.video = None  # recording.VideoRecorder while a recording has video on
         self.last_imu = None
 
         # Serial writes come from tool threads AND the pump (the tilt trip sends "stop" from
         # there, ~20 ms after the offending IMU sample), so a line must never interleave.
         self._wlock = threading.RLock()
         self.tilt = TILT  # module-level: a latched fault and the level reference survive connect()
-        self.on_tilt_trip = None  # callable(fault_dict); set by the server to abort autonomous runs
 
         self._stop_pump = threading.Event()
         self._pump_thread = threading.Thread(target=self._pump, daemon=True)
@@ -485,15 +482,10 @@ class RobotLink:
                         except ValueError:
                             pass
             if tripped is not None:
-                # Outside the state lock: stop first (the guard already latched, so send_drive
-                # refuses from here on), then tell whoever is running an autonomous loop.
+                # Outside the state lock: the guard already latched, so send_drive refuses
+                # from here on. A blocking tool notices on its next send_drive, which
+                # raises TiltFault.
                 self.emergency_stop()
-                cb = self.on_tilt_trip
-                if cb is not None:
-                    try:
-                        cb(tripped)
-                    except Exception:
-                        pass
 
     def send_line(self, text):
         with self._wlock:
@@ -719,9 +711,6 @@ class RobotLink:
 
     def close(self):
         self.emergency_stop()
-        if self.video is not None:
-            self.video.stop()
-            self.video = None
         self.recorder.stop()
         self._stop_pump.set()
         self.reader.stop()  # joins bridge.py's own reader thread before the port closes
@@ -747,7 +736,6 @@ def _connect(port=None):
         link = None
     try:
         link = RobotLink(port)
-        link.on_tilt_trip = _on_guard_trip
         _connect_error = None
     except Exception as e:
         _connect_error = str(e)
@@ -755,15 +743,7 @@ def _connect(port=None):
     return link
 
 
-def _on_guard_trip(fault):
-    """Called from the IMU pump thread right after the guard trips and "stop" is sent: end any
-    autonomous run (perform). Blocking tools notice on their next
-    send_drive, which raises TiltFault."""
-    _run["abort"].set()
-
-
 def _shutdown():
-    _run["abort"].set()
     if link is not None:
         link.emergency_stop()
 
@@ -778,160 +758,6 @@ except Exception:
     pass  # tools report the connection error; the server itself still starts
 
 
-# ---------------------------------------------------------------------------
-# Phone camera -- read-only vision, never moves the robot. Camera images are advisory:
-# they do NOT replace the confirmed_safe gate above.
-#
-# ONE device. The robot carries a single Android phone running "Android IP Camera", and
-# its address is handed to this server at runtime (set_camera, or ELLAMA_CAM_URL at
-# startup). Nothing here searches the network for it and nothing remembers it between
-# runs: an address that is wrong is an error to fix, not something to go hunting for.
-#
-# That one phone has two lenses, chosen with lens="back" (the main camera, pointing where
-# the robot drives) or lens="front". The app serves ONE of them at a time, so choosing a
-# lens is a state change on the phone, not a per-request parameter -- see _select_lens.
-# ---------------------------------------------------------------------------
-
-CAM_DEFAULT_SCHEME = "https"  # the app serves TLS on 4444 with a self-signed cert
-CAM_DEFAULT_PORT = 4444
-CAM_SNAPSHOT_PATH = "/video/snapshot"   # full-res still; takes ~1-8 s
-CAM_STREAM_PATH = "/video/mjpeg"        # live MJPEG; ~15 fps at 360x480
-CAM_INFO_PATH = "/info.json"            # battery, torch, current lens
-# The app takes settings as query parameters on / the way the torch does (/?torch=on).
-# NOT yet verified against the phone: if lens switching answers but the picture does not
-# change, these two lines are the only thing to correct.
-CAM_LENS_PARAM = "camera"
-CAM_LENS_VALUES = {"back": "back", "front": "front"}
-CAM_LENS_SETTLE_S = 1.0       # the app reopens the camera; an immediate grab is the old lens
-CAM_SNAPSHOT_TIMEOUT_S = 12   # a full-res still takes ~1-8 s; past this the photo has failed
-CAM_MAX_WIDTH = 1280
-
-# auto_photo (start_recording): take a photo each time the robot comes to rest after moving.
-AUTO_PHOTO_STILL_S = 0.7          # both wheels below STILL_SPEED_IN_S for this long = stopped
-AUTO_PHOTO_STILL_SPEED_IN_S = 0.5
-AUTO_PHOTO_MIN_TRAVEL_IN = 4.0    # summed |left|+|right| wheel travel since the last photo
-AUTO_PHOTO_MIN_TURN_DEG = 10.0    # or this much IMU yaw change
-AUTO_PHOTO_POLL_S = 0.1
-_cam = None        # the phone's base URL, once someone has given it to us
-_cam_lens = None   # the lens the phone was last told to use ("back"/"front"), or None
-# The camera app's TLS uses a self-signed cert, so verification is off -- acceptable
-# for a read-only camera on the home LAN, and this context is used for nothing else.
-_cam_ssl = ssl.create_default_context()
-_cam_ssl.check_hostname = False
-_cam_ssl.verify_mode = ssl.CERT_NONE
-
-
-def _cam_open(url, timeout):
-    return urllib.request.urlopen(url, timeout=timeout, context=_cam_ssl)
-
-_cam_lock = threading.Lock()
-
-
-def _normalize_cam_url(text):
-    """"192.168.0.54" -> "https://192.168.0.54:4444". Takes a bare IP or host, a host:port,
-    or a full URL, and fills in the scheme and port this app uses. Raises ValueError on
-    something that is not an address."""
-    from urllib.parse import urlparse
-    raw = (text or "").strip().rstrip("/")
-    if not raw:
-        raise ValueError("no address given")
-    u = urlparse(raw if "://" in raw else f"{CAM_DEFAULT_SCHEME}://{raw}")
-    if not u.hostname:
-        raise ValueError("%r is not an address I can use -- try 192.168.0.54 or "
-                         "https://192.168.0.54:4444" % text)
-    return f"{u.scheme}://{u.hostname}:{u.port or CAM_DEFAULT_PORT}"
-
-
-if os.environ.get("ELLAMA_CAM_URL", "").strip():
-    try:
-        _cam = _normalize_cam_url(os.environ["ELLAMA_CAM_URL"])
-    except ValueError as e:
-        raise SystemExit("ELLAMA_CAM_URL: %s" % e)
-
-
-def _camera():
-    """The phone's base URL, or a RuntimeError saying nobody has given one. This server does
-    not scan the network and does not remember an address between runs."""
-    with _cam_lock:
-        if _cam is None:
-            raise RuntimeError(
-                "no phone camera address set: call set_camera('192.168.0.54') with the "
-                "address the camera app is showing on the phone, or start the server with "
-                "ELLAMA_CAM_URL")
-        return _cam
-
-
-def _select_lens(lens):
-    """Point the phone at one of its two lenses, and return the lens in use.
-
-    The app serves one lens at a time, so this is a state change on the phone that outlives
-    the call: a front-lens still leaves the phone on the front lens until something switches
-    it back. There is therefore no way to read both lenses at the same moment, and no way to
-    run a front and a rear stream at once. lens=None means "whatever it is already on".
-    """
-    global _cam_lens
-    if lens is None:
-        return _cam_lens
-    if lens not in CAM_LENS_VALUES:
-        raise ValueError("lens must be 'front' or 'back', not %r" % (lens,))
-    if _cam_lens == lens:
-        return lens
-    _phone_get("/?%s=%s" % (CAM_LENS_PARAM, CAM_LENS_VALUES[lens]))
-    _cam_lens = lens
-    time.sleep(CAM_LENS_SETTLE_S)
-    return lens
-
-
-def _reachable(base, timeout=2.0):
-    """True if something accepts TCP connections at base's host:port."""
-    from urllib.parse import urlparse
-    u = urlparse(base)
-    try:
-        with socket.create_connection((u.hostname, u.port or (443 if u.scheme == "https" else 80)),
-                                      timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-def _fetch_snapshot(lens=None):
-    """A full-res JPEG from the phone's photo endpoint, or a RuntimeError saying why not. It
-    never substitutes a frame of the live stream. `lens` switches the phone first and leaves
-    it there (see _select_lens)."""
-    base = _camera()
-    _select_lens(lens)
-    try:
-        with _cam_open(base + CAM_SNAPSHOT_PATH, CAM_SNAPSHOT_TIMEOUT_S) as r:
-            img = r.read()
-    except Exception as e:
-        if _reachable(base):
-            raise RuntimeError(
-                f"the camera app is up at {base} but its photo endpoint "
-                f"({CAM_SNAPSHOT_PATH}) returned no image within {CAM_SNAPSHOT_TIMEOUT_S} s "
-                f"({e}); look() does not fall back to the live stream. Try restarting the "
-                "camera app on the phone.")
-        raise RuntimeError(
-            f"nothing answered at {base} ({e}) -- check the phone is awake and on this "
-            "Wi-Fi, and that set_camera() was given the address the app shows.")
-    if img[:2] != b"\xff\xd8":
-        raise RuntimeError(f"{base}{CAM_SNAPSHOT_PATH} did not return a JPEG")
-    return img
-
-
-def _stream_url(lens=None):
-    """The phone's MJPEG URL, with the phone switched to `lens` first."""
-    base = _camera()
-    _select_lens(lens)
-    return base + CAM_STREAM_PATH
-
-
-def _open_stream(lens=None):
-    """Open the phone's MJPEG stream (for recording). Returns a file-like of multipart MJPEG."""
-    return _cam_open(_stream_url(lens), 10)
-
-
-_run = {"running": False, "abort": threading.Event(), "status": "idle", "info": {}, "result": None,
-        "ended": threading.Event()}
 
 
 mcp = FastMCP("ellama-robot")
@@ -980,8 +806,6 @@ def _confirm_gate(confirmed_safe: bool):
     tilt_block = _tilt_gate()
     if tilt_block:
         return tilt_block
-    if _run["running"]:
-        return {"ok": False, "error": "an autonomous run (perform) is in progress; call stop() first"}
     if confirmed_safe:
         return None
     rng = link.range_snapshot() if link is not None else None
@@ -1221,7 +1045,6 @@ def stop() -> dict:
     """Immediately command zero PWM (active braking, not coasting -- see
     DRIVING_POLICY.md). Always safe to call with no confirmation, any time, including
     when nothing is currently moving."""
-    _run["abort"].set()
     if link is None:
         return _not_connected()
     link.send_stop()
@@ -1286,7 +1109,6 @@ def listen() -> dict:
     matching computer_bridge.ino's serial protocol). Use this when done driving so a
     human can pick up the stick without the two fighting on the same ESP-NOW channel.
     Always safe to call, no confirmation needed."""
-    _run["abort"].set()
     if link is None:
         return _not_connected()
     link.send_listen()
@@ -1294,402 +1116,23 @@ def listen() -> dict:
 
 
 @mcp.tool()
-def look(width: int = 640, lens: Optional[Literal["back", "front"]] = None):
-    """Read-only. Take a photo with the phone camera mounted on the robot and return it, so
-    you can see what the robot currently sees. Never moves the robot, no confirmation
-    needed. The phone's address comes from set_camera() or ELLAMA_CAM_URL -- this server
-    does not search for it.
-
-    `lens` picks which of the one phone's two cameras to use: "back" is the main camera
-    pointing where the robot drives, "front" is the selfie camera. The phone serves one at
-    a time, so this SWITCHES it and leaves it switched -- the next look() with no `lens`
-    uses whichever it was left on (phone_status() reports which). Omit it to use the current
-    one and save ~1 s.
-
-    A full-res photo takes ~1-8 seconds; if the phone's photo endpoint does not return one
-    within 12 s this returns an error (it never substitutes a frame of the live video
-    stream). `width` downsizes the image (default 640, max 1280) to keep it cheap. This is advisory vision only -- a JPEG glance is not an obstacle sensor, so it
-    does NOT replace asking the operator before any move. Use save_photo() to keep the
-    picture as a file on this computer."""
-    width = max(64, min(int(width), CAM_MAX_WIDTH))
-    try:
-        img = PILImage.open(BytesIO(_fetch_snapshot(lens)))
-        if img.width > width:
-            img = img.resize((width, round(img.height * width / img.width)))
-        buf = BytesIO()
-        img.convert("RGB").save(buf, "JPEG", quality=80)
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    return Image(data=buf.getvalue(), format="jpeg")
-
-
-TAG_MM = float(os.environ.get("ELLAMA_TAG_MM", "250"))
-TAG_DICT = os.environ.get("ELLAMA_TAG_DICT", "DICT_4X4_50")
-
-
-@mcp.tool()
-def tags(tag_mm: float = 0.0, dict_name: str = "") -> dict:
-    """Read-only. Take a full-res photo with the phone camera and report every ArUco tag in
-    it: its id, its BEARING in degrees off the camera's centre line (negative = left of
-    centre, which is what you steer by) and a rough RANGE in mm. Never moves the robot.
-
-    Bearing is trustworthy -- it depends only on the lens field of view. Range is derived
-    from the tag's apparent size with an uncalibrated focal length, so treat it as a gate
-    ("closer than a metre") rather than a measurement.
-
-    An empty `tags` list with live=true means the camera looked and saw no tag -- which is
-    NOT the same as live=false, the camera being unreachable. A tag whose `weak` flag is
-    true was detected near the pixel limit and will drop in and out; move closer or use
-    bigger tags rather than trusting it.
-
-    `tag_mm` is the printed size of the tags in millimetres (default ELLAMA_TAG_MM, 250).
-    All tags must be printed the same size for range to mean anything."""
-    try:
-        import cv2
-        import numpy as np
-        sys.path.insert(0, str(REPO_ROOT / "tools"))
-        from find_tags import find_tags as _find_tags
-    except Exception as e:
-        return {"ok": False, "live": False, "error": f"tag detection unavailable: {e}"}
-
-    try:
-        raw = _fetch_snapshot()
-    except Exception as e:
-        return {"ok": False, "live": False, "error": str(e)}
-
-    img = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        return {"ok": False, "live": False, "error": "camera returned something that is not an image"}
-
-    found = _find_tags(img, dict_name or TAG_DICT, tag_mm or TAG_MM)
-    for t in found:
-        t["weak"] = t["px"] < 25
-    return {
-        "ok": True,
-        "live": True,
-        "measuring": bool(found),
-        "tags": found,
-        "frame": {"width": img.shape[1], "height": img.shape[0]},
-        "tag_mm": tag_mm or TAG_MM,
-        "dict": dict_name or TAG_DICT,
-    }
-
-
-VISION_MODEL = os.environ.get("ELLAMA_VISION_MODEL", "gemma3:4b")
-VISION_WIDTH = int(os.environ.get("ELLAMA_VISION_WIDTH", "768"))
-VISION_TIMEOUT_S = float(os.environ.get("ELLAMA_VISION_TIMEOUT_S", "300"))
-OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-
-
-@mcp.tool()
-def describe_view(question: str = "", width: int = 0) -> dict:
-    """Read-only. Take a photo with the phone camera and have a vision model describe it in
-    words. Never moves the robot. Use this when you need to know what is actually in front
-    of the robot -- a doorway, a person, clutter on the floor -- that no sensor reports.
-
-    `question` asks something specific ("is the floor clear ahead?", "what is the dark shape
-    on the left?"); empty asks for a plain description. Ask narrow questions: the answer is
-    a few sentences of prose from a small model, so it is advisory, not a measurement, and
-    it can be confidently wrong about things it half-sees.
-
-    This is NOT an obstacle sensor and does NOT replace asking the operator before a move.
-    For tags use tags(), which measures bearing geometrically instead of guessing.
-
-    Takes roughly 10-60 s: the photo, then a vision model running on the CPU."""
-    try:
-        raw = _fetch_snapshot()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-    try:
-        img = PILImage.open(BytesIO(raw))
-        w = max(256, min(int(width or VISION_WIDTH), 1280))
-        if img.width > w:
-            img = img.resize((w, round(img.height * w / img.width)))
-        buf = BytesIO()
-        img.convert("RGB").save(buf, "JPEG", quality=80)
-        b64 = base64.b64encode(buf.getvalue()).decode()
-    except Exception as e:
-        return {"ok": False, "error": f"could not prepare the image: {e}"}
-
-    prompt = question.strip() or "Describe what you see. Two or three sentences."
-    body = json.dumps({
-        "model": VISION_MODEL, "stream": False, "keep_alive": "30m",
-        "messages": [{"role": "user", "content": prompt, "images": [b64]}],
-    }).encode()
-    t0 = time.monotonic()
-    try:
-        req = urllib.request.Request(f"{OLLAMA_URL}/api/chat", body,
-                                     {"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=VISION_TIMEOUT_S) as r:
-            answer = json.load(r)["message"]["content"].strip()
-    except Exception as e:
-        return {"ok": False, "error": f"vision model {VISION_MODEL} failed: {e}",
-                "hint": f"is ollama running, and is {VISION_MODEL} pulled?"}
-
-    return {"ok": True, "model": VISION_MODEL, "question": prompt, "answer": answer,
-            "image_width": img.width, "seconds": round(time.monotonic() - t0, 1),
-            "advisory": "prose from a small vision model; not an obstacle sensor"}
-
-
-PHONE_LOW_BATTERY_PCT = 20
-
-
-def _phone_get(path, timeout=6.0):
-    """Body of GET <camera base><path>."""
-    base = _camera()
-    try:
-        with _cam_open(base + path, timeout) as r:
-            return r.read()
-    except Exception as e:
-        raise RuntimeError(f"the phone camera app at {base} did not answer {path}: {e}")
-
-
-def _phone_info():
-    info = json.loads(_phone_get(CAM_INFO_PATH))
-    settings = info.get("settings") or {}
-    torch = settings.get("torch")
-    reported_lens = settings.get(CAM_LENS_PARAM)
-    return {
-        "battery_percent": info.get("batteryPercent"),
-        "torch_on": None if torch is None else str(torch).lower() in ("on", "true", "1"),
-        # what the app says it is pointing at, falling back to what we last told it
-        "lens": str(reported_lens).lower() if reported_lens is not None else _cam_lens,
-    }
-
-
-@mcp.tool()
-def set_camera(address: str) -> dict:
-    """Tell the server where the robot's phone is, while it is running. Never moves the
-    robot, no confirmation needed.
-
-    `address` is what the camera app shows on the phone: a bare IP ("192.168.0.54"), a
-    host:port, or a full URL. Missing pieces are filled in with https and port 4444, which
-    is what this app serves. The address is used as given -- nothing is scanned for and
-    nothing is remembered after the server stops, so call this once at the start of a
-    session (or set ELLAMA_CAM_URL before starting).
-
-    The new address is checked immediately by reading the app's info endpoint, so a typo or
-    a sleeping phone fails here rather than inside the next look(). On failure the previous
-    address is left in place.
-    """
-    global _cam, _cam_lens
-    try:
-        url = _normalize_cam_url(address)
-    except ValueError as e:
-        return {"ok": False, "error": str(e)}
-    with _cam_lock:
-        previous, _cam, _cam_lens = _cam, url, None
-    try:
-        info = _phone_info()
-    except Exception as e:
-        with _cam_lock:
-            _cam = previous
-        return {"ok": False, "error": "%s is not answering: %s" % (url, e),
-                "camera": previous, "note": "the previous address is still in use"}
-    return {"ok": True, "camera": url, **info}
-
-
-@mcp.tool()
-def camera_stream(lens: Optional[Literal["back", "front"]] = None) -> dict:
-    """Read-only. The URL of the phone's live MJPEG video stream, for a browser, VLC, ffmpeg
-    or any script to open. Never moves the robot, no confirmation needed. This returns an
-    address, not video: an MCP tool result cannot carry a stream.
-
-    `lens` switches the phone to its "back" (main) or "front" camera first. The phone serves
-    ONE lens at a time, so a front stream and a rear stream cannot run at once -- asking for
-    the other lens redirects the single stream, including one something else is already
-    watching. Omit `lens` to leave it where it is.
-
-    The stream is lower resolution than look() and save_photo(), which take a full-res
-    still. start_recording(video=True) saves this same stream to video.mp4.
-    """
-    try:
-        url = _stream_url(lens)
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    return {"ok": True, "stream_url": url, "lens": _cam_lens,
-            "note": "the phone serves one lens at a time; switching redirects this stream"}
-
-
-@mcp.tool()
-def phone_status():
-    """Read-only. The robot's phone (camera + brain): battery percent, whether the torch is
-    on, and which lens it is pointing at ("back"/"front", null if the app does not say and
-    nothing has switched it this session), from the camera app's info endpoint. Never moves
-    the robot, no confirmation needed. Check it before a long scan or before using the
-    torch, which drains the battery quickly; `low_battery` is true at or below 20%."""
-    try:
-        s = _phone_info()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    pct = s["battery_percent"]
-    return {"ok": True, **s, "low_battery": pct is not None and pct <= PHONE_LOW_BATTERY_PCT}
-
-
-@mcp.tool()
-def torch(on: bool):
-    """Turn the phone's torch (flashlight) on or off, then read the state back. Never moves the
-    robot, no confirmation needed. Use it when the camera view is dark (see save_photo's
-    `brightness`) so tags and doorways are readable, and turn it off again when idle, stalled
-    or waiting on the operator: it drains the phone, which is also the robot's camera and
-    brain. Returns the phone's battery percent too; `torch_on` is what the phone reports after
-    the change (null if the app doesn't say)."""
-    try:
-        _phone_get(f"/?torch={'on' if on else 'off'}")
-        s = _phone_info()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    pct = s["battery_percent"]
-    result = {"ok": True, **s, "low_battery": pct is not None and pct <= PHONE_LOW_BATTERY_PCT}
-    if s["torch_on"] is not None and s["torch_on"] != bool(on):
-        result["ok"] = False
-        result["error"] = f"asked for torch {'on' if on else 'off'} but the phone reports it {'on' if s['torch_on'] else 'off'}"
-    return result
-
-
-PHOTO_DIR = Path(os.environ.get("ELLAMA_PHOTO_DIR") or REPO_ROOT / "recordings" / "photos")
-PHOTO_MOVED_IN = 0.2    # wheel travel (|left|+|right|) during the fetch that counts as "moved"
-PHOTO_MOVED_DEG = 1.0   # or this much IMU yaw change
-
-
-def _write_photo(jpeg, dest_dir, name, meta):
-    """Save jpeg as dest_dir/<YYYYmmdd_HHMMSS>[_name].jpg with a .json sidecar holding meta.
-    The folder gets its own .gitignore so photos never show up in git status. Returns the
-    jpg path."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    gi = dest_dir / ".gitignore"
-    if not gi.exists():
-        gi.write_text("*\n")   # ignores everything here, itself included
-    stem = time.strftime("%Y%m%d_%H%M%S")
-    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", name or "").strip("_")[:40]
-    if slug:
-        stem += "_" + slug
-    path, n = dest_dir / f"{stem}.jpg", 2
-    while path.exists():   # two photos in the same second
-        path, n = dest_dir / f"{stem}_{n}.jpg", n + 1
-    path.write_bytes(jpeg)
-    path.with_suffix(".json").write_text(json.dumps({**meta, "file": path.name}, indent=2))
-    return path
-
-
-@mcp.tool()
-def save_photo(name: str = "", preview_width: int = 0, open_in_browser: bool = False,
-               lens: Optional[Literal["back", "front"]] = None):
-    """Read-only. Take a full-res photo with the phone camera and SAVE it on this computer,
-    returning its path, so you can open the file or run image recognition / any script on it
-    (all of that happens off the robot). Never moves the robot, no confirmation needed.
-
-    Returns `path` (the .jpg; a .json with the same facts sits next to it), `width`/`height`,
-    `brightness` (mean 0-255; low = consider the phone torch), `robot` (the odometry pose at
-    the moment of the photo: dist_avg_in and heading_deg since zero_odometry(), IMU
-    yaw/pitch/roll; null if the bridge isn't connected) and `moved_during_capture` (true if the
-    wheels or yaw changed during the ~1-2 s fetch, so the picture may be blurred or from a
-    slightly different spot).
-
-    The look-decide-move loop: drive_distance / turn_degrees (it stops itself) -> save_photo
-    -> look at the file, decide -> next move. Compare `robot` between photos to place them.
-    name is an optional label for the filename. preview_width > 0 also returns the picture
-    itself, downsized to that width (max 1280), so you can see it in this same call; leave 0
-    to keep the call cheap and open the file later. open_in_browser shows it in a browser
-    window on this computer. If the phone's photo endpoint doesn't answer within 12 s this
-    fails with an error; it never substitutes a frame of the live stream.
-
-    `lens` is "back" (the main camera) or "front", and switches the phone for this and every
-    later photo until something switches it back -- see look()."""
-    def pose():
-        if link is None:
-            return None
-        with link.lock:
-            return (link.enc.dist_l, link.enc.dist_r, link.orient.yaw)
-
-    before, t0 = pose(), time.monotonic()
-    try:
-        jpeg = _fetch_snapshot(lens)
-        im = PILImage.open(BytesIO(jpeg))
-        im.load()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    elapsed, after = time.monotonic() - t0, pose()
-    moved = None
-    if before is not None and after is not None:
-        moved = (abs(after[0] - before[0]) + abs(after[1] - before[1]) > PHOTO_MOVED_IN
-                 or abs(after[2] - before[2]) > PHOTO_MOVED_DEG)
-    robot = None
-    if link is not None:
-        s = link.telemetry_snapshot()
-        robot = {k: s.get(k) for k in ("dist_avg_in", "heading_deg", "yaw_deg", "pitch_deg",
-                                       "roll_deg", "telemetry_live", "imu_live")}
-    brightness = round(sum(im.convert("L").resize((64, 64)).getdata()) / 4096)
-    meta = {"taken_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "name": name or None,
-            "width": im.width, "height": im.height, "brightness": brightness,
-            "robot": robot, "moved_during_capture": moved, "elapsed_s": round(elapsed, 2)}
-    try:
-        path = _write_photo(jpeg, PHOTO_DIR, name, meta)
-    except OSError as e:
-        return {"ok": False, "error": f"could not save the photo: {e}"}
-    result = {"ok": True, "path": str(path), "width": im.width, "height": im.height,
-              "bytes": len(jpeg), "brightness": brightness, "robot": robot,
-              "moved_during_capture": moved, "elapsed_s": round(elapsed, 2)}
-    if open_in_browser:
-        page = path.with_suffix(".html")
-        page.write_text(
-            f'<!doctype html><meta charset="utf-8"><title>{path.name}</title>'
-            '<body style="margin:0;background:#111;display:flex;justify-content:center;'
-            f'align-items:center;min-height:100vh"><img src="{path.name}" '
-            'style="max-width:100vw;max-height:100vh;object-fit:contain"></body>')
-        try:
-            result["opened_in_browser"] = bool(webbrowser.open(page.as_uri()))
-        except Exception:
-            result["opened_in_browser"] = False
-    width = max(0, min(int(preview_width), CAM_MAX_WIDTH))
-    if width <= 0:
-        return result
-    small = im.convert("RGB")
-    if small.width > width:
-        small = small.resize((width, round(small.height * width / small.width)))
-    buf = BytesIO()
-    small.save(buf, "JPEG", quality=80)
-    return [json.dumps(result), Image(data=buf.getvalue(), format="jpeg")]
-
-
-@mcp.tool()
-def start_recording(name: Optional[str] = None, auto_photo: bool = False,
-                    video: bool = True) -> dict:
+def start_recording(name: Optional[str] = None) -> dict:
     """Read-only. Start recording telemetry to recordings/<name>/<name>.csv (name defaults
     to run_<timestamp>): one row per encoder/IMU sample, in the same format as
     calibration/live_view.py --csv, so analyze_csv.py reads it. Works while the stick
     controller drives -- this server sends nothing to the robot unless a drive tool is
-    called. Never moves the robot, no confirmation needed. Use add_marker() and
-    take_photo() during the recording, stop_recording() when done.
+    called. Never moves the robot, no confirmation needed. Use add_marker() during the
+    recording, stop_recording() when done.
 
-    auto_photo=True: also take a photo by itself whenever the robot comes to rest (wheels
-    still for ~0.7 s) after moving at least ~4 in of wheel travel or ~10 deg of yaw since
-    the last photo, plus one at the start once still. Each PHOTO row is stamped when the
-    robot stopped; if it moves again before the snapshot arrives (~5-8 s), a MARK row
-    says so. Hold still until you've seen it happen, or accept the flag.
-
-    video=True (default): also record the phone's live video stream to video.mp4 in the
-    recording folder, plus video_times.csv (when each frame arrived, on the same time_s
-    clock as the CSV -- use it to sync, since the phone's frame rate varies). Also saves
-    commands.csv: every drive command the stick sent (time_s,left,right), if the bridge
-    has the firmware that relays them. A failed video start doesn't stop telemetry
-    recording; it's reported in the result."""
+    Also saves commands.csv: every drive command the stick sent (time_s,left,right), if
+    the bridge has the firmware that relays them."""
     if link is None:
         return _not_connected()
     try:
         path = link.recorder.start(name)
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    video_status = "off"
-    if video:
-        link.video = recording.VideoRecorder(_open_stream, link.recorder.now, link.recorder.dir)
-        link.video.start()
-        video_status = "recording (check video_error in stop_recording if video.mp4 is empty)"
-    if auto_photo:
-        threading.Thread(target=_auto_photo_loop, args=(link, path), daemon=True).start()
-    return {"ok": True, "csv": str(path), "auto_photo": auto_photo, "video": video_status,
-            **link.telemetry_snapshot()}
+    return {"ok": True, "csv": str(path), **link.telemetry_snapshot()}
 
 
 @mcp.tool()
@@ -1706,95 +1149,16 @@ def add_marker(text: str) -> dict:
     return {"ok": True, "time_s": round(t, 3), "note": text}
 
 
-_photo_lock = threading.Lock()  # path choice + PHOTO row must be atomic across threads
-
-
-def _capture_photo(lnk, note=""):
-    """Stamp a PHOTO row now, then fetch and save the snapshot. Returns (result dict,
-    stamped pose (dist_l, dist_r, yaw)) -- the pose lets callers tell if the robot moved
-    during the slow fetch."""
-    rec = lnk.recorder
-    with _photo_lock:
-        path = rec.next_photo_path()
-        label = f"{path.name} {note}".strip()
-        with lnk.lock:
-            t = rec.mark(lnk.enc, lnk.orient, "PHOTO", label)
-            pose = (lnk.enc.dist_l, lnk.enc.dist_r, lnk.orient.yaw)
-    try:
-        path.write_bytes(_fetch_snapshot())
-    except Exception as e:
-        with lnk.lock:
-            rec.mark(lnk.enc, lnk.orient, "MARK", f"{path.name} FAILED: {e}")
-        return {"ok": False, "error": str(e)}, pose
-    return {"ok": True, "photo": str(path), "time_s": None if t is None else round(t, 3)}, pose
-
-
-def _auto_photo_loop(lnk, csv_path):
-    """Watches for the robot coming to rest and photographs it. Runs until this recording
-    (identified by its csv path) ends."""
-    rec = lnk.recorder
-    last = None          # pose at the last photo: (dist_l, dist_r, yaw); None until the first
-    still_since = None
-    while rec.active and rec.csv_path == csv_path:
-        time.sleep(AUTO_PHOTO_POLL_S)
-        now = time.monotonic()
-        sl, sr = rec.speed
-        if max(abs(sl), abs(sr)) >= AUTO_PHOTO_STILL_SPEED_IN_S:
-            still_since = None
-            continue
-        if still_since is None:
-            still_since = now
-        if now - still_since < AUTO_PHOTO_STILL_S:
-            continue
-        with lnk.lock:
-            cur = (lnk.enc.dist_l, lnk.enc.dist_r, lnk.orient.yaw)
-        if last is not None:
-            travel = abs(cur[0] - last[0]) + abs(cur[1] - last[1])
-            turn = abs(cur[2] - last[2])
-            if travel < AUTO_PHOTO_MIN_TRAVEL_IN and turn < AUTO_PHOTO_MIN_TURN_DEG:
-                continue
-        result, pose = _capture_photo(lnk, "auto")
-        last = pose
-        with lnk.lock:
-            after = (lnk.enc.dist_l, lnk.enc.dist_r, lnk.orient.yaw)
-            moved = (abs(after[0] - pose[0]) + abs(after[1] - pose[1]) >= 1.0
-                     or abs(after[2] - pose[2]) >= 3.0)
-            if moved and result.get("ok") and rec.csv_path == csv_path:
-                rec.mark(lnk.enc, lnk.orient, "MARK",
-                         f"{Path(result['photo']).name} robot moved during capture")
-        still_since = None
-
-
-@mcp.tool()
-def take_photo(note: str = "") -> dict:
-    """Read-only. While recording, take a full-size photo with the phone camera and save
-    it next to the CSV (photo_001.jpg, ...), with a PHOTO row at the moment of the request
-    (the snapshot itself takes ~5-8 seconds). Never moves the robot. Use look() instead to
-    just view the camera without saving."""
-    if link is None:
-        return _not_connected()
-    if not link.recorder.active:
-        return {"ok": False, "error": "not recording; call start_recording() first"}
-    result, _ = _capture_photo(link, note)
-    return result
-
-
 @mcp.tool()
 def stop_recording() -> dict:
     """Read-only. Stop recording and close the CSV. Returns its path, duration and how
-    many samples, markers and photos were saved. Never moves the robot."""
+    many samples and markers were saved. Never moves the robot."""
     if link is None:
         return _not_connected()
-    video_summary = None
-    if link.video is not None:
-        video_summary = link.video.stop()
-        link.video = None
     summary = link.recorder.stop()
     if summary is None:
         return {"ok": False, "error": "not recording"}
     out = {"ok": True, **summary}
-    if video_summary is not None:
-        out["video"] = video_summary
     if summary["commands"] == 0:
         out["note"] = ("no stick commands were captured: either the stick wasn't driven, or "
                        "the bridge still has firmware that doesn't relay them (reflash "
@@ -1830,9 +1194,9 @@ def drive_distance(
     worry about reversing direction without a stop in between.
 
     Pick `pwm` deliberately, don't default to a "clearly visible" value: on any setup you
-    haven't personally verified, DRIVING_POLICY.md's floor is 5-10% duty (13-26). Capped
-    at MAX_SINGLE_MOVE_IN=60 inches per call -- chain further confirmed calls for more,
-    checking read_telemetry() between them.
+    haven't personally verified, DRIVING_POLICY.md's floor is 5-10% duty (13-26). There
+    is no per-call distance cap: a single call will drive as far as it is asked to, so
+    the stop-check-decide-move loop is the operator's to keep, not this tool's.
 
     direction is which way the robot travels; PWM sign is handled internally
     (FORWARD_PWM_SIGN in this file) but hasn't been verified against a live test yet --
@@ -1851,14 +1215,6 @@ def drive_distance(
         return gate
     if distance_inches <= 0:
         return {"ok": False, "error": "distance_inches must be positive"}
-    if distance_inches > MAX_SINGLE_MOVE_IN:
-        return {
-            "ok": False,
-            "error": f"distance_inches {distance_inches} exceeds the {MAX_SINGLE_MOVE_IN}in "
-            "per-call cap -- chain multiple confirmed calls instead, checking "
-            "read_telemetry() between them.",
-        }
-
     pwm = min(abs(int(pwm)), MAX_PWM_CEILING)
     if pwm == 0:
         return {"ok": False, "error": "pwm must be > 0"}
@@ -1882,12 +1238,6 @@ def drive_distance(
                     "bring the encoders back." % (pwm, PWM_DEADBAND),
                     "telemetry": snap}
         open_loop_s = distance_inches / predicted_speed
-        if open_loop_s > MAX_JOG_DURATION_S:
-            return {"ok": False, "error":
-                    "no encoder feedback: this move would be open-loop for %.1fs, over the "
-                    "%.0fs cap for an unmeasured move. Use a shorter distance or a higher pwm, "
-                    "or bring the encoders back." % (open_loop_s, MAX_JOG_DURATION_S),
-                    "telemetry": snap}
 
     prior_lights = _warn_blink(warn_lights)
     link.send_stop()
@@ -1985,17 +1335,21 @@ def turn_degrees(
     `degrees` turned, then stops. Same confirmed_safe gate and stop-before-moving
     behavior as drive_distance -- see its docstring and DRIVING_POLICY.md.
 
-    Uses the IMU, not the wheel encoders, as ground truth for how far the robot has
-    actually rotated. Verified 2026-09-27 (robot on the ground, four 90deg turns each
-    way): the encoder-differential estimate (dr-dl over track_width_in) read ~92 deg per
-    commanded 90deg turn while the robot visually rotated only ~47 deg -- wheel scrub
-    during an in-place spin makes the wheels turn much more than the chassis does, so
-    the encoders overestimate rotation by roughly 2x. The IMU yaw delta over those same
-    turns averaged ~49 deg, matching the ~47 deg observed by eye. The response still
-    includes encoder_degrees_estimate for reference, explicitly labeled unreliable.
+    The IMU is the ONLY thing this tool will turn by, and it refuses outright without a
+    live one -- there is deliberately no encoder fallback. Verified 2026-09-27 (robot on
+    the ground, four 90deg turns each way): the encoder-differential estimate (dr-dl over
+    track_width_in) read ~92 deg per commanded 90deg turn while the robot visually rotated
+    only ~47 deg -- wheel scrub during an in-place spin makes the wheels turn much more
+    than the chassis does. A 2026-09-29 re-run on the same floor measured ~1.7x rather
+    than ~2x, which is the point: the error moves with the surface, so no fixed correction
+    recovers it. The IMU yaw delta over those turns averaged ~49 deg, matching the ~47 deg
+    observed by eye. On this robot the encoders measure arcs and straight lines; they do
+    not measure spins. The response still includes encoder_degrees_estimate for reference,
+    explicitly labeled unreliable, but nothing reads it.
 
-    Capped at MAX_SINGLE_TURN_DEG=180 per call. direction "left" is counter-clockwise
-    viewed from above, matching calibration/bridge.py's heading convention.
+    There is no per-call cap on how far it will turn. direction "left" is
+    counter-clockwise viewed from above, matching bridge/'s heading
+    convention.
 
     By default (warn_lights=True) the WLED strip does a 1.5 s warning pattern (on, off, on,
     off, on, solid green at 50%) right before the motors start, then is restored when the
@@ -2009,31 +1363,21 @@ def turn_degrees(
         return gate
     if degrees <= 0:
         return {"ok": False, "error": "degrees must be positive"}
-    if degrees > MAX_SINGLE_TURN_DEG:
-        return {
-            "ok": False,
-            "error": f"degrees {degrees} exceeds the {MAX_SINGLE_TURN_DEG}deg per-call cap "
-            "-- chain multiple confirmed calls instead, checking read_telemetry() between "
-            "them.",
-        }
-
     snap = link.telemetry_snapshot()
     start = link.last_counts()
-    # The IMU is ground truth for rotation. Falling back to the encoder differential is a
-    # real option, not an equal one: it over-reads an in-place turn by ~2x from wheel
-    # scrub, and TURN_SCRUB_FACTOR only undoes the average of that.
-    if snap["imu_live"]:
-        feedback_source = "imu"
-    elif snap["telemetry_live"] and start is not None:
-        feedback_source = "encoders"
-    else:
+    # The IMU is the only thing allowed to measure a spin in place. The encoders are not a
+    # fallback for this: wheel scrub makes them over-read an in-place turn by ~2x, and by a
+    # ratio that moves with the surface, so there is no fixed divisor that fixes it.
+    if not snap["imu_live"]:
         return {
             "ok": False,
-            "error": "nothing can measure this turn: no live IMU, and no live encoders on "
-            "both wheels either. A timed turn is not this tool -- use jog(left_pwm, "
-            "right_pwm, duration_s) and watch it, or bring a sensor back.",
+            "error": "no live IMU, so nothing can measure this turn. The wheel encoders are "
+            "not a substitute for a spin in place -- scrub makes them over-read it by ~2x, "
+            "by a factor that changes with the surface. Bring the IMU back, or use "
+            "jog(left_pwm, right_pwm, duration_s) for a timed turn you watch yourself.",
             "telemetry": snap,
         }
+    feedback_source = "imu"
 
     pwm = min(abs(int(pwm)), MAX_PWM_CEILING)
     if pwm == 0:
@@ -2049,14 +1393,6 @@ def turn_degrees(
     with link.lock:
         start_yaw = link.orient.yaw
 
-    def encoder_turn_deg():
-        """Degrees turned per the wheel differential, scrub-corrected, or None."""
-        cur = link.last_counts()
-        if cur is None or start is None:
-            return None
-        dl = (cur[0] - start[0]) * in_per_tick
-        dr = (cur[1] - start[1]) * in_per_tick
-        return math.degrees((dr - dl) / track_width) / TURN_SCRUB_FACTOR
     # "left" (CCW, nose swings left) needs the right wheel driving real-forward and the
     # left wheel driving real-backward -- both relative to FORWARD_PWM_SIGN, not raw PWM
     # sign, the same correction drive_distance applies.
@@ -2075,18 +1411,9 @@ def turn_degrees(
             if time.monotonic() - last_send >= DRIVE_KEEPALIVE_S:
                 link.send_drive(left_pwm, right_pwm)
                 last_send = time.monotonic()
-            if feedback_source == "imu":
-                with link.lock:
-                    current_yaw = link.orient.yaw
-                turned_so_far = abs(current_yaw - start_yaw)
-            else:
-                turned_so_far = encoder_turn_deg()
-                if turned_so_far is None:
-                    abort_reason = ("an encoder stopped reporting mid-turn -- with no IMU "
-                                    "there is nothing left to measure the turn, so it was "
-                                    "cut short")
-                    break
-                turned_so_far = abs(turned_so_far)
+            with link.lock:
+                current_yaw = link.orient.yaw
+            turned_so_far = abs(current_yaw - start_yaw)
             if turned_so_far >= degrees:
                 break
             if time.monotonic() - t_start > timeout_s:
@@ -2114,15 +1441,11 @@ def turn_degrees(
         "direction": direction,
         "pwm_used": pwm,
         "feedback_source": feedback_source,
-        "actual_degrees_turned": (round(end_yaw - start_yaw, 1) if feedback_source == "imu"
-                                  else None if enc_deg is None
-                                  else round(enc_deg / TURN_SCRUB_FACTOR, 1)),
-        "measurement_note": ("IMU gyro-integrated yaw" if feedback_source == "imu" else
-                             "NO IMU: turned from the encoder differential divided by the "
-                             "measured %.2fx in-place scrub factor. Scrub varies with the "
-                             "surface, so treat this as approximate and check by eye."
-                             % TURN_SCRUB_FACTOR),
-        "imu_degrees": round(end_yaw - start_yaw, 1) if snap["imu_live"] else None,
+        "actual_degrees_turned": round(end_yaw - start_yaw, 1),
+        "measurement_note": "IMU gyro-integrated yaw -- the only source this tool will "
+                            "turn by; the encoder figure below is reported for reference "
+                            "and never steers the move",
+        "imu_degrees": round(end_yaw - start_yaw, 1),
         "encoder_degrees_estimate": None if enc_deg is None else round(enc_deg, 1),
         "encoder_estimate_unreliable": "wheel scrub during in-place turns inflates this "
         "~2x vs. the IMU/real rotation -- see this tool's docstring",
@@ -2185,8 +1508,8 @@ def drive_arc(
     `travel="reverse"` drives the same arc backing up: both wheels roll backward and the
     robot's heading still turns `direction` (left = counter-clockwise seen from above), so
     the outer wheel is the LEFT one for "left" (the opposite of a forward arc) and the
-    rear sweeps out along the path. The camera cannot see behind the robot, so only back
-    up into space the operator has said is clear. Forward then reverse arcs of the same
+    rear sweeps out along the path. Nothing on the robot senses what is behind it, so only
+    back up into space the operator has said is clear. Forward then reverse arcs of the same
     direction trace an S-curve: the robot ends facing the opposite way, displaced along its
     original axis by twice the radius and back on the same line laterally.
 
@@ -2634,7 +1957,8 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool,
     FORWARD_PWM_SIGN. This is for bench/commissioning tests where a fixed, observable
     duration matters more than hitting a distance or angle (checking direction, deadband,
     turn convention by eye). Same confirmed_safe gate as the other drive tools. Capped at
-    MAX_JOG_DURATION_S=10s and MAX_PWM_CEILING=125 per side.
+    MAX_PWM_CEILING=125 per side; duration_s has no upper bound, so an open-loop call runs
+    for exactly as long as it is given.
 
     By default (warn_lights=True) the WLED strip does a 1.5 s warning pattern (on, off, on,
     off, on, solid green at 50%) right before the motors start, then is restored when the
@@ -2652,8 +1976,8 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool,
     gate = _confirm_gate(confirmed_safe)
     if gate:
         return gate
-    if not (0 < duration_s <= MAX_JOG_DURATION_S):
-        return {"ok": False, "error": f"duration_s must be > 0 and <= {MAX_JOG_DURATION_S}"}
+    if duration_s <= 0:
+        return {"ok": False, "error": "duration_s must be > 0"}
 
     snap = link.telemetry_snapshot()
     if require_telemetry is None:
@@ -2710,7 +2034,7 @@ def speak_then_drive(text: str, pwm: int, duration_s: float, confirmed_safe: boo
     (checked BEFORE speaking, so a refused move says nothing). warn_lights=True (default)
     keeps the pre-move blink (1.25 s, fading on off on off on, solid green while moving) between
     the speech and the motors, sent over the realtime channel so it shows right after the
-    mouth closes; False starts the motors straight away. Capped at MAX_JOG_DURATION_S and MAX_PWM_CEILING."""
+    mouth closes; False starts the motors straight away. Capped at MAX_PWM_CEILING; duration_s has no upper bound."""
     if link is None:
         return _not_connected()
     gate = _confirm_gate(confirmed_safe)
@@ -2720,8 +2044,8 @@ def speak_then_drive(text: str, pwm: int, duration_s: float, confirmed_safe: boo
         return {"ok": False, "error": "direction must be 'forward' or 'reverse'"}
     if not (0 < pwm <= MAX_PWM_CEILING):
         return {"ok": False, "error": f"pwm must be 1-{MAX_PWM_CEILING}"}
-    if not (0 < duration_s <= MAX_JOG_DURATION_S):
-        return {"ok": False, "error": f"duration_s must be > 0 and <= {MAX_JOG_DURATION_S}"}
+    if duration_s <= 0:
+        return {"ok": False, "error": "duration_s must be > 0"}
     if require_telemetry is None:
         require_telemetry = "enc" in link.policy.required
     if require_telemetry and not link.telemetry_snapshot()["telemetry_live"]:
@@ -2781,15 +2105,6 @@ def speak_then_drive(text: str, pwm: int, duration_s: float, confirmed_safe: boo
         "telemetry": link.telemetry_snapshot(),
         "spoke_seconds": said.get("seconds"), "direction": direction, "pwm": pwm,
     }
-
-
-def _run_status(wait_s: float = 0.0) -> dict:
-    """State of the current autonomous run (perform): running / the reason it ended, the latest
-    info, and the result. wait_s (max 60) blocks until the run ends or that long passes."""
-    if _run["running"] and wait_s > 0:
-        _run["ended"].wait(min(wait_s, 60.0))
-    return {"ok": True, "running": _run["running"], "status": _run["status"],
-            "info": _run["info"], "result": _run["result"]}
 
 
 WLED_HOST = os.environ.get("ELLAMA_WLED_HOST", "192.168.0.57")
@@ -3170,220 +2485,6 @@ def hear(wait_seconds: float = 10.0, max_seconds: float = 20.0, pause_seconds: f
         _hear_lock.release()
 
 
-PERFORM_MAX_S = 420.0   # one perform() call never runs longer than this, whatever the file says
-PERFORM_FPS = 30
-PERFORM_BLINK_S = 1.5   # the usual pre-move warning blink, before a dancing show's countdown
-
-
-def _perform_loop(show, rend, dance, brightness, lead_in_s, start_s, end_s, audio, audio_offset_s,
-                  require_telemetry, tmp_wav):
-    """Runs on its own thread for the whole show (shares _run with the other autonomous runs:
-    stop() / listen() abort it, the drive tools refuse while it runs). One loop at PERFORM_FPS
-    paints the light bar from the show clock and, when dancing, re-sends the current beat's
-    wheel command every DRIVE_KEEPALIVE_S. Always finishes with a stop."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    proc, reason, prev_cmd, step_k, brake_until = None, "finished", (0, 0), -1, 0.0
-    last_send = last_check = last_info = 0.0
-    lead_sec = None
-    t = start_s
-    lnk = link
-    try:
-        _mouth.acquire(brightness)
-        if dance:
-            _blink(brightness=min(brightness, 127))  # same warning the drive tools give
-        wall0 = time.monotonic() + lead_in_s          # when show time == start_s
-        a_pos0 = start_s - audio_offset_s             # where in the audio file that moment falls
-        audio_wall = wall0 + max(0.0, -a_pos0)
-        rend.seek(start_s)
-        k0 = max(0, bisect.bisect_right(show.beats, start_s) - 1)
-        while True:
-            now = time.monotonic()
-            t = start_s + (now - wall0)
-            if _run["abort"].is_set():
-                reason = "stopped"
-                break
-            if t >= end_s:
-                break
-            if audio and proc is None and now >= audio_wall:
-                cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
-                if a_pos0 > 0:
-                    cmd += ["-ss", f"{a_pos0:.3f}"]
-                proc = subprocess.Popen(cmd + [audio], stdin=subprocess.DEVNULL)
-            if t < start_s and int(wall0 - now) != lead_sec:  # lead-in: a white blip each second
-                lead_sec = int(wall0 - now)
-                rend.pulse(0.6)
-            try:
-                sock.sendto(rend.frame(t), (WLED_HOST, 21324))
-            except OSError:
-                pass
-            if dance and lnk is not None:
-                if require_telemetry and now - last_check > 0.5:
-                    last_check = now
-                    if not lnk.telemetry_snapshot()["telemetry_live"]:
-                        reason = "telemetry_stale"
-                        break
-                if t >= start_s:
-                    k = bisect.bisect_right(show.beats, t) - 1
-                    if k >= 0:
-                        name, left, right = dance.move(k - k0)
-                    else:
-                        name, left, right = "hold", 0, 0
-                    if k != step_k:
-                        step_k = k
-                        if perform_show.reverses(prev_cmd, (left, right)):
-                            brake_until = now + STOP_SETTLE_S  # no sign reversal without a stop
-                    if now - last_send >= DRIVE_KEEPALIVE_S:
-                        last_send = now
-                        if now < brake_until:
-                            lnk.send_stop()
-                            prev_cmd = (0, 0)
-                        else:
-                            lnk.send_drive(left, right)
-                            prev_cmd = (left, right)
-            if now - last_info >= 1.0:
-                last_info = now
-                _run["info"] = {"t_s": round(t, 1), "of_s": round(end_s, 1),
-                                   "beat": max(0, bisect.bisect_right(show.beats, t) - 1), "dancing": bool(dance)}
-            time.sleep(max(0.0, 1.0 / PERFORM_FPS - (time.monotonic() - now)))
-    except Exception as e:
-        reason = f"error: {e}"
-    finally:
-        if lnk is not None and dance:
-            try:
-                lnk.send_stop()
-            except Exception:
-                pass
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
-        for _ in range(3):  # leave the bar dark, not frozen on the last frame
-            try:
-                sock.sendto(rend.dark(), (WLED_HOST, 21324))
-            except OSError:
-                pass
-            time.sleep(1 / PERFORM_FPS)
-        _mouth.release(2.6)
-        if tmp_wav:
-            try:
-                os.unlink(tmp_wav)
-            except OSError:
-                pass
-        _run["status"] = reason
-        _run["result"] = dict(status=reason, ended_at_s=round(t, 1))
-        _run["running"] = False
-        _run["ended"].set()
-        _speak_lock.release()
-
-
-@mcp.tool()
-def perform(midi_path: Optional[str] = None, bpm: Optional[float] = None,
-            audio_path: Optional[str] = None, synth: bool = False, dance: bool = False,
-            confirmed_safe: bool = False, dance_pwm: int = 60, spin_pwm: int = 85,
-            brightness: int = 127, lead_in_s: float = 3.0, audio_offset_s: float = 0.0,
-            start_s: float = 0.0, max_seconds: Optional[float] = None,
-            duration_s: float = 60.0, require_telemetry: Optional[bool] = None) -> dict:
-    """Light-bar show (and optionally a dance) timed to a song. Starts it and returns at once;
-    follow with perform_status(wait_s=...) and end early with stop().
-
-    Timing source (give one): midi_path = a .mid file, whose notes drive the bar (pitch = where
-    along the bar a coloured spot lands, kick = burst from the middle, snare = flash at both
-    ends, hats = sparkle) and whose tempo map gives the beat; or bpm (+ duration_s) = just
-    pulse and dance on a steady beat, which is the safer choice when the recording you will
-    play does not line up with any MIDI you have.
-    Sound (all optional): audio_path = a recording (mp3/wav/anything ffplay plays) played from
-    this computer's speakers in sync; synth=True = a small chiptune render of the MIDI instead
-    (the robot "sings" the melody). With neither, start your own player at the end of the
-    countdown. audio_offset_s = seconds the recording lags the MIDI/beat grid (+ = audio late;
-    ffplay also takes a few tenths of a second to start, so expect to tune this once).
-    Rehearse a piece of it with start_s / max_seconds. lead_in_s = countdown before the music
-    (a white blip per second), after the green warning blink if dancing.
-
-    dance=True also drives the wheels, open-loop, one move per beat (8-beat phrase: two arc
-    sways, rock forward/back, spin each way; it nets out near where it started). That MOVES
-    the robot, so it needs confirmed_safe=true after asking the operator, same as the drive
-    tools -- say it is a dance, for how long, and at what dance_pwm / spin_pwm. Forward effort
-    is touchy and spins need much more PWM (scrub), so they are separate. Each beat's command
-    is re-sent every 0.1 s, a stop is inserted when a wheel has to reverse, and stop() /
-    listen() ends the show with a stop. Lights-only (dance=False) needs no confirmation.
-    brightness is the strip's master (0-255, default 127 = 50%). Capped at 420 s."""
-    if not (midi_path or bpm):
-        return {"ok": False, "error": "give midi_path (a .mid file) or bpm"}
-    if midi_path and not Path(midi_path).expanduser().is_file():
-        return {"ok": False, "error": f"no such file: {midi_path}"}
-    if audio_path and not Path(audio_path).expanduser().is_file():
-        return {"ok": False, "error": f"no such file: {audio_path}"}
-    if synth and not midi_path:
-        return {"ok": False, "error": "synth=True needs midi_path (nothing to render from a bare bpm)"}
-    if synth and audio_path:
-        return {"ok": False, "error": "pick one sound source: audio_path or synth"}
-    if bpm is not None and not (40 <= bpm <= 240):
-        return {"ok": False, "error": "bpm must be 40-240"}
-    if not (0 <= brightness <= 255):
-        return {"ok": False, "error": "brightness must be 0-255"}
-    if not (0 <= lead_in_s <= 30):
-        return {"ok": False, "error": "lead_in_s must be 0-30"}
-    if not (0 <= dance_pwm <= MAX_PWM_CEILING and 0 <= spin_pwm <= MAX_PWM_CEILING):
-        return {"ok": False, "error": f"dance_pwm / spin_pwm must be 0-{MAX_PWM_CEILING}"}
-    if dance:
-        if link is None:
-            return _not_connected()
-        gate = _confirm_gate(confirmed_safe)
-        if gate:
-            return gate
-        snap = link.telemetry_snapshot()
-        if require_telemetry is None:
-            require_telemetry = "enc" in link.policy.required
-        if require_telemetry and not snap["telemetry_live"]:
-            return {"ok": False, "error": "no live encoder telemetry -- refusing to dance without it "
-                    "(pass require_telemetry=false only for a bench run you are watching)",
-                    "telemetry": snap}
-    elif _run["running"]:
-        return {"ok": False, "error": "an autonomous run / show is in progress; call stop() first"}
-    try:
-        show = (perform_show.Show.from_midi(str(Path(midi_path).expanduser())) if midi_path
-                else perform_show.Show.from_bpm(bpm, duration_s))
-    except Exception as e:
-        return {"ok": False, "error": f"could not read the timing source: {e}"}
-    if not (0 <= start_s < show.length_s):
-        return {"ok": False, "error": f"start_s must be 0 to {show.length_s:.1f}"}
-    end_s = min(show.length_s, start_s + PERFORM_MAX_S)
-    if max_seconds is not None:
-        end_s = min(end_s, start_s + max(1.0, max_seconds))
-    tmp_wav = None
-    audio = str(Path(audio_path).expanduser()) if audio_path else None
-    try:
-        if synth:
-            tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-            perform_show.synth_wav(show, tmp_wav)
-            audio = tmp_wav
-        rend = perform_show.LightRender(show)
-        dancer = perform_show.Dance(pwm=dance_pwm, spin_pwm=spin_pwm, sign=FORWARD_PWM_SIGN) if dance else None
-    except Exception as e:
-        if tmp_wav:
-            os.unlink(tmp_wav)
-        return {"ok": False, "error": f"could not prepare the show: {e}"}
-    if not _speak_lock.acquire(blocking=False):
-        if tmp_wav:
-            os.unlink(tmp_wav)
-        return {"ok": False, "error": "the strip is busy (speaking or another show)"}
-    _run["abort"].clear()
-    _run["ended"].clear()
-    _run.update(running=True, status="performing", info={}, result=None)
-    threading.Thread(target=_perform_loop, daemon=True,
-                     args=(show, rend, dancer, brightness, lead_in_s, start_s, end_s,
-                           audio, audio_offset_s, require_telemetry, tmp_wav)).start()
-    return {"ok": True, "started": True, "dancing": dance, "show_seconds": round(end_s - start_s, 1),
-            "bpm": round(show.bpm_hint, 1) if show.bpm_hint else None, "beats": len(show.beats),
-            "notes": len(show.notes), "pitch_range": [rend.lo, rend.hi],
-            "music_starts_in_s": round(lead_in_s + (PERFORM_BLINK_S if dance else 0.0), 1),
-            "audio": "synth" if synth else ("file" if audio_path else "none (start your own player)")}
-
-
-@mcp.tool()
-def perform_status(wait_s: float = 0.0) -> dict:
-    """Read-only. State of the perform() show: running / the reason it ended (finished, stopped,
-    telemetry_stale, error: ...), the show clock and beat while it runs. wait_s (max 60) blocks
-    until it ends or that long passes. Never moves the robot."""
-    return _run_status(wait_s)
 
 
 if __name__ == "__main__":

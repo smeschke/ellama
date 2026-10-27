@@ -72,10 +72,10 @@ why. Work upward from low PWM rather than starting at the target, and never reve
 without stopping first. stop() is always safe. Positive PWM drives a side forward, so
 jog(60, -60, 1.0) spins in place to the right.
 
-Prefer the tool that measures over the one that guesses: tags() gives a tag's bearing
-geometrically, read_range() gives millimetres. describe_view() is a small vision model
-writing prose about a photo -- useful for what no sensor reports, like clutter or a
-doorway, and not to be trusted as an obstacle sensor.
+Prefer the tool that measures over the one that guesses: read_range() gives millimetres,
+the encoders give distance travelled and the IMU gives heading. Nothing here sees the
+room, so anything you have not measured is for the operator to confirm, not for you to
+assume.
 
 Call sensors() before trusting any reading. Sensors appear and disappear on their own, so
 check what is live rather than assuming. Three states that are NOT the same: live and

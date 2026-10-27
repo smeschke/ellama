@@ -7,7 +7,7 @@ encoders and stops itself at the target, rather than a fixed-time open-loop comm
 Talks over the same USB-serial link as `calibration/live_view.py`:
 [`firmware/computer_bridge/computer_bridge.ino`](../firmware/computer_bridge/computer_bridge.ino)
 on a spare ESP32, plugged into whatever machine runs this server. Reuses
-[`calibration/bridge.py`](../calibration/bridge.py) for serial I/O, line parsing, and the
+[`bridge/`](../bridge/) for serial I/O, line parsing, and the
 distance/heading/range math — one place that logic lives, not two.
 
 **Read [`../DRIVING_POLICY.md`](../DRIVING_POLICY.md) before using this.** The short
@@ -57,9 +57,11 @@ stationary wheel.
 
 ## Setup
 
-`robot_server.py` imports [`calibration/bridge.py`](../calibration/bridge.py) from this
-same repo, so the server and `calibration/live_view.py` compute distance, heading and range
-from one copy of that math.
+`robot_server.py` imports the top-level [`bridge/`](../bridge/) package from this same
+repo, so the server and `calibration/live_view.py` compute distance, heading and range from
+one copy of that math. It lived at `calibration/bridge.py` until 2026-10-24; it is a shared
+client library for the bridge firmware, not a calibration script. Note that `config.json`
+stayed in `calibration/`, and `bridge/__init__.py` resolves it by an explicit path.
 
 ```
 python3 -m venv --system-site-packages mcp_server/.venv
@@ -83,7 +85,6 @@ All of these are startup defaults; the sensor and guard ones are settable at run
 |---|---|
 | `ELLAMA_SERIAL_PORT` | explicit serial port; default auto-detects |
 | `ELLAMA_REQUIRED_SENSORS` | comma/space separated starting policy, default `enc,imu`; set it empty to require none |
-| `ELLAMA_CAM_URL` | the phone's camera address (`192.168.0.54`, or a full URL). Optional — `set_camera()` gives it at runtime instead. Never searched for |
 | `ELLAMA_TILT_LIMIT_DEG`, `ELLAMA_TILT_LOOKAHEAD_S`, `ELLAMA_TILT_GUARD` | tilt guard start values (`set_guard` changes them live) |
 
 Register with an MCP client via `.mcp.json` (already set up at the repo root) or run
@@ -103,19 +104,12 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `set_required_sensors(names, confirmed_safe)` | No | `confirmed_safe` — it changes what the robot will do with no feedback |
 | `guards()` | No | — |
 | `set_guard(name="tilt", mode=None, limit_deg=…, lookahead_s=…)` | No | No (it cannot clear a latched fault) |
-| `look(width=640, lens=None)` | No | — (`lens` is `"back"`/`"front"`, and leaves the phone switched) |
-| `set_camera(address)` | No | — (the phone's address, checked immediately; nothing is scanned or remembered) |
-| `camera_stream(lens=None)` | No | — (returns the MJPEG **URL**, not video; one lens at a time) |
-| `save_photo(name="", preview_width=0, open_in_browser=False, lens=None)` | No | — (saves a full-res photo to `recordings/photos/` with a `.json` of the robot's pose; `preview_width` > 0 also returns the picture) |
-| `phone_status()` | No | — (the phone's battery percent, torch state and current lens, from the camera app's `/info.json`; `low_battery` at or below 20%) |
-| `torch(on)` | No | — (phone flashlight on/off, state read back; turn it on when the view is dark, off when idle -- it drains the phone) |
 | `zero_odometry()` | No | — |
 | `stop()` | Commands zero PWM (active braking) | No — always safe |
 | `listen()` | Stops and releases control to the stick controller | No — always safe |
 | `connect(port=None)` | No | — |
-| `start_recording(name=None, auto_photo=False)` | No | No |
+| `start_recording(name=None)` | No | No |
 | `add_marker(text)` | No | No |
-| `take_photo(note="")` | No | No |
 | `stop_recording()` | No | No |
 | `drive_distance(distance_inches, direction, pwm, confirmed_safe, encoder="both")` | Yes | Yes |
 | `turn_degrees(degrees, direction, pwm, confirmed_safe)` | Yes | Yes |
@@ -129,78 +123,20 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `list_light_effects()` | No | — |
 | `lights_blink(blinks=2, phase_s=0.3, color="00ff00", brightness=127, restore=True, fade=True)` | No (on off on off on = 1.5 s by default, each phase fading) | — |
 | `speak(text, speed=1.3, max_brightness=127)` | No (Piper TTS out of this computer's speakers, WLED strip animates a mouth; blocks until done. Env: `ELLAMA_PIPER`, `ELLAMA_PIPER_VOICE`) | — |
-| `perform(midi_path=None, bpm=None, audio_path=None, synth=False, dance=False, confirmed_safe=False, dance_pwm=60, spin_pwm=85, brightness=127, lead_in_s=3, audio_offset_s=0, start_s=0, max_seconds=None)` | Only with `dance=True` (open-loop wheel moves, one per beat) | Only with `dance=True` — lights + sound need none |
-| `perform_status(wait_s=0)` | No | — |
 | `hear(wait_seconds=10, max_seconds=20, pause_seconds=0.8)` | No (records the webcam mic on this computer, waits for speech, stops at a pause, transcribes with faster-whisper `base.en`; blocks. Alternate with `speak` for a conversation. Env: `ELLAMA_MIC`, `ELLAMA_MIC_MATCH`, `ELLAMA_WHISPER`. Test: `.venv/bin/python hearing.py`) | — |
-
-### `perform` — a song on the mouth bar (and a dance)
-
-Starts a light show timed to a MIDI file (or just a tempo) and returns at once; `perform_status(wait_s)`
-follows it, `stop()` ends it. Engine: [`perform.py`](perform.py) (pure logic, tested offline); the thread
-and the tools are in `robot_server.py`.
-
-- **Timing**: `midi_path` (notes drive the bar: pitch = where a coloured spot lands, kick = burst from the
-  middle, snare = flash at both ends, hats = sparkle; the tempo map gives the beat) or `bpm` + `duration_s`
-  (beat pulses only — the safer choice when your recording won't line up with any MIDI you have).
-- **Sound**: `audio_path` plays a recording from this computer (ffplay) in sync; `synth=True` renders the MIDI
-  as a chiptune ("the robot sings"); neither = start your own player at the end of the countdown. ffplay takes a
-  few tenths of a second to start, so tune `audio_offset_s` once. Rehearse a bit with `start_s` / `max_seconds`.
-- **Dance** (`dance=True`): one open-loop move per beat, re-sent every 0.1 s — an 8-beat phrase of two arc sways,
-  rock forward/back, spin each way. It needs `confirmed_safe=true` like any drive tool (and live telemetry,
-  unless `require_telemetry=false`), a green warning blink first, and a stop is inserted whenever a wheel has to
-  reverse. Forward effort and spins are separate knobs (`dance_pwm`, `spin_pwm`) because spins need far more PWM
-  to beat wheel scrub. The sway's inner wheel (40% of `dance_pwm`) is under the motor deadband at 60, so the
-  sway is really a pivot on one wheel. Not yet run on the robot; try it on blocks first.
-- No MIDI of a copyrighted song is bundled; supply your own `.mid` (and recording).
-
-### One phone, given at runtime
-
-The robot carries **one** Android phone running "Android IP Camera". Its address is handed to
-the server and never guessed at: `set_camera("192.168.0.54")` while it runs, or
-`ELLAMA_CAM_URL` before it starts. A bare IP gets `https` and port `4444` filled in. Nothing
-scans the network and nothing is cached between runs, so a wrong address is an error that
-says so rather than a 30 s search. `set_camera` reads the app's info endpoint before
-accepting, and keeps the previous address if the new one does not answer.
-
-That one phone has **two lenses**, and the app serves one at a time. `lens="back"` is the
-main camera pointing where the robot drives; `lens="front"` is the selfie camera. Passing
-`lens` *switches the phone and leaves it switched* — it is a state change, not a per-call
-parameter, so there is no way to read both lenses at the same moment and no way to run a
-front and a rear stream at once. `phone_status()` reports which lens it is on. Omitting
-`lens` uses whatever it is already on and saves ~1 s of settling.
-
-> The lens-switch request (`/?camera=back|front`) is **not yet verified against the phone**.
-> If switching answers but the picture does not change, `CAM_LENS_PARAM` and
-> `CAM_LENS_VALUES` in `robot_server.py` are the only two lines to correct.
-
-`look()` returns a full-res photo, or a clear error; it never substitutes a frame of the live
-stream. A photo takes ~1-8 s and fails after 12 s. If the app answers but no photo comes
-back, the error says so (restart the camera app on the phone). It is advisory vision only and
-does not replace `confirmed_safe`. `camera_stream()` returns the MJPEG **URL** for a browser,
-VLC, ffmpeg or a script to open — an MCP result cannot carry a stream.
-
-`save_photo()` is the same camera, saved to a file instead of shown: it writes
-`recordings/photos/<time>[_name].jpg` (override with `ELLAMA_PHOTO_DIR`) plus a `.json` with the
-robot's odometry pose at that moment, the image brightness, and `moved_during_capture`. The
-folder ignores itself in git. It is the hook for off-robot image work and for the loop *drive ->
-stop -> photo -> analyse -> decide -> drive*: the `drive_*` / `turn_degrees` tools stop
-themselves, `save_photo` takes the picture and returns its path (add `preview_width=640` to
-see it in the same call), and any script or model on this computer can read the file. Compare
-`robot.dist_avg_in` / `heading_deg` between photos to place them; call `zero_odometry()` first
-if you want them relative to a start point.
 
 ## Recording a stick-driven run
 
 The server can log telemetry while you drive with the stick: it only transmits when a drive
 tool is called, so the bridge stays listen-only. Ask the agent to `start_recording`, drive,
-ask for markers and photos as you go, then `stop_recording`. Everything lands in
+ask for markers as you go, then `stop_recording`. Everything lands in
 `recordings/<name>/`:
 
 - `<name>.csv` — same columns as `calibration/live_view.py --csv`, plus `range_closest_mm`
   and a trailing `note` column, so `python3 calibration/analyze_csv.py
   recordings/<name>/<name>.csv` works. Rows are `ENC` / `IMU` samples, a row per packet from
   any other sensor with its own name as the source (`TOF_FRONT`, …), plus `MARK` (from
-  `add_marker`), `PHOTO` (from `take_photo`) and `CONFIG` (a guard or sensor-policy change,
+  `add_marker`) and `CONFIG` (a guard or sensor-policy change,
   so a run shows what it was driven under) rows that carry the state at that moment and the
   text, filename or setting in `note`.
   A numeric cell that is not known holds `nan`, never `0` — `enc_heading_deg` is `nan`
@@ -208,16 +144,6 @@ ask for markers and photos as you go, then `stop_recording`. Everything lands in
   one would look plausible and drift without bound. `analyze_csv.py` loads those fine
   (`float("nan")` is a number), but an unguarded mean over such a column comes out NaN,
   which is the honest answer: part of that run was not measured.
-- `photo_001.jpg`, ... — full-size phone-camera snapshots. The `PHOTO` row is stamped when the
-  photo is requested; the snapshot itself arrives ~5-8 s later.
-
-`start_recording(auto_photo=True)` photographs the robot by itself whenever it comes to rest
-(wheels still ~0.7 s) after moving at least ~4 in of wheel travel or ~10° of yaw since the
-last photo, plus one at the start. The `PHOTO` row is stamped when the robot stopped. The
-snapshot takes ~5-8 s, so if the robot moves again before it arrives, a `MARK` row notes
-"robot moved during capture" and that photo shouldn't be trusted for pose. Thresholds are
-the `AUTO_PHOTO_*` constants in `robot_server.py`.
-
 Only one program can hold the bridge's serial port, so `live_view.py` can't run at the same
 time. Only one ESP32 may transmit drive commands at a time: keep the stick controller on for
 this (nothing is sent to the robot) and don't call a drive tool while it drives.
@@ -230,18 +156,22 @@ median and needs neither encoder nor yaw, which is what makes it usable when the
 are not trustworthy. What they do without that sensor depends on the
 policy, and every result says which feedback it actually used: `drive_distance` falls back
 to a timed move off the measured PWM-speed curve with `closed_loop: false` and
-`distance_source` saying it was predicted rather than measured; `turn_degrees` falls back to
-the encoder differential divided by the measured 1.96x scrub factor, with
-`feedback_source: "encoders"`. `drive_arc` has no fallback and says so — "curve until the
+`distance_source` saying it was predicted rather than measured; `turn_degrees` has no fallback — it
+requires a live IMU and refuses without one, because wheel scrub makes the encoders
+over-read a spin in place by ~2x and by a ratio that moves with the surface (operator
+policy, 2026-10-24: encoders measure arcs and straight lines on this robot, never spins).
+`drive_arc` has no fallback and says so — "curve until the
 yaw reads N degrees" has no meaning without yaw, and a fixed wheel split for a fixed time is
 just `jog`. All of them abort mid-move, rather than raising, if an encoder drops out while
 the wheels are turning. They always stop-and-settle before starting (so a direction
-reversal is never commanded without a stop in between), and cap how far a single call
-can go (`MAX_SINGLE_MOVE_IN` / `MAX_SINGLE_TURN_DEG` in `robot_server.py`) — chain
-further confirmed calls for more, checking `read_telemetry()` between them, per
-`DRIVING_POLICY.md`'s stop-check-decide-move loop. `jog` is the odd one out: open-loop,
-raw PWM, fixed duration, no target — for bench/commissioning tests, capped at
-`MAX_JOG_DURATION_S`.
+reversal is never commanded without a stop in between). There is **no per-call cap** on
+distance, turn angle or jog duration: one call will drive as far, turn as far, or run as
+long as it is asked to. `DRIVING_POLICY.md`'s stop-check-decide-move loop — short moves,
+`read_telemetry()` between them — is therefore the operator's discipline to keep, with
+nothing in this server enforcing it. `jog` is the odd one out in the other direction:
+open-loop, raw PWM, fixed duration, no target, so nothing stops it early either — it is
+for bench/commissioning tests. `MAX_PWM_CEILING` and the `drive_arc` caps
+(`MAX_SINGLE_ARC_DEG` / `MAX_SINGLE_ARC_IN` / `MIN_ARC_RADIUS_IN`) still apply.
 
 **Which encoder measures a move.** `drive_distance` and `drive_arc` take
 `encoder="both"` (the default, averaging the wheels), `"left"` or `"right"`. One wheel is
@@ -280,11 +210,26 @@ lead together.
 
 ## Known unknowns
 
-- **Direction sign: verified 2026-09-27.** Robot on blocks, wheels free to spin,
-  `drive_distance(distance_inches=12, direction="forward", pwm=50, ...)` — all four
-  wheels visibly spun backwards. `FORWARD_PWM_SIGN` is now `-1` to correct for this.
-  Re-verify the same way after any change to wiring, motor board firmware, or which
-  physical wheel is "left" vs "right".
+- **Direction sign: re-verified 2026-10-24, on the ground.** Repeated
+  `drive_distance(direction="forward", pwm=60, encoder="right")` moves drove the robot
+  backwards, confirmed by the operator watching it, and the front ToF range never closed
+  over ~13in of travel. `FORWARD_PWM_SIGN` is now `1`.
+  This replaces the 2026-09-27 reading (robot on blocks, wheels free to spin, wheel
+  rotation judged by eye), which concluded `-1`. Judging rotation direction on a jacked-up
+  robot got it backwards; verify on the ground, by where the robot actually ends up.
+  Confirmed 2026-10-24 by watching the robot: `jog(+50, +50, 1s)` moved it forward.
+  **There is now an arrow drawn on the chassis marking forward** — the robot is
+  symmetrical, so there is no other way to tell, and that is how this got recorded
+  backwards for a month.
+  Re-verify after any change to wiring, motor board firmware, or which physical wheel is
+  "left" vs "right" — and verify it by where the robot ends up, never by the ticks a
+  "forward" command produces, which assumes the answer.
+- **Encoder count direction: `(-1, -1)` since 2026-10-24.** Forward travel counts the
+  encoders *down* on this robot. The earlier `(1, 1)` was read off a "forward"
+  `drive_distance`, which applied the then-wrong `FORWARD_PWM_SIGN` — so it recorded a
+  backward move's tick direction and called it forward. Only `drive_arc` reads this
+  (`traveled_inches` is unsigned, so `drive_distance` is unaffected). Only the right
+  channel was verified; the left was dead at the time and its `-1` is assumed by symmetry.
 - **Wheel encoders overestimate in-place turns by ~2x — verified 2026-09-27.** Robot on
   the ground, four 90° turns left then four right, pwm=60: the encoder-differential
   estimate (`dr - dl` over `track_width_in`) reported ~92° per commanded 90° turn, but
@@ -320,8 +265,7 @@ that watches the lean of the chassis and stops the robot before it goes over.
   recordings in `recordings/` that carry tilt data, the worst ordinary tilt seen was 5.7 deg, no trips.
 - **What it does:** sends `stop` from the IMU thread within ~20 ms of the sample, **latches**,
   and refuses every drive command (`send_drive` is the single choke point, so `jog`,
-  `drive_*`, `turn_*` and `perform` are all covered) until
-  `clear_tilt_fault`. Autonomous runs are aborted; blocking tools return
+  `drive_*` and `turn_*` are all covered) until `clear_tilt_fault`. Blocking tools return
   `{"ok": false, "error": "tilt guard: ...", "tilt_guard": {...}}`.
 - **No IMU is a fact, not a refusal:** with the IMU silent for 0.5 s this guard reports
   `active: false` with `inactive_because: "no live IMU"` and stops judging. Whether the robot
@@ -349,11 +293,9 @@ that watches the lean of the chassis and stops the robot before it goes over.
 All offline, no robot needed:
 
 ```
-ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_sensors.py       # 24: registry, policy, degraded modes
+ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_sensors.py       # 26: registry, policy, degraded modes
 ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_tilt_guard.py    # 14: + the send_drive choke point
-ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_drive_feedback.py # 35: encoder= selection, range approach, jog guard restore
-ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_phone_status.py  #  6
-ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_save_photo.py    #  6
+ELLAMA_SERIAL_PORT=/dev/none .venv/bin/python test_drive_feedback.py # 34: encoder= selection, spin needs the IMU, range approach, jog guard restore
 ```
 
 `test_sensors.py` covers the states that are slow to stage on a real robot: an encoder
@@ -379,3 +321,13 @@ person tracking (`turn_to_me*`, `person_view`) were built on 2026-10-02/03 and t
 `before-experiment-removal`; the run videos and pose models are in
 `~/ellama_experiments_archive/`. The write-up of what worked and what did not is the doc
 "eLlama experiments: line following and person tracking".
+
+The phone camera went the same way on 2026-10-26: `look`, `tags`, `describe_view`,
+`set_camera`, `camera_stream`, `phone_status`, `torch`, `save_photo` and `take_photo`, the
+`auto_photo` and video recording in `start_recording`, and `recording.VideoRecorder`. The
+robot no longer carries a phone. `tools/find_tags.py` is still there and still works on an
+image file from any source. Git history before this commit has all of it.
+
+`perform` and `perform_status` went too, on the same day, along with `perform.py` (the MIDI
+light-show and dance engine) and the `_run` autonomous-run bookkeeping they were the only
+user of. `speak`, `hear`, `lights`, `lights_blink` and `list_light_effects` are untouched.

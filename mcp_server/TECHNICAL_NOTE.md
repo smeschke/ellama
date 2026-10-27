@@ -13,8 +13,8 @@ measured while building it. Every number below comes from a logged run in
 The agent calls tools; the server talks to the robot over USB serial through a bridge ESP32.
 
 - `drive_distance` stops on **wheel-encoder** ticks. `turn_degrees` stops on **IMU gyro yaw**.
-  `drive_arc` follows a curved path. `read_telemetry` and `look` (a phone camera on the robot)
-  give the agent state to reason about between moves.
+  `drive_arc` follows a curved path. `read_telemetry` and `sensors` give the agent state
+  to reason about between moves.
 - Every tool that can move the robot requires `confirmed_safe=true`, which the agent may only
   set after asking the human operator about that specific move. The robot has no obstacle
   sensors, so the server cannot verify that the area is clear on its own.
@@ -71,8 +71,8 @@ can flip it or damage it, and nothing undoes that.
 ## Limits
 
 - **No obstacle sensing.** Wheel encoders and an IMU tell the agent how far it went, not whether the
-  path was clear. This is why every move needs a human confirmation. The `look()` camera is advisory
-  only and does not replace it.
+  path was clear. The forward range sensors see two narrow cones and nothing else. This is why
+  every move needs a human confirmation.
 - **Per-unit numbers.** The tables above describe one unit, on one surface. Hand-built units differ
   in wheel alignment, and the calibration scripts (`characterize_speed.py`, `characterize_turns.py`)
   are meant to be re-run per robot. Some encoder and PWM sign constants in `robot_server.py` are
