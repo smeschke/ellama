@@ -172,7 +172,7 @@ open-loop robot nobody is measuring. Guards follow the same logic: turn one
 off when it is wrong for the job (a ramp the robot is meant to climb is a
 real lean to the tilt guard), not because it is inconvenient.
 
-**Example: noticing a stall the tool didn't report.** During a camera scan in
+**Example: noticing a stall the tool didn't report.** During a scan in
 35° in-place steps, one step took 5.9 s instead of ~1.9 s, and the wheel
 encoders counted about three times the rotation of the previous steps (173°
 against ~56°) while the IMU reported the same ~34° turn. The tool still
@@ -184,8 +184,8 @@ a person's foot, deliberately). The operator stopped, released control with
 of continuing the scan. It guessed a wall was the cause and was wrong; it
 flagged that as a guess. The rule this illustrates: an operator without
 obstacle sensors has no way to see what the robot is up against, so when
-wheel motion, timing or the camera disagree with what the IMU says happened,
-treat it as "something is in the way," stop, and ask before sending the next
+wheel motion or timing disagree with what the IMU says happened, treat it as
+"something is in the way," stop, and ask before sending the next
 command, instead of finishing the sequence.
 
 The robot now has forward-facing range sensors (`read_range()`), which
@@ -211,9 +211,8 @@ the move, not whether to do it; section 1 still applies.
 
 **Robot facts that matter:** it is 22 in wide at the wheels, 24 in long and
 10 in tall. The wheels are the widest part, and rubbing up to about 1 in per
-side is fine. The camera is centered on the robot, 10 in off the ground, so
-the image's center column is the robot's centerline. Forward moves drift left
-by about 1.5° per foot, so aim a touch right of center on a long approach.
+side is fine. Forward moves drift left by about 1.5° per foot, so aim a touch
+right of center on a long approach.
 The smallest in-place turn is about 3–4°, so a sideways shift is an S-turn
 (turn, a short drive, turn back), not an aim.
 

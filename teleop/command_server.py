@@ -98,7 +98,9 @@ class Link:
                 raise SystemExit("no /dev/ttyUSB* or /dev/ttyACM* found; "
                                  "pass --port or use --dry-run")
             port = found[0]
-        self.ser = serial.Serial(port, baud, timeout=0.1)
+        # exclusive=True: refuse to attach to a port something else already owns, rather
+        # than resetting the ESP32 and splitting the byte stream with it.
+        self.ser = serial.Serial(port, baud, timeout=0.1, exclusive=True)
         print(f"serial: {port} @ {baud}, waiting {BOOT_WAIT_S}s for ESP32 boot")
         time.sleep(BOOT_WAIT_S)
         self.ser.reset_input_buffer()

@@ -1,13 +1,13 @@
-"""Telemetry recording for robot_server.py: one CSV per recording plus saved photos.
+"""Telemetry recording for robot_server.py: one CSV per recording.
 
 The CSV has the same columns as calibration/live_view.py --csv (so analyze_csv.py reads
 it) plus a trailing "note" column. A row is written per ENC or IMU sample, holding the
 latest value of the other stream, with source "ENC" / "IMU". Any other SensorPacket sender
 writes a row with its own name as the source (e.g. "TOF_FRONT") and its values in "note",
-so a sensor added later lands in the CSV with no change here. add_marker() and photos write
-extra rows with source "MARK" / "PHOTO", and a guard or sensor-policy change writes one
-with source "CONFIG": same numeric columns (the state at that moment) and the text, photo
-filename or setting in "note".
+so a sensor added later lands in the CSV with no change here. add_marker() writes an
+extra row with source "MARK", and a guard or sensor-policy change writes one with source
+"CONFIG": same numeric columns (the state at that moment) and the text or setting in
+"note".
 
 Columns that can be unknown rather than wrong: a numeric cell holds "nan" when the value
 is not known, which for enc_heading_deg means one of the encoders was not responding. It
@@ -20,9 +20,6 @@ Alongside the CSV, a recording directory can also hold:
   commands.csv     time_s,left,right -- every drive command the bridge overheard (the stick's),
                    stamped on arrival, same time_s clock as the main CSV. Empty if the bridge
                    firmware is too old to relay them.
-  video.mp4        the phone camera's stream (VideoRecorder below)
-  video_times.csv  frame,time_s -- when each video frame arrived, same clock. Use this, not
-                   the nominal mp4 frame rate, to line video up with the telemetry.
 
 Lock order: RobotLink.lock first, then Recorder's own lock -- never the reverse.
 """
@@ -53,7 +50,7 @@ class Recorder:
         self._cmds = 0
         self.dir = self.csv_path = None
         self._t0 = 0.0
-        self._rows = self._markers = self._photos = 0
+        self._rows = self._markers = 0
         self._speed = (0.0, 0.0)
         self._acc = (0.0, 0.0, 0.0)
         self._range_mm = None
@@ -86,7 +83,7 @@ class Recorder:
             self._cmd_writer.writerow(["time_s", "left", "right"])
             self._cmds = 0
             self._t0 = time.monotonic()
-            self._rows = self._markers = self._photos = 0
+            self._rows = self._markers = 0
             self._speed = (0.0, 0.0)
             self._acc = (0.0, 0.0, 0.0)
             self._range_mm = None
@@ -103,7 +100,7 @@ class Recorder:
             self._cmd_file = self._cmd_writer = None
             return dict(csv=str(self.csv_path), dir=str(self.dir),
                         duration_s=round(time.monotonic() - self._t0, 1),
-                        samples=self._rows, markers=self._markers, photos=self._photos,
+                        samples=self._rows, markers=self._markers,
                         commands=self._cmds)
 
     def on_enc(self, enc, orient, speed_l, speed_r):
@@ -145,19 +142,12 @@ class Recorder:
         return time.monotonic() - self._t0
 
     def mark(self, enc, orient, source, note):
-        """Write a MARK / PHOTO row carrying the current state. Returns its time_s."""
+        """Write a MARK row carrying the current state. Returns its time_s."""
         t = self._write(source, enc, orient, note)
         if t is not None:
             with self._lock:
-                if source == "PHOTO":
-                    self._photos += 1
-                else:
-                    self._markers += 1
+                self._markers += 1
         return t
-
-    def next_photo_path(self):
-        with self._lock:
-            return self.dir / f"photo_{self._photos + 1:03d}.jpg"
 
     def _write(self, source, enc, orient, note):
         with self._lock:
@@ -189,97 +179,3 @@ class Recorder:
             self._writer.writerow(row)
             self._file.flush()
             return t
-
-
-class VideoRecorder:
-    """Records an MJPEG stream to <dir>/video.mp4 plus <dir>/video_times.csv.
-
-    A thread reads `open_stream()` (a callable returning a file-like of multipart MJPEG),
-    cuts it into JPEG frames, and writes each to the mp4 and its arrival time (via `clock`,
-    seconds since the recording began) to the times file. The mp4 is written at a nominal
-    `fps`; the phone's real rate wanders, so the times file is the truth for syncing. If the
-    stream drops it reconnects until stop(). Frames are written as received -- orientation
-    and size are the phone's.
-    """
-
-    def __init__(self, open_stream, clock, out_dir, fps=15.0):
-        self._open, self._clock, self.dir, self.fps = open_stream, clock, Path(out_dir), fps
-        self._stop = threading.Event()
-        self._thread = None
-        self.frames = 0
-        self.reconnects = 0
-        self.error = None
-        self.size = None
-
-    def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-        return dict(video=str(self.dir / "video.mp4"), frames=self.frames, size=self.size,
-                    reconnects=self.reconnects, error=self.error)
-
-    def _run(self):
-        import cv2
-        import numpy as np
-
-        writer = None
-        times = open(self.dir / "video_times.csv", "w", newline="")
-        tw = csv.writer(times)
-        tw.writerow(["frame", "time_s"])
-        try:
-            while not self._stop.is_set():
-                try:
-                    stream = self._open()
-                except Exception as e:
-                    self.error = f"stream open failed: {e}"
-                    self._stop.wait(1.0)
-                    continue
-                self.error = None
-                buf = b""
-                try:
-                    while not self._stop.is_set():
-                        chunk = stream.read(4096)
-                        if not chunk:
-                            break
-                        buf += chunk
-                        while True:
-                            a = buf.find(b"\xff\xd8")
-                            b = buf.find(b"\xff\xd9", a + 2) if a >= 0 else -1
-                            if a < 0 or b < 0:
-                                break
-                            jpg, buf = buf[a:b + 2], buf[b + 2:]
-                            t = self._clock()
-                            img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
-                            if img is None:
-                                continue
-                            if writer is None:
-                                h, w = img.shape[:2]
-                                self.size = (w, h)
-                                writer = cv2.VideoWriter(str(self.dir / "video.mp4"),
-                                                         cv2.VideoWriter_fourcc(*"mp4v"),
-                                                         self.fps, (w, h))
-                            elif img.shape[1] != self.size[0] or img.shape[0] != self.size[1]:
-                                img = cv2.resize(img, self.size)
-                            writer.write(img)
-                            tw.writerow([self.frames, f"{t:.3f}"])
-                            self.frames += 1
-                            if self.frames % 15 == 0:
-                                times.flush()
-                except Exception as e:
-                    self.error = f"stream read failed: {e}"
-                finally:
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
-                if not self._stop.is_set():
-                    self.reconnects += 1
-                    self._stop.wait(0.5)
-        finally:
-            if writer is not None:
-                writer.release()
-            times.close()

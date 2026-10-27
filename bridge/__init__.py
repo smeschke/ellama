@@ -1,6 +1,12 @@
 """
 Shared code for reading computer_bridge.ino's serial output and turning it
-into distances and angles. Used by live_view.py.
+into distances and angles.
+
+This is the PC-side client library for the bridge firmware, and it is shared: the MCP
+server (mcp_server/robot_server.py) and the live dashboard (calibration/live_view.py)
+both import it so they compute distance, heading and range from the same code. It lived
+in calibration/ until 2026-10-24, which read as calibration-only and is why
+teleop/command_server.py grew its own copy of the parsing instead of importing this.
 
 computer_bridge.ino is listen-only until it is sent a drive line, and the
 scripts here never send one, so they can run while you drive with the stick.
@@ -66,7 +72,12 @@ ACCEL_LSB_PER_G = 16384.0
 GYRO_LSB_PER_DPS = 131.0
 COMPLEMENTARY_ALPHA = 0.98
 
-CONFIG_PATH = Path(__file__).with_name("config.json")
+# config.json lives in calibration/, not beside this file: it holds measured constants
+# that the calibration scripts produce and save_config() writes back. Resolved explicitly
+# because load_config() swallows FileNotFoundError -- a wrong path here would not raise,
+# it would silently fall back to DEFAULT_CONFIG and quietly change every distance the
+# robot reports.
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "calibration" / "config.json"
 DEFAULT_CONFIG = {
     "wheel_diameter_in": 10.0,
     "ticks_per_rev": 4096,       # AS5600, per revolution of the MAGNET shaft (not the wheel)

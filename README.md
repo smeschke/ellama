@@ -72,7 +72,7 @@ The same robot, driven by an agent instead of a hand: [`mcp_server/`](mcp_server
 exposes closed-loop tools over MCP, so "go forward 10 inches" stops on encoder ticks and
 "turn 90 degrees left" stops on IMU gyro yaw, rather than running the motors for a guessed
 number of seconds. It uses the platform the way any owner would — through the computer
-bridge, `calibration/bridge.py` and whatever sensors happen to be transmitting.
+bridge, `bridge/` and whatever sensors happen to be transmitting.
 [`mcp_server/TECHNICAL_NOTE.md`](mcp_server/TECHNICAL_NOTE.md) has the measured results and
 the safeguards; [`DRIVING_POLICY.md`](DRIVING_POLICY.md) has the rules.
 
