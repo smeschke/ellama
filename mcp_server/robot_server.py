@@ -86,8 +86,13 @@ def _shutdown():
 
 
 atexit.register(_shutdown)
+# os._exit, not sys.exit: SystemExit raised from a handler lands inside the MCP stdio
+# loop, which then blocks forever waiting on its worker thread parked in a stdin read --
+# the process survived SIGTERM still holding the serial port, so the next run of
+# tools/explore_bump_turn.py could not open it. _shutdown has already sent the stop and
+# flushed the port by this line, and atexit would only run the same _shutdown again.
 for _sig in (signal.SIGINT, signal.SIGTERM):
-    signal.signal(_sig, lambda signum, frame: (_shutdown(), sys.exit(1)))
+    signal.signal(_sig, lambda signum, frame: (_shutdown(), os._exit(1)))
 
 try:
     _connect(os.environ.get("ELLAMA_SERIAL_PORT"))
