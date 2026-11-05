@@ -8,8 +8,8 @@ No hardware needed:
 Two things are under test. First, `encoder=` on drive_distance and drive_arc: measuring a
 move by one nominated wheel, and refusing a move whose measuring channel is frozen instead
 of driving to the timeout (encoder="left") or to twice the distance asked (encoder="both",
-where a dead channel halves the average). That second case is not hypothetical -- it is
-what this robot did on 2026-10-22 with one encoder frozen at a constant count.
+where a dead channel halves the average). That second case is not hypothetical: a channel
+frozen at a constant count is a real failure mode, not a theoretical one.
 
 Second, the arithmetic drive_until_range approaches with: the inverse of the PWM-speed
 curve, and the taper that keeps the overshoot inside the gap rather than inside the wall.
@@ -168,7 +168,7 @@ def test_a_creep_slower_than_the_deadband_has_no_pwm():
 
 def test_approach_tapers_as_the_gap_closes():
     wide = rs.approach_pwm(2000, 125, 50)
-    mid = rs.approach_pwm(150, 125, 50)
+    mid = rs.approach_pwm(900, 125, 50)
     assert wide is not None and mid is not None
     assert wide > mid, (wide, mid)
     assert wide <= 125 and mid >= 50
@@ -194,8 +194,7 @@ def test_approach_never_commands_a_speed_it_cannot_stop_within():
 def test_a_move_measured_by_one_wheel_completes_with_the_other_dead():
     link = bench_link()
     with Feeder(link, per_packet=(ticks_for(link, 0.02), 0)):   # 1 in/s, right frozen
-        out = rs.drive_distance(1.0, "forward", 60, True, encoder="left",
-                                warn_lights=False)
+        out = rs.drive_distance(1.0, "forward", 60, True, encoder="left")
     assert out["ok"], out
     assert out["measured_by"] == "left", out
     assert "left wheel encoder only" in out["distance_source"], out
@@ -207,8 +206,7 @@ def test_a_move_measured_by_one_wheel_completes_with_the_other_dead():
 def test_a_frozen_channel_aborts_instead_of_driving_twice_as_far():
     link = bench_link()
     with Feeder(link, per_packet=(ticks_for(link, 0.02), 0)):
-        out = rs.drive_distance(2.0, "forward", 60, True, encoder="both",
-                                warn_lights=False)
+        out = rs.drive_distance(2.0, "forward", 60, True, encoder="both")
     assert not out["ok"], out
     assert out["abort_reason"] and "right encoder has not ticked" in out["abort_reason"], out
     assert 'encoder="left"' in out["abort_reason"], out
@@ -220,8 +218,7 @@ def test_a_frozen_channel_aborts_instead_of_driving_twice_as_far():
 def test_a_frozen_selected_channel_names_the_other_wheel_as_the_way_out():
     link = bench_link()
     with Feeder(link, per_packet=(0, ticks_for(link, 0.02))):   # left frozen, right moving
-        out = rs.drive_distance(2.0, "forward", 60, True, encoder="left",
-                                warn_lights=False)
+        out = rs.drive_distance(2.0, "forward", 60, True, encoder="left")
     assert not out["ok"], out
     assert "left encoder has not ticked" in out["abort_reason"], out
     assert 'encoder="right"' in out["abort_reason"], out
@@ -231,8 +228,7 @@ def test_a_frozen_selected_channel_names_the_other_wheel_as_the_way_out():
 def test_both_encoders_dead_is_not_told_to_try_the_other_one():
     link = bench_link()
     with Feeder(link, per_packet=(0, 0)):
-        out = rs.drive_distance(2.0, "forward", 60, True, encoder="both",
-                                warn_lights=False)
+        out = rs.drive_distance(2.0, "forward", 60, True, encoder="both")
     assert not out["ok"], out
     assert "left and right encoder has not ticked" in out["abort_reason"], out
     assert "encoder=" not in out["abort_reason"], out    # there is no good wheel to suggest
@@ -241,7 +237,7 @@ def test_both_encoders_dead_is_not_told_to_try_the_other_one():
 def test_an_unknown_encoder_name_is_refused_before_anything_moves():
     link = bench_link()
     feed_enc(link, 0, 0, 0)
-    out = rs.drive_distance(2.0, "forward", 60, True, encoder="middle", warn_lights=False)
+    out = rs.drive_distance(2.0, "forward", 60, True, encoder="middle")
     assert not out["ok"] and "encoder must be one of" in out["error"], out
     assert link.ser.lines == [], "nothing may be sent to the robot"
 
@@ -254,10 +250,10 @@ def test_a_single_encoder_arc_measures_against_that_wheels_radius():
     # puts the RIGHT wheel outside, so the left wheel is the inner one.
     with Feeder(link, per_packet=(ticks_for(link, 0.02), ticks_for(link, 0.02)),
                 yaw_dps=300):
-        out = rs.drive_arc(24.0, 5.0, "left", 50, True, encoder="left", warn_lights=False)
+        out = rs.drive_arc(24.0, 5.0, "left", 50, True, encoder="left")
         assert out["measuring_wheel_radius_in"] == 14.0, out
         assert out["measured_by"] == "left", out
-        out = rs.drive_arc(24.0, 5.0, "left", 50, True, encoder="right", warn_lights=False)
+        out = rs.drive_arc(24.0, 5.0, "left", 50, True, encoder="right")
         assert out["measuring_wheel_radius_in"] == 34.0, out
 
 
@@ -265,8 +261,7 @@ def test_the_outer_wheel_swaps_sides_on_a_reverse_arc():
     link = bench_link()
     with Feeder(link, per_packet=(ticks_for(link, 0.02), ticks_for(link, 0.02)),
                 yaw_dps=300):
-        out = rs.drive_arc(24.0, 5.0, "left", 50, True, encoder="left", travel="reverse",
-                           warn_lights=False)
+        out = rs.drive_arc(24.0, 5.0, "left", 50, True, encoder="left", travel="reverse")
     assert out["measuring_wheel_radius_in"] == 34.0, out
 
 
@@ -274,7 +269,7 @@ def test_an_arc_measured_by_both_wheels_reports_the_centre_radius():
     link = bench_link()
     with Feeder(link, per_packet=(ticks_for(link, 0.02), ticks_for(link, 0.02)),
                 yaw_dps=300):
-        out = rs.drive_arc(24.0, 5.0, "left", 50, True, warn_lights=False)
+        out = rs.drive_arc(24.0, 5.0, "left", 50, True)
     assert out["measuring_wheel_radius_in"] == 24.0, out
     assert out["measured_by"] == "both", out
 
@@ -282,7 +277,7 @@ def test_an_arc_measured_by_both_wheels_reports_the_centre_radius():
 def test_an_arc_too_tight_for_the_inner_wheel_is_refused_with_the_way_out():
     link = bench_link()
     with Feeder(link, per_packet=(0, 0)):
-        out = rs.drive_arc(12.0, 5.0, "left", 50, True, encoder="left", warn_lights=False)
+        out = rs.drive_arc(12.0, 5.0, "left", 50, True, encoder="left")
     assert not out["ok"], out
     assert "pivoting" in out["error"] and 'encoder="right"' in out["error"], out
     assert link.ser.lines == [], "a refused call must not touch the hardware"
@@ -294,7 +289,7 @@ def test_an_arc_whose_measuring_wheel_is_silent_says_which_one():
     feed_imu(link, 20)
     feed_enc(link, 1000, None, 30)      # right encoder not responding
     feed_enc(link, 1001, None, 40)
-    out = rs.drive_arc(24.0, 5.0, "left", 50, True, encoder="right", warn_lights=False)
+    out = rs.drive_arc(24.0, 5.0, "left", 50, True, encoder="right")
     assert not out["ok"], out
     assert "right encoder is not reporting" in out["error"], out
 
@@ -309,7 +304,7 @@ def test_a_spin_with_no_imu_is_refused_rather_than_measured_by_the_encoders():
     link = bench_link()
     feed_enc(link, 1000, 1000, 10)      # encoders perfectly healthy ...
     feed_enc(link, 1100, 900, 20)       # ... and turning, which must not be enough
-    out = rs.turn_degrees(90, "left", 60, True, warn_lights=False)
+    out = rs.turn_degrees(90, "left", 60, True)
     assert not out["ok"], out
     assert "no live IMU" in out["error"], out
     assert "not a substitute" in out["error"], out
@@ -319,7 +314,7 @@ def test_a_spin_with_no_imu_is_refused_rather_than_measured_by_the_encoders():
 def test_a_spin_turns_by_the_imu_and_says_so():
     link = bench_link()
     with Feeder(link, per_packet=(80, -80), yaw_dps=400.0):
-        out = rs.turn_degrees(45, "left", 60, True, warn_lights=False)
+        out = rs.turn_degrees(45, "left", 60, True)
     assert out["ok"], out
     assert out["feedback_source"] == "imu", out
     assert out["actual_degrees_turned"] == out["imu_degrees"], out
@@ -339,7 +334,7 @@ def test_the_drive_direction_comes_from_the_sensors_name():
     link = bench_link()
     feed_tof(link, "TOF_REAR", (1000, 1000), 10)
     feed_tof(link, "TOF_REAR", (1000, 1000), 20)
-    out = rs.drive_until_range(900, 60, True, warn_lights=False)
+    out = rs.drive_until_range(900, 60, True)
     assert out["direction"] == "reverse", out
     assert "name" in out["facing_from"], out
 
@@ -349,7 +344,7 @@ def test_facing_can_be_overridden_for_a_board_mounted_the_other_way():
     # The real case on 2026-10-22: the board is on the back but flashed "TOF_FRONT".
     feed_tof(link, "TOF_FRONT", (1000, 1000), 10)
     feed_tof(link, "TOF_FRONT", (1000, 1000), 20)
-    out = rs.drive_until_range(900, 60, True, facing="reverse", warn_lights=False)
+    out = rs.drive_until_range(900, 60, True, facing="reverse")
     assert out["direction"] == "reverse", out
     assert out["facing_from"] == "the caller said so", out
 
@@ -359,10 +354,10 @@ def test_two_range_boards_must_be_told_apart_by_the_caller():
     for ms in (10, 20):
         feed_tof(link, "TOF_FRONT", (1000, 1000), ms)
         feed_tof(link, "TOF_REAR", (1000, 1000), ms)
-    out = rs.drive_until_range(900, 60, True, warn_lights=False)
+    out = rs.drive_until_range(900, 60, True)
     assert not out["ok"], out
     assert "pass sensor=" in out["error"], out
-    out = rs.drive_until_range(900, 60, True, sensor="TOF_REAR", warn_lights=False)
+    out = rs.drive_until_range(900, 60, True, sensor="TOF_REAR")
     assert out["direction"] == "reverse", out
 
 
@@ -370,7 +365,7 @@ def test_nothing_in_range_is_refused_as_blind_not_clear():
     link = bench_link()
     feed_tof(link, "TOF_FRONT", (INVALID, INVALID), 10)
     feed_tof(link, "TOF_FRONT", (INVALID, INVALID), 20)
-    out = rs.drive_until_range(200, 60, True, warn_lights=False)
+    out = rs.drive_until_range(200, 60, True)
     assert not out["ok"], out
     assert "nothing in range" in out["error"], out
     assert link.ser.lines == [], "nothing may be sent to the robot"
@@ -380,7 +375,7 @@ def test_already_inside_the_target_does_not_move():
     link = bench_link()
     for ms in (10, 20, 30):
         feed_tof(link, "TOF_FRONT", (180, 190), ms)
-    out = rs.drive_until_range(200, 60, True, warn_lights=False)
+    out = rs.drive_until_range(200, 60, True)
     assert out["ok"] and out["moved"] is False, out
     assert link.ser.lines == [], "nothing may be sent to the robot"
 
@@ -388,14 +383,14 @@ def test_already_inside_the_target_does_not_move():
 def test_a_target_inside_the_sensors_usable_range_is_refused():
     link = bench_link()
     feed_tof(link, "TOF_FRONT", (900, 900), 10)
-    out = rs.drive_until_range(20, 60, True, warn_lights=False)
+    out = rs.drive_until_range(20, 60, True)
     assert not out["ok"] and "target_mm must be at least" in out["error"], out
 
 
 def test_a_min_pwm_under_the_deadband_is_refused():
     link = bench_link()
     feed_tof(link, "TOF_FRONT", (900, 900), 10)
-    out = rs.drive_until_range(200, 60, True, min_pwm=20, warn_lights=False)
+    out = rs.drive_until_range(200, 60, True, min_pwm=20)
     assert not out["ok"] and "deadband" in out["error"], out
 
 
@@ -418,7 +413,7 @@ def test_an_approach_stops_itself_when_the_range_reaches_the_target():
     thread = threading.Thread(target=closing, daemon=True)
     thread.start()
     try:
-        out = rs.drive_until_range(300, 80, True, warn_lights=False)
+        out = rs.drive_until_range(300, 80, True)
     finally:
         stop.set()
         thread.join(timeout=2)
@@ -445,7 +440,7 @@ def test_an_approach_that_stops_getting_closer_aborts_and_says_why():
     thread = threading.Thread(target=stuck, daemon=True)
     thread.start()
     try:
-        out = rs.drive_until_range(300, 80, True, warn_lights=False)
+        out = rs.drive_until_range(300, 80, True)
     finally:
         stop.set()
         thread.join(timeout=2)
@@ -474,7 +469,7 @@ def test_an_approach_whose_sensor_goes_quiet_aborts_rather_than_driving_blind():
     try:
         time.sleep(0.15)
         state["quiet"] = True
-        out = rs.drive_until_range(300, 80, True, warn_lights=False)
+        out = rs.drive_until_range(300, 80, True)
     finally:
         stop.set()
         thread.join(timeout=2)

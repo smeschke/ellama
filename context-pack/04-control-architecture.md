@@ -29,9 +29,8 @@ when using the stick controller, put the bridge in listen mode (or unplug it).
 The handheld path needs none of the others to exist. That ordering matters: the robot is
 complete without compute, and compute is an expansion rather than a dependency.
 
-Onboard compute doesn't have to be onboard, either: a desktop running the simulator and an
-ESP32 running the same `computer_bridge.ino` is the same sender, just relocated off the chassis
-entirely (`07-simulation.md`).
+Onboard compute doesn't have to be onboard, either: a desktop and an ESP32 running the same
+`computer_bridge.ino` is the same sender, just relocated off the chassis entirely.
 
 ## One controller drives every robot — on purpose
 
@@ -76,8 +75,8 @@ The controller link is connectionless: no access point to join, no DHCP, no pair
 ritual, no reconnect storm when the robot drives behind a shed. For a machine that works
 in a field with no infrastructure, *the absence of a network to join* is the feature.
 
-Network teleop layers TCP on top only when a Pi is fitted and a network exists — and even
-then the last hop to the motors is still the direct radio link.
+Network driving, when fitted, layers TCP on top only when a Pi and a network exist — and
+even then the last hop to the motors is still the direct radio link.
 
 **One deliberate tradeoff, stated plainly:** the link is unencrypted and unauthenticated.
 Anyone in radio range with the right hardware can drive the robot. That is acceptable for

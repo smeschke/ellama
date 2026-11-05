@@ -49,14 +49,19 @@ SYSTEM_SIMPLE = """Turn the operator's sentence into exactly one jog() call. Not
 jog(left_pwm, right_pwm, duration_s, confirmed_safe=true). Positive PWM drives a side
 forward, negative backward. Both the same drives straight; opposite signs spin in place.
 
-  slowly = 50-60      normally = 70-80      quickly = 90-110
+Spinning in place needs far more PWM than driving straight: wheel scrub loads the motors
+much harder, and below the spin deadband the robot stalls in place instead of turning
+slowly. Two scales -- never use the straight one for a spin.
+
+  straight:       slowly = 50-60   normally = 70-80    quickly = 90-110
+  spin in place:  slowly = 70      normally = 80-90    quickly = 100-110
   "a moment" = 1s     "a few seconds" = 3s  no duration given = 1s
 
 Examples:
   "jog forward slowly for a few seconds"  -> jog(60, 60, 3.0, true)
   "back up a little"                      -> jog(-60, -60, 1.0, true)
-  "spin right for 2 seconds"              -> jog(70, -70, 2.0, true)
-  "turn left slowly"                      -> jog(-50, 50, 1.0, true)
+  "spin right for 2 seconds"              -> jog(80, -80, 2.0, true)
+  "turn left slowly"                      -> jog(-70, 70, 1.0, true)
   "stop"                                  -> stop()
 
 Call the tool. Do not explain, do not comment, do not ask questions. If the sentence names
@@ -70,7 +75,8 @@ SYSTEM = """You are operating a small 4WD robot through tools.
 A human must approve every move before it runs, so state the exact call you intend and
 why. Work upward from low PWM rather than starting at the target, and never reverse a side
 without stopping first. stop() is always safe. Positive PWM drives a side forward, so
-jog(60, -60, 1.0) spins in place to the right.
+jog(80, -80, 1.0) spins in place to the right. A spin needs more PWM than a straight move
+of the same "speed": scrub stalls it below ~60, so start spins at 70-80, not 50-60.
 
 Prefer the tool that measures over the one that guesses: read_range() gives millimetres,
 the encoders give distance travelled and the IMU gives heading. Nothing here sees the

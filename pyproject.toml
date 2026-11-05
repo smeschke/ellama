@@ -1,0 +1,15 @@
+[project]
+name = "ellama"
+version = "0.1.0"
+description = "eLlama 4WD robot: firmware, calibration tools and MCP drive server"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.0",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+calibration = ["numpy", "opencv-python", "matplotlib"]
+
+[tool.ruff]
+line-length = 100

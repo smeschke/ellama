@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Like analyze_csv.py, but corrects old recordings for the gear ratio and can
-export the dead-reckoned trajectory for simulation/replay3d.html.
+export the dead-reckoned trajectory as JSON.
 
 live_view.py bakes distances into the CSV using the gear_ratio in config.json
 at record time (6.33 until the 4.5 fix). Distance is proportional to
@@ -78,7 +78,7 @@ def main():
                    help=f"true gear ratio (default {TRUE_GEAR_RATIO})")
     p.add_argument("--heading", choices=["imu", "enc"], default="imu")
     p.add_argument("--save", metavar="PNG", help="save time-series PNG and <name>_path.png, no window")
-    p.add_argument("--export-json", metavar="FILE", help="write trajectory for simulation/replay3d.html")
+    p.add_argument("--export-json", metavar="FILE", help="write dead-reckoned trajectory as JSON")
     p.add_argument("--replay", action="store_true")
     p.add_argument("--replay-save", metavar="FILE")
     p.add_argument("--speed", type=float, default=8.0)

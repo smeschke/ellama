@@ -48,7 +48,7 @@ The practical effect: treat every real-world command with the caution
 you'd give an action you can only take once, because that's what it is. If
 a plan only works out when several things go right in a row, that plan is
 wrong for real hardware, even if it would be fine in
-`simulation/`.
+a simulator.
 
 ## 3. Start at the lowest PWM that might work, not a value that will obviously work
 
@@ -78,10 +78,7 @@ before.
   (`RAMP_STEP`/`RAMP_DT_MS`,
   [`firmware/robot_motor_bts7960/robot_motor_bts7960.ino:32-33`](firmware/robot_motor_bts7960/robot_motor_bts7960.ino#L32-L33))
   — about 333 PWM/s, or ~0.77 s to go from 0 to full 255.
-- **Manual/teleop operating ceiling:** 128/255, chosen after top speed was
-  found too fast
-  (`SPEED_MAX`,
-  [`teleop/command_client.py:37`](teleop/command_client.py#L37)).
+- **Manual operating ceiling:** 128/255, chosen after top speed was found too fast.
 - **Scripted ground-truth-run ceiling:** 125/255, used for calibration and
   encoder-verification runs where the robot actually rolls
   (`MAX_PWM_CEILING`,

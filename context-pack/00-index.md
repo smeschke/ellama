@@ -13,7 +13,6 @@ the battery, and optionally a single-board computer, camera, lidar, and any sens
 | `04-control-architecture.md` | Design principles only — protocol is in flux |
 | `05-battery-options.md` | The three supported battery options and the rules for all of them |
 | `06-manufacturing-cost.md` | BOM, in-house fabrication, batch plan |
-| `07-simulation.md` | The calibrated desktop simulator, sending commands from off-board compute, and the off-board-compute product vision (lawn mowing) |
 | `eLlama User Manual.md` | The product manual: specs, getting started, safety |
 | `bom.csv` | Current bill of materials (robot and controller, no battery) |
 | `battery_bom.csv` | Prices for the three battery options |
