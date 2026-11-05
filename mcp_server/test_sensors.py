@@ -286,6 +286,43 @@ def test_requiring_a_sensor_that_is_silent_refuses_even_if_others_are_live():
     assert link._drive_refusal() is None
 
 
+def test_a_group_sensor_that_dies_is_reported_by_age_not_as_never_seen():
+    """Measured on the robot: a run ended with "tof not reporting (never seen)" after the
+    board had been streaming for eight minutes. No stream is ever called "tof" -- the
+    board reports as TOF_FRONT -- so looking the required name up directly could only
+    ever answer "never seen", and that sent the operator looking for an unplugged cable
+    instead of a link that had just dropped."""
+    link = make_link()
+    encoders_live(link)
+    imu_live(link)
+    link.policy.set(["enc", "imu", "tof"])
+    for i in range(40):
+        link.sensors.observe("TOF_FRONT", (812, 900), 100 + i * 20, available=[True, True])
+    assert link._drive_refusal() is None, "a live ToF must satisfy the group"
+
+    link.sensors.get("TOF_FRONT").last_wall = time.monotonic() - 3.0   # board goes quiet
+    assert link.missing_required() == ["tof"]
+    why = link._drive_refusal()
+    assert "never seen" not in why, why
+    assert "tof_front" in why, why          # which board, not just which group
+    assert "last sample 3.0s ago" in why, why
+    assert "set_required_sensors" in why, why
+
+
+def test_a_group_sensor_that_never_reported_still_says_never_seen():
+    """The other half: "never seen" must keep meaning never seen."""
+    link = make_link()
+    encoders_live(link)
+    imu_live(link)
+    link.policy.set(["enc", "imu", "tof"])
+    assert "tof not reporting (never seen)" in link._drive_refusal(), link._drive_refusal()
+    # One packet is a torn line until a second one confirms it, and it says which it is.
+    link.sensors.observe("TOF_FRONT", (500, 500), 110, available=[True, True])
+    why = link._drive_refusal()
+    assert "seen only once" in why, why
+    assert "never seen" not in why, why
+
+
 def test_a_torn_serial_line_does_not_invent_a_sensor():
     """Seen on the real robot: 115200 baud tears, and "IMU 194 -122 16028" split across two
     lines leaves "MU 150 -128 ..." -- which parses as a SensorPacket named MU."""

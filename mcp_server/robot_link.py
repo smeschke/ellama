@@ -214,14 +214,34 @@ class RobotLink:
         return self.policy.missing(self.sensors)
 
     def _missing_detail(self, name):
-        age = self.sensors.age_s(name)
-        stream = self.sensors.get(name)
-        if stream is not None and not stream.trusted:
+        """Why one required sensor does not count as present, in the operator's terms.
+
+        `name` may be a GROUP ("tof"/"range"), and no stream is ever actually called
+        that: the board reports as TOF_FRONT and the registry stores "tof_front". Looking
+        the required name up directly therefore answered "never seen" for every group,
+        however long the board had been streaming -- so a ToF that had run for eight
+        minutes and gone quiet three seconds earlier was described as a board that had
+        never existed, which sends the operator hunting for an unplugged cable instead of
+        a link that just dropped. Resolve the group first and describe its freshest
+        member, naming the stream when it is not the name that was required.
+        """
+        now = time.monotonic()
+        trusted = self.sensors.resolve(name)
+        if trusted:
+            # The freshest member: with two boards fitted under one group name, the one
+            # that went quiet most recently is the one that says what just happened.
+            stream = min((self.sensors.get(n) for n in trusted),
+                         key=lambda st: st.age_s(now))
+            when = "last sample %.1fs ago" % stream.age_s(now)
+            if stream.name != sensorlib.canon(name):
+                when = "%s %s" % (stream.name, when)
+        elif self.sensors.resolve(name, trusted_only=False):
             # One packet is not a sensor: the serial link tears and leaves plausible-looking
             # names behind (see sensors.py). Say so rather than reporting it as silent.
-            return ("%s seen only once, not yet confirmed -- one packet can be a garbled "
-                    "line rather than a sensor" % name)
-        when = "never seen" if age is None else "last sample %.1fs ago" % age
+            when = ("seen only once, not yet confirmed -- one packet can be a garbled "
+                    "line rather than a sensor")
+        else:
+            when = "never seen"
         if name == "imu":
             return "no live IMU (%s)" % when
         if name == "enc":
