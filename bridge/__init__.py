@@ -5,8 +5,7 @@ into distances and angles.
 This is the PC-side client library for the bridge firmware, and it is shared: the MCP
 server (mcp_server/robot_server.py) and the live dashboard (calibration/live_view.py)
 both import it so they compute distance, heading and range from the same code. It lived
-in calibration/ until 2026-10-24, which read as calibration-only and is why
-teleop/command_server.py grew its own copy of the parsing instead of importing this.
+in calibration/ until 2026-10-24, which read as calibration-only.
 
 computer_bridge.ino is listen-only until it is sent a drive line, and the
 scripts here never send one, so they can run while you drive with the stick.

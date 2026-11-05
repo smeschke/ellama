@@ -65,7 +65,7 @@ stayed in `calibration/`, and `bridge/__init__.py` resolves it by an explicit pa
 
 ```
 python3 -m venv --system-site-packages mcp_server/.venv
-mcp_server/.venv/bin/pip install mcp
+mcp_server/.venv/bin/pip install -r mcp_server/requirements.txt
 ```
 
 (`--system-site-packages` so it reuses the `pyserial` already installed for
@@ -116,14 +116,8 @@ mcp_server/.venv/bin/python mcp_server/robot_server.py
 | `drive_arc(radius_inches, degrees, direction, pwm, confirmed_safe, max_wheel_pwm=125, travel="forward", encoder="both")` | Yes (curved; 360° = full circle; `travel="reverse"` backs up along the arc) | Yes |
 | `drive_until_range(target_mm, pwm, confirmed_safe, facing="auto", sensor=None, tolerance_mm=15, min_pwm=50)` | Yes (straight, toward whatever the ToF faces, until it reads `target_mm`) | Yes |
 | `jog(left_pwm, right_pwm, duration_s, confirmed_safe, require_telemetry=True)` | Yes (raw, time-based) | Yes |
-| `speak_then_drive(text, pwm, duration_s, confirmed_safe, direction="forward", warn_lights=True)` | Yes (`speak` then straight open-loop `jog`, one call, no model round trip between) | Yes |
 | `set_level_reference(confirmed_level)` | No (records the current orientation as "level" for the tilt guard; refused while moving or if it would shift the reference by > half the limit) | `confirmed_level` — only after the operator says the robot is on level ground |
 | `clear_tilt_fault(confirmed_safe)` | No (releases a tripped tilt guard; refused while still leaning within 5° of the limit) | `confirmed_safe` — only after the operator has looked at the robot |
-| `lights(on=True, brightness, color, effect, speed, intensity)` | No (WLED strip at `ELLAMA_WLED_HOST`, default 192.168.0.57) | — |
-| `list_light_effects()` | No | — |
-| `lights_blink(blinks=2, phase_s=0.3, color="00ff00", brightness=127, restore=True, fade=True)` | No (on off on off on = 1.5 s by default, each phase fading) | — |
-| `speak(text, speed=1.3, max_brightness=127)` | No (Piper TTS out of this computer's speakers, WLED strip animates a mouth; blocks until done. Env: `ELLAMA_PIPER`, `ELLAMA_PIPER_VOICE`) | — |
-| `hear(wait_seconds=10, max_seconds=20, pause_seconds=0.8)` | No (records the webcam mic on this computer, waits for speech, stops at a pause, transcribes with faster-whisper `base.en`; blocks. Alternate with `speak` for a conversation. Env: `ELLAMA_MIC`, `ELLAMA_MIC_MATCH`, `ELLAMA_WHISPER`. Test: `.venv/bin/python hearing.py`) | — |
 
 ## Recording a stick-driven run
 
@@ -206,7 +200,6 @@ for `RANGE_NO_PROGRESS_S`. The ToF median lags by half its window while the robo
 instead of crept: `RANGE_LATENCY_S` folds that lag, one sample interval and the braking
 lead together.
 
-`drive_distance`, `turn_degrees`, `drive_arc` and `jog` take `warn_lights=True`: right before the motors start the WLED strip does the 1.5 s fading `lights_blink` pattern (on off on off on, then solid green at 50% while moving) and is restored when the move ends. Pass `warn_lights=False` to skip it. A strip that can't be reached never blocks a move.
 
 ## Known unknowns
 
@@ -229,7 +222,7 @@ lead together.
   `drive_distance`, which applied the then-wrong `FORWARD_PWM_SIGN` — so it recorded a
   backward move's tick direction and called it forward. Only `drive_arc` reads this
   (`traveled_inches` is unsigned, so `drive_distance` is unaffected). Only the right
-  channel was verified; the left was dead at the time and its `-1` is assumed by symmetry.
+  channel was verified; the left `-1` is assumed by symmetry — confirm both per robot.
 - **Wheel encoders overestimate in-place turns by ~2x — verified 2026-09-27.** Robot on
   the ground, four 90° turns left then four right, pwm=60: the encoder-differential
   estimate (`dr - dl` over `track_width_in`) reported ~92° per commanded 90° turn, but
@@ -325,9 +318,10 @@ person tracking (`turn_to_me*`, `person_view`) were built on 2026-10-02/03 and t
 The phone camera went the same way on 2026-10-26: `look`, `tags`, `describe_view`,
 `set_camera`, `camera_stream`, `phone_status`, `torch`, `save_photo` and `take_photo`, the
 `auto_photo` and video recording in `start_recording`, and `recording.VideoRecorder`. The
-robot no longer carries a phone. `tools/find_tags.py` is still there and still works on an
-image file from any source. Git history before this commit has all of it.
+robot no longer carries a phone. Git history before this commit has all of it.
 
 `perform` and `perform_status` went too, on the same day, along with `perform.py` (the MIDI
 light-show and dance engine) and the `_run` autonomous-run bookkeeping they were the only
-user of. `speak`, `hear`, `lights`, `lights_blink` and `list_light_effects` are untouched.
+user of. Lights and voice (`speak`, `hear`, `lights`, `lights_blink`, `list_light_effects`,
+`speak_then_drive`, `hearing.py` and the WLED/Piper/Whisper plumbing) followed on 2026-11-05;
+the server now only drives, senses and records. All of it is in git history.

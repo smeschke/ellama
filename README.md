@@ -2,7 +2,7 @@
 
 A suitcase-sized, four-wheel-drive outdoor robot base built on the ESP32. Drive it with the handheld controller out of the box, or send it left/right speeds from any computer. You bring the battery and, if you want one, the computer.
 
-Demo video: **[youtu.be/O5k8u-hmhis](https://youtu.be/O5k8u-hmhis)**. Try the 3D drive simulator in your browser: **[huggingface.co/spaces/r5d2/ellama-simulator](https://huggingface.co/spaces/r5d2/ellama-simulator)**.
+Demo video: **[youtu.be/O5k8u-hmhis](https://youtu.be/O5k8u-hmhis)**.
 
 ## What it is
 
@@ -45,7 +45,7 @@ The stick controller and the computer bridge send the same drive packet over ESP
 
 ## Status
 
-**Works:** manual driving, computer driving through the bridge, encoder and IMU telemetry, calibration tools, the calibrated simulator, and agent driving through the MCP server with encoder- and IMU-closed-loop moves.
+**Works:** manual driving, computer driving through the bridge, encoder and IMU telemetry, calibration tools, and agent driving through the MCP server with encoder- and IMU-closed-loop moves.
 
 **Not there yet:** a single main board (the encoders and IMU are still separate ESP32 prototypes), 24 V support, an emergency stop beyond the power switch, and published KiCad source and printed-part files. The agent side changes often and is not a product.
 
@@ -57,12 +57,10 @@ The stick controller and the computer bridge send the same drive packet over ESP
 | [`firmware/`](firmware/) | ESP32 Arduino sketches: controller, motor board, encoder and IMU senders, computer bridge, bench tests |
 | [`hardware/`](hardware/) | Llama Motor Board Gerber and drill files for JLCPCB |
 | [`calibration/`](calibration/) | Live encoder/IMU view, wheel and track calibration, and measured characterization data |
-| [`simulation/`](simulation/) | Calibrated 2D/3D drive simulators and a CSV replay script |
 | [`images/`](images/) | Photos, dimensions and wiring diagrams |
 | [`ROBOT_CHARACTERIZATION.md`](ROBOT_CHARACTERIZATION.md) | Measured speed, turning, stopping and drift |
-| [`mcp_server/`](mcp_server/) | MCP server that lets an AI agent drive by encoder feedback ("go forward 10 inches"), with a live sensor inventory the agent decides from, switchable motion and tilt guards, recording, voice and lights |
+| [`mcp_server/`](mcp_server/) | MCP server that lets an AI agent drive by encoder feedback ("go forward 10 inches"), with a live sensor inventory the agent decides from, a switchable tilt guard, and recording |
 | [`DRIVING_POLICY.md`](DRIVING_POLICY.md) | Rules anything driving the robot must follow. Read it first. |
-| [`teleop/`](teleop/) | Network driving, video and lidar client/server scripts for an onboard Pi |
 | [`tools/`](tools/) | Speed and turn characterization sweeps that drive through the MCP server, and ArUco tag detection |
 | `recordings/` | Run recordings the server writes. Not committed. |
 

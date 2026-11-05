@@ -1,236 +1,86 @@
-# Robot characterization checklist
+# How this robot drives
 
-> The sweep scripts this file mentions are [`tools/characterize_speed.py`](tools/characterize_speed.py) and [`tools/characterize_turns.py`](tools/characterize_turns.py); they drive through [`mcp_server/`](mcp_server/). The measured results are in `calibration/*_characterization_*.csv`.
+Numbers for predicting what a command will do before sending it. Measured on one unit on
+painted wood with the battery above 80% and no compute box aboard; re-measure per robot
+with `tools/characterize_speed.py` and `tools/characterize_turns.py`.
 
-Goal: give Claude the mechanical numbers it can't measure on its own, so it can
-drive the robot safely and build a path follower. Most data comes from the
-encoders and IMU (recorded with `calibration/live_view.py --csv`); the tape
-measure and video cover what those can't see: slip, real stopping distance,
-and drift.
+## Straight line — `jog(pwm, pwm, seconds)`
 
-Assumptions: battery is kept above 80%, so battery level is not a variable.
-The compute box (Pi, camera, lidar) is **not** on the robot. Repeat the
-relevant tests if that changes the robot's mass.
+Steady speed, forward and reverse within 3% of each other:
 
-## Ground rules for every test
+| pwm | in/s | 1s | 2s | 3s |
+|---|---|---|---|---|
+| 50 | 3.9 | 3.9in | 7.8in | 12in |
+| 60 | 5.9 | 5.9in | 12in | 18in |
+| 80 | 9.3 | 9.3in | 19in | 28in |
+| 100 | 11.9 | 12in | 24in | 36in |
+| 125 | 14.3 | 14in | 29in | 43in |
 
-- Robot on clear floor with at least 10 ft of free run, someone within reach.
-- Any test that sends motor commands: tell Claude the robot is safe to move
-  before it runs. Claude will cap PWM and always send `stop` on exit.
-- Name each recording so it's obvious what it is, e.g. `--csv sweep_fwd.csv`.
-- Note the floor surface and whether anything is on the robot.
+`distance ≈ speed × duration` is reliable here: a measured `jog(50, 50, 1.0)` travelled
+3.9in against 3.9in predicted. The ~0.2s ramp-up at the start and the coast after the stop
+roughly cancel each other out.
 
-## Video tips (for the tests that need it)
+Speed is near-linear above the deadband, ~0.14 in/s per PWM count, so interpolating
+between rows is safe.
 
-- Camera on a tripod or stack of books, side-on to the path, level with the floor.
-- Tape measure laid on the floor along the path, in frame.
-- 60 fps if the phone allows it.
-- Say the test name and PWM value out loud at the start of each take.
+## Spin in place — `jog(pwm, -pwm, seconds)` or `turn_degrees`
 
----
+A spin needs far more PWM than a straight move: wheel scrub loads the motors much harder.
+Steady rate once up to speed:
 
-## 0. Measurements by hand (5 minutes)
-
-Write the values in the table and give them to Claude.
-
-| Item | Value |
+| pwm | deg/s |
 |---|---|
-| Total mass of robot, as run (kg or lb) | |
-| Wheel diameter (in) | |
-| Track width, centre of left tyre to centre of right tyre (in) | |
-| Wheelbase / caster position (in) | |
-| Overall footprint, length x width x height (in) | |
-| Roughly how high the centre of mass is (in) | |
-| Wheel type and floor contact (rubber, hard plastic, etc.) | |
-| Caster or skid type at the other end | |
-| Where the bumpers, kill switch and battery sit | |
+| 60 | 12 |
+| 80 | 27 |
+| 100 | 38 |
+| 125 | 51 |
 
-Also note anything you plan to add later (payload, mounts) and its mass.
+But a short spin never reaches that rate, so **do not multiply the steady rate by the
+duration** — the ramp eats a large fraction of a brief turn. Measured at pwm 80:
 
-## 1. PWM to steady speed (most important)
+| duration | turned | effective rate |
+|---|---|---|
+| 2.0s | 32deg | 16 deg/s |
+| 4.4s | 93deg | 21 deg/s |
+| 14.0s | 331deg | 24 deg/s |
+| steady | — | 27 deg/s |
 
-**What it tells us:** the deadband, the shape of the curve, and any left/right
-motor mismatch.
+So a spin at pwm 80 for 2s gives about 32deg, not the 55deg the steady rate suggests.
+Budget ~60% of the steady rate under 2s, ~80% around 5s, ~90% past 10s.
 
-**How:**
-1. Put the robot where it has room, wheels free to run on the floor.
-2. Claude runs a sweep: each wheel in turn, then both together, stepping PWM
-   from low up to your max cap, forward and reverse, holding each step 2-3 s
-   with a short stop between.
-3. Encoders record steady-state speed at each step.
+## Closed-loop calls overshoot
 
-**You provide:** the max PWM cap you're comfortable with, and confirmation the
-robot is safe to move.
+`drive_distance` coasts past its target: a 12in request lands +0.7in long at pwm 50, +1.3
+at 60, +2.8 at 80, ~+4 at 100, ~+5 at 125. A 30in request at pwm 80 runs ~2.1in long
+forward, ~2.8in reverse.
 
-**Data out:** `sweep_*.csv` from `live_view.py --csv`, plus Claude's PWM log.
+`turn_degrees` overshoots more at speed: a 90deg request yields 91deg at pwm 60, ~94 at
+80, ~97 at 100, ~102 at 125. Ask for less than you want at high PWM, or use a lower PWM
+when the angle matters.
 
-> Status (2026-09-27, "unit1", robot on the ground, 4ft clear in front / 2ft behind):
-> `calibration/characterize_speed.py` sweeps PWM via the MCP server's `drive_distance`
-> tool, forward then reverse each step, and logs actual distance/time to a CSV — see
-> `calibration/speed_characterization_unit1_20260927_201926.csv` (an earlier partial run,
-> `..._201610.csv`, caught a real forward/reverse deadband asymmetry at pwm=40 — forward
-> didn't move at all in 9.3s, reverse moved fine at 1.49in/s — before its own drift guard
-> paused it; see that CSV and the git history of this file for the raw finding).
-> Deadband is between pwm 40 and 50. Above it, forward and reverse speeds match closely
-> (no meaningful asymmetry, unlike turning in place — see section 4): 50->4.11in/s,
-> 60->6.13, 80->9.36, 100->12.03, 125->14.46. Roughly linear, ~0.14 in/s per PWM count
-> above the deadband. Re-run the script per robot; this is unit1's curve, not a
-> universal one.
->
-> Re-run (2026-09-29, "unit1", painted wood, 4ft clear on all sides, pwm 40-125, 12in
-> each way): `calibration/speed_characterization_unit1_20260929_172444.csv`. Reproduces
-> the 09-27 curve within ~4%: 50->3.92/3.82in/s (fwd/rev), 60->5.92/5.87, 80->9.28/9.23,
-> 100->11.91/11.59, 125->14.32/14.33. Deadband still between pwm 40 and 50, and this time
-> pwm 40 failed to move in *both* directions (0.02in/s fwd, 0.03in/s rev), so the 09-27
-> reverse move at 40 was marginal. Forward and reverse agree within 3%. A 12in request
-> overshoots by +0.7in at pwm 50, +1.3 at 60, +2.8 at 80, ~+4 at 100 and ~+5 at 125
-> (coast past the stop point). The 09-27 numbers above were not stale for this unit.
+## What will not work
 
-## 2. Acceleration and stopping
+- **Straight below pwm 50.** At pwm 40 the robot does not move at all, either direction.
+- **Spinning below pwm 60.** At pwm 50 a spin produced 2.4deg in 39s — a stall, not a slow
+  turn. Start spins at 70-80.
+- **A stalled `turn_degrees` does not give up early.** It has no stall detection and runs
+  its full timeout, `max(4, degrees × 0.1 + 3)` seconds — 39s for a 360deg request — with
+  the motors at stall current the whole time. Check the PWM is above the spin deadband
+  before asking for a large angle.
+- **Above the ceilings.** `MAX_PWM_CEILING` is 125; the LLM bridge caps itself at pwm 120
+  and 4s per call.
 
-**What it tells us:** how long speed takes to settle, and how far it coasts.
-This sets the safe top speed for a given obstacle-detection range.
+## Timing and heading
 
-**How:**
-1. Step from rest to 3 PWM levels (low, mid, high) and hold until speed settles.
-2. Cut to 0 from each level and let it coast.
-3. Film the coast next to the tape measure and read the true stopping distance.
+Movement starts 0.195s after the command, set by the motor board's PWM ramp (~333 PWM/s),
+not by link latency — so durations under ~0.5s are mostly ramp. If the controlling process
+dies, the firmware stops the robot in about 0.5s on its own
+(`SERIAL_IDLE_TIMEOUT_MS = 500`).
 
-**You provide:** the video, and the stopping distance read from it for each
-speed.
+Open-loop straight driving curves off line on any skid-steer robot, so distance from the
+encoders does not imply heading. Take heading from the IMU: encoder-differential heading,
+`(dr - dl) / track_width_in`, overstates rotation by ~1.7-2x during a spin because the
+wheels scrub, and the factor moves with the surface, so no fixed correction recovers it.
+`turn_degrees` uses IMU yaw alone and refuses to run without a live IMU.
 
-**Data out:** `stop_*.csv` and the video.
 
-## 3. Straight-line drift
-
-**What it tells us:** how much of the drift is mechanical and how much
-correction a path follower needs.
-
-**How:**
-1. Lay a 10 ft tape measure along the floor and a straight line beside it.
-2. Command equal PWM on both wheels and drive the full 10 ft.
-3. Measure the sideways offset at the end with the tape.
-4. Repeat 3 times, then repeat in reverse.
-
-**You provide:** the sideways offset for each run and its direction (left or
-right).
-
-**Data out:** `straight_*.csv` and your offset numbers.
-
-> Status (2026-09-27, "unit1", one run, tape-measured): `drive_distance(40, "forward",
-> 80, ...)` via the MCP server. Encoders: left wheel 41.56in, right wheel 43.14in (right
-> ~1.6in farther over the run) -> +4.5deg computed heading; IMU agreed closely (+4.1deg).
-> User confirmed by tape: left wheel traveled ~40in as commanded, right wheel a bit
-> farther, and the robot drifted **left** -- exactly matching the encoder math's sign
-> convention (right-farther = left drift). This lines up with section 4's finding that
-> right turns are consistently faster than left on this unit: same root cause either
-> way, most likely the right-side wheel/motor having a slight speed or effective-diameter
-> edge over the left. Only one run so far (not the 3x-forward + 3x-reverse the "How"
-> above asks for) -- re-run for a real average and to check reverse behaves the same way.
->
-> Re-run (2026-09-29, "unit1", painted wood, 3x forward + 3x reverse, 30in at pwm 80,
-> odometry zeroed before each run): `calibration/drift_characterization_unit1_20260929_173403.csv`.
-> Right wheel again travels farther than left in both directions: forward left/right
-> 30.2/33.4, 31.5/33.3, 31.4/33.2in; reverse ~32.1/33.5in on all three. That is ~4-6%
-> more on the right (10% on the first forward run, which looks like a warm-up outlier).
-> IMU yaw: +2.8, +3.4, +3.2deg forward (robot curves left), -3.3, -3.3, -3.9deg reverse,
-> so a forward-and-back trip largely cancels. Forward runs 2 and 3 agree within ~0.2deg IMU yaw,
-> so the drift is systematic, not noise. Encoder heading reads +5 to +9deg forward vs
-> ~3deg on the IMU -- the same wheel-scrub overestimate as section 4, so use the IMU for
-> heading. drive_distance overshoots a 30in request by ~2.1in forward and ~2.8in reverse
-> at pwm 80. Distances matched what the operator saw on the floor; no separate tape
-> measurement of lateral offset was logged for this re-run.
-
-## 4. Turning in place
-
-**What it tells us:** the lowest PWM that turns it, the top turn rate, and how
-much the wheels scrub during a turn.
-
-**How:**
-1. Spin in place at several PWM values, both directions, using the IMU yaw rate.
-2. Mark a start line on the floor and do a 180 degree turn at a mid PWM.
-3. Film from above or side-on and note how far off 180 degrees it ended.
-
-**You provide:** the video and the real angle turned.
-
-**Data out:** `turn_*.csv`, video and measured angles. Do the distance
-calibration (`d <inches>`) first, because the turn estimate depends on it.
-
-> Status (2026-09-27, "unit1", robot on the ground): `calibration/characterize_turns.py`
-> sweeps PWM x direction via the MCP server's `turn_degrees` tool and logs the results —
-> see `calibration/turn_characterization_unit1_20260927_200733.csv`. Turned up something
-> important first: the encoder-differential heading estimate overestimates in-place turns
-> by ~2x due to wheel scrub (92 deg encoder vs ~47 deg real for a commanded 90 deg turn,
-> confirmed by eye) — matches this section's own hunch to use "the IMU yaw rate," which
-> `turn_degrees` now does exclusively for its stop condition and reported angle. Deadband
-> for turning-in-place on this unit is between pwm 50 and 60 (40 and 50 both timed out at
-> 12s with negligible rotation). Turn rate at pwm 60/80/100/125: left 9.7/25.7/36.8/49.8
-> deg/s, right 14.7/29.3/40.1/52.6 deg/s — right turns are consistently faster than left,
-> most pronounced near the deadband (~50% at pwm 60) and converging toward parity
-> (~6%) at pwm 125. Read as this unit's individual wheel-alignment asymmetry, not a
-> universal number — re-run the script per robot.
->
-> Re-run (2026-09-29, "unit1", painted wood, pwm 50-125, 90deg each way):
-> `calibration/turn_characterization_unit1_20260929_172614.csv`. Deadband still between
-> pwm 50 and 60 (at 50 left reached only 25.5deg and right 2.7deg in 12s). Turn rate at
-> pwm 60/80/100/125: left 9.95/26.7/37.5/50.1deg/s, right 13.6/28.1/39.4/51.8deg/s --
-> right still faster than left, +36% at pwm 60 shrinking to +3.5% at 125 (09-27: ~+50%
-> and ~+6%). Achieved angle on a 90deg request (IMU): 91 at pwm 60, ~94 at 80, ~97 at
-> 100, ~102 at 125, i.e. overshoot grows with speed (~1deg to ~12deg). The encoder
-> estimate read ~150deg per real 90deg at pwm 80 and above, ~1.7x too high (09-27: ~2x),
-> same scrub effect; the IMU stays the reliable number.
-
-## 5. Latency and link loss (safety)
-
-**What it tells us:** the delay from a command to movement, and what happens if
-the radio link drops. `computer_bridge.ino` repeats the last command until told
-otherwise, so we need to know whether the robot has its own timeout.
-
-**How:**
-1. Latency: Claude sends a step command and times the first encoder movement.
-2. Link loss: with the robot running slowly, you unplug the bridge ESP32 (or
-   stop the sending script) and watch whether the robot stops on its own.
-   Be ready to grab it.
-
-**You provide:** what you saw, and how long it kept moving.
-
-> Status (2026-09-27, "unit1", robot on the ground): **Latency** — sent a raw drive
-> command (pwm=60 forward) and polled encoder counts; first detected movement at 0.195s,
-> consistent with `robot_motor_bts7960.ino`'s PWM ramp (RAMP_STEP/RAMP_DT_MS, ~333
-> PWM/s, so ~0.18s to ramp from 0 to 60) dominating over ESP-NOW/encoder-broadcast
-> latency. **Link loss** — started the robot moving slowly (pwm=50, jog) in a background
-> process, let it run ~2.3s, then `kill -9`'d that process with zero graceful shutdown
-> (no stop sent, no exit handler ran) to simulate a real crash, not a clean disconnect.
-> User watched and confirmed the robot stopped almost immediately, "maybe half a
-> second" — matching `computer_bridge.ino`'s `SERIAL_IDLE_TIMEOUT_MS=500` almost exactly.
-> Confirms the firmware failsafe (added this session, see mcp_server/README.md) actually
-> works against a real killed process, not just against a clean `stop`/`listen` line.
-
-## 6. Surfaces and obstacles
-
-**What it tells us:** how the numbers change on the surfaces you'll use.
-
-**How:**
-1. Repeat tests 1 to 3 on each surface (hard floor, carpet, etc.).
-2. Try a door threshold and a small ramp, and note what it can climb and at
-   what PWM.
-
-**You provide:** surface names and the climb results.
-
-**Data out:** separate CSVs per surface.
-
----
-
-## Order of work
-
-1. Section 0 (hand measurements) and the PWM cap.
-2. Section 5 (latency and link loss), so we know the safety picture first.
-3. Section 1 (PWM to speed).
-4. Sections 2, 3, 4.
-5. Section 6 for each new surface.
-
-## Handing the data over
-
-Put recordings and videos in one folder, with one line per file saying what it
-is and any measurements you took. Claude can analyze CSVs with
-`calibration/analyze_csv.py`; the video numbers go in your notes.
