@@ -21,7 +21,9 @@ Steady speed, forward and reverse within 3% of each other:
 roughly cancel each other out.
 
 Speed is near-linear above the deadband, ~0.14 in/s per PWM count, so interpolating
-between rows is safe.
+between rows is safe. (`drive_math.PWM_SPEED_IN_S` carries the slightly higher 09-27
+sweep — 4.11 / 6.13 / 9.36 / 12.03 / 14.46 — and is used only to time an open-loop move
+when the encoders are absent.)
 
 ## Spin in place — `jog(pwm, -pwm, seconds)` or `turn_degrees`
 

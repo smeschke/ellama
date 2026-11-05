@@ -56,8 +56,8 @@ Things to know:
 - **It is faster.** The firmware sends duty cycle, so motor voltage is the duty cycle times
   the pack voltage. At the same command a 5S pack runs the motors well above SLA voltage.
   Speed also changes with the pack's charge level.
-- **Calibrate it.** The PWM numbers in `ROBOT_CHARACTERIZATION.md` and the simulator speed
-  model were measured on SLA at about 12.5 V. Re-measure speed on a tool pack before
+- **Calibrate it.** The PWM numbers in `ROBOT_CHARACTERIZATION.md` were measured on SLA at
+  about 12.5 V. Re-measure speed on a tool pack before
   relying on them, and start lower.
 - **Packs differ.** Protection circuits vary between brands and between models, and a
   trip under load cuts the drive power mid-run. Only the M18 2 Ah has been tested. Other

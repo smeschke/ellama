@@ -35,8 +35,6 @@ POLICY = sensorlib.SensorPolicy(
 if _required_env is not None:
     POLICY.set_by = "ELLAMA_REQUIRED_SENSORS"
 
-# Measured PWM -> steady forward speed, ROBOT_CHARACTERIZATION.md section 1 (sweep of
-
 # ---------------------------------------------------------------------------
 # Tilt guard (mcp_server/tilt_guard.py). The robot is low and can run banks up to ~25 deg;
 # past that it tips. Every drive command goes through RobotLink.send_drive, which refuses

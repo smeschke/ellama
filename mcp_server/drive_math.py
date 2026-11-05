@@ -29,8 +29,11 @@ TRUE_GEAR_RATIO = 4.5
 # (ToF) or 50 Hz (encoders, IMU), so this is many missed packets for any of them.
 TELEMETRY_STALE_S = 2.0
 
-# Measured PWM -> steady forward speed, ROBOT_CHARACTERIZATION.md section 1 (sweep of
-# 2026-09-27, reproduced within ~4% on 09-29). Used ONLY to time an open-loop move when the
+# Measured PWM -> steady forward speed: the 2026-09-27 sweep, recorded in
+# calibration/speed_characterization_unit1_20260927_201926.csv. The 09-29 re-run
+# reproduced it within ~4% but read 2-5% lower, and ROBOT_CHARACTERIZATION.md quotes that
+# later run -- so re-derive these from a CSV, never from the doc. Used ONLY to time an
+# open-loop move when the
 # encoders are absent and the operator has said that is acceptable -- it is a prediction
 # from a curve, never a measurement, and every result that uses it says so.
 PWM_SPEED_IN_S = ((50, 4.11), (60, 6.13), (80, 9.36), (100, 12.03), (125, 14.46))

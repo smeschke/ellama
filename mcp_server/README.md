@@ -240,7 +240,7 @@ lead together.
 - **Gear ratio is overridden in memory, not in the file.** `calibration/config.json`
   still says `gear_ratio: 6.33`; `calibration/analyze_run.py` found the true ratio is
   `4.5` (confirmed by `calibration/30_inches.csv`, a real tape-measured run). This server
-  uses `4.5` regardless of what the file says — `TRUE_GEAR_RATIO` in `robot_server.py` —
+  uses `4.5` regardless of what the file says — `TRUE_GEAR_RATIO` in `drive_math.py` —
   left that way deliberately so it could be tested independently before touching the file.
 
 ## Tilt guard (`tilt_guard.py`)

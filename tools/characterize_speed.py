@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sweep drive_distance() across PWM values, forward then back, logging steady-state-ish
-speed (actual distance / elapsed time) to a CSV. Same idea as characterize_turns.py, for
-ROBOT_CHARACTERIZATION.md section 1 (PWM to steady speed) instead of section 4.
+speed (actual distance / elapsed time) to a CSV. Same idea as characterize_turns.py, but
+it feeds ROBOT_CHARACTERIZATION.md's straight-line table rather than its spin table.
 
 Read DRIVING_POLICY.md and mcp_server/README.md before running this -- it sends real
 nonzero-PWM drive commands in a loop. --clearance-forward-in / --clearance-reverse-in

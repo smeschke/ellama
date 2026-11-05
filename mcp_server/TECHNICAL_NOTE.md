@@ -77,8 +77,9 @@ can flip it or damage it, and nothing undoes that.
   in wheel alignment, and the calibration scripts (`characterize_speed.py`, `characterize_turns.py`)
   are meant to be re-run per robot. Some encoder and PWM sign constants in `robot_server.py` are
   still hard-coded to one unit.
-- **Uncalibrated track width.** `track_width_in` is still a 20 in placeholder, so the encoder turn
-  estimate is only a rough figure. This does not affect `turn_degrees`, which uses the IMU.
+- **Track width is per-unit.** `track_width_in` is 19 in, measured wheel-to-wheel on this unit;
+  measure it per robot. The encoder turn estimate stays a rough figure either way, since scrub
+  swamps any track-width error. This does not affect `turn_degrees`, which uses the IMU.
 - **IMU drift.** Yaw is gyro-integrated, which is fine for turns lasting a few seconds. Drift over
   multi-minute sessions has not been characterized.
 - **Distances are not independently ground-truthed on this run.** The 2026-09-29 distance runs match

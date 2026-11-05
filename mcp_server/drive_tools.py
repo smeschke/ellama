@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Drive tools: drive_distance, turn_degrees, drive_arc, drive_until_range, jog.
 
-Registered by robot_server.register_tools(); CTX is the robot_server module,
+Registered by register(mcp, ctx), called from robot_server; CTX is the robot_server module,
 used for the live `link` singleton and the safety gates (_confirm_gate,
 _tilt_guarded), which stay there so tests that set `robot_server.link` keep
 working exactly as before.
@@ -62,7 +62,7 @@ def drive_distance(
     the first real call on new hardware should be a small one specifically to check the
     robot actually moves the way it was asked.
 
-    blocks the move.
+    Blocks until the move finishes.
     """
     if _L() is None:
         return CTX._not_connected()
@@ -202,7 +202,7 @@ def turn_degrees(
     counter-clockwise viewed from above, matching bridge/'s heading
     convention.
 
-    blocks the move.
+    Blocks until the move finishes.
     """
     if _L() is None:
         return CTX._not_connected()
@@ -356,7 +356,7 @@ def drive_arc(
     direction trace an S-curve: the robot ends facing the opposite way, displaced along its
     original axis by twice the radius and back on the same line laterally.
 
-    blocks the move.
+    Blocks until the move finishes.
     """
     if _L() is None:
         return CTX._not_connected()
@@ -792,7 +792,7 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool,
     MAX_PWM_CEILING=125 per side; duration_s has no upper bound, so an open-loop call runs
     for exactly as long as it is given.
 
-    blocks the move.
+    Blocks until the move finishes.
 
     require_telemetry defaults to the server's sensor policy (set_required_sensors): it
     insists on live encoders only if "enc" is in the required set, which it is by default.
@@ -856,4 +856,12 @@ def register(mcp, ctx):
     global CTX
     CTX = ctx
     for fn in DRIVE_TOOLS:
-        mcp.tool()(ctx._tilt_guarded(fn))
+        guarded = ctx._tilt_guarded(fn)
+        mcp.tool()(guarded)
+        # Rebind the module global too. Before the split these were stacked
+        # decorators at def time, so the module attribute WAS the guarded
+        # function; robot_server re-exports these names and the sweep scripts in
+        # tools/ call them directly, and they need a guard trip to come back as
+        # {"ok": False, "error": "guard: ..."} rather than as a raised GuardFault.
+        # DRIVE_TOOLS keeps the raw functions, so re-registering re-wraps cleanly.
+        globals()[fn.__name__] = guarded

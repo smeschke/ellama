@@ -58,10 +58,10 @@ The stick controller and the computer bridge send the same drive packet over ESP
 | [`hardware/`](hardware/) | Llama Motor Board Gerber and drill files for JLCPCB |
 | [`calibration/`](calibration/) | Live encoder/IMU view, wheel and track calibration, and measured characterization data |
 | [`images/`](images/) | Photos, dimensions and wiring diagrams |
-| [`ROBOT_CHARACTERIZATION.md`](ROBOT_CHARACTERIZATION.md) | Measured speed, turning, stopping and drift |
+| [`ROBOT_CHARACTERIZATION.md`](ROBOT_CHARACTERIZATION.md) | What a given PWM and duration actually produce: speed, turn rate, overshoot, limits |
 | [`mcp_server/`](mcp_server/) | MCP server that lets an AI agent drive by encoder feedback ("go forward 10 inches"), with a live sensor inventory the agent decides from, a switchable tilt guard, and recording |
 | [`DRIVING_POLICY.md`](DRIVING_POLICY.md) | Rules anything driving the robot must follow. Read it first. |
-| [`tools/`](tools/) | Speed and turn characterization sweeps that drive through the MCP server, and ArUco tag detection |
+| [`tools/`](tools/) | Speed and turn characterization sweeps that drive through the MCP server |
 | `recordings/` | Run recordings the server writes. Not committed. |
 
 ## Driving it with an AI

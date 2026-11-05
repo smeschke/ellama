@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Admin tools: connect, telemetry, sensors, policy, guards, odometry,
-recording. Registered by robot_server.register_tools(); see drive_tools.py
+recording. Registered by register(mcp, ctx), called from robot_server; see drive_tools.py
 for the CTX convention.
 """
 
@@ -12,6 +12,7 @@ from typing import Literal, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import bridge  # noqa: E402
 import sensors as sensorlib  # noqa: E402
+import tilt_guard  # noqa: E402  -- set_level_reference reads REF_MAX_RATE_DPS
 from drive_math import STOP_SETTLE_S  # noqa: E402
 
 CTX = None
