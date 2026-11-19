@@ -157,6 +157,8 @@ def make_link():
     link.tilt = tg.TiltGuard(mode="off")      # not under test here
     link.recorder = NoRecorder()
     link.last_imu = None
+    link.last_stick = None
+    link.last_stick_wall = None
     return link
 
 
@@ -189,6 +191,18 @@ def test_telemetry_survives_a_dead_encoder():
     # The left wheel's distance is HELD, not zeroed: a missing encoder is not a still wheel.
     assert snap["dist_l_in"] == 0.0, snap["dist_l_in"]
     assert snap["dist_r_in"] > 0
+
+
+def test_overheard_stick_command_shows_in_telemetry_snapshot():
+    link = make_link()
+    assert link.telemetry_snapshot()["stick"] is None   # never driven by hand
+    link.last_stick = (80, -80)
+    link.last_stick_wall = time.monotonic()
+    snap = link.telemetry_snapshot()
+    assert snap["stick"]["active"] is True, snap["stick"]
+    assert (snap["stick"]["left"], snap["stick"]["right"]) == (80, -80)
+    link.last_stick_wall -= 5.0                          # hand driving ended a while ago
+    assert link.telemetry_snapshot()["stick"]["active"] is False
 
 
 def test_last_counts_is_none_unless_both_wheels_reported():
@@ -229,6 +243,35 @@ def test_range_block_separates_nothing_in_range_from_blind():
                          when=time.monotonic() - 99)
     blind = link.range_snapshot()
     assert blind["live"] is False and "blind, not clear" in blind["note"], blind["note"]
+
+
+def test_a_torn_boot_line_does_not_steer_closest_forever():
+    link = make_link()
+    # What a reset-time splice looks like: one TOF_FRONT packet with extra values
+    # (IMU-shaped numbers glued on). Seen live when opening the port reset the
+    # bridge: phantom channels tof_front[2..5] and closest stuck at -83.
+    link.tof.update("TOF_FRONT", (134, 111, 16180, -83, -29, 49), 1000)
+    link.sensors.observe("TOF_FRONT", (134, 111), 1000, available=[True, True])
+    # On first sight it is indistinguishable from a wider board, so it counts...
+    assert link.range_snapshot()["closest_mm"] == -83
+    # ...until it ages: those keys never refresh, while normal traffic resumes.
+    for key in list(link.tof.last_wall):
+        if key[1] > 1:
+            link.tof.last_wall[key] -= 5.0
+    link.tof.update("TOF_FRONT", (134, 111), 2000)
+    rng = link.range_snapshot()
+    assert rng["channels"]["front_left"]["mm"] == 134
+    assert rng["closest_mm"] == 111, rng["closest_mm"]
+
+
+def test_a_channel_that_goes_quiet_stops_steering():
+    link = make_link()
+    link.tof.update("TOF_FRONT", (134, 111), 1000)
+    assert link.range_snapshot()["closest_mm"] == 111
+    link.tof.last_wall[("TOF_FRONT", 1)] -= 5.0
+    assert link.range_snapshot()["closest_mm"] == 134
+    link.tof.last_wall[("TOF_FRONT", 0)] -= 5.0
+    assert link.range_snapshot()["closest_mm"] is None
 
 
 def test_an_unknown_sensor_needs_no_code_to_appear():

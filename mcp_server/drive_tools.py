@@ -34,6 +34,7 @@ def drive_distance(
     pwm: int,
     confirmed_safe: bool,
     encoder: Literal["both", "left", "right"] = "both",
+    lease: Optional[str] = None,
 ) -> dict:
     """Closed-loop straight-line move: drives at `pwm` (0-255, clamped to
     MAX_PWM_CEILING=125) until the wheel encoders report `distance_inches` traveled, then
@@ -62,11 +63,16 @@ def drive_distance(
     the first real call on new hardware should be a small one specifically to check the
     robot actually moves the way it was asked.
 
+    `lease` is the token from take_drive_lease. The daemon lets one client drive at a
+    time, so there every drive tool needs it; a server with a single stdio client does
+    not ask for one. It says whose move this is and is not a substitute for
+    confirmed_safe.
+
     Blocks until the move finishes.
     """
     if _L() is None:
         return CTX._not_connected()
-    gate = CTX._confirm_gate(confirmed_safe)
+    gate = CTX._confirm_gate(confirmed_safe, lease)
     if gate:
         return gate
     if distance_inches <= 0:
@@ -180,6 +186,7 @@ def turn_degrees(
     direction: Literal["left", "right"],
     pwm: int,
     confirmed_safe: bool,
+    lease: Optional[str] = None,
 ) -> dict:
     """Closed-loop spin-in-place: drives the wheels in opposite directions at `pwm`
     (0-255, clamped to MAX_PWM_CEILING=125) until the IMU's gyro-integrated yaw reports
@@ -206,7 +213,7 @@ def turn_degrees(
     """
     if _L() is None:
         return CTX._not_connected()
-    gate = CTX._confirm_gate(confirmed_safe)
+    gate = CTX._confirm_gate(confirmed_safe, lease)
     if gate:
         return gate
     if degrees <= 0:
@@ -312,6 +319,7 @@ def drive_arc(
     max_wheel_pwm: int = MAX_PWM_CEILING,
     travel: Literal["forward", "reverse"] = "forward",
     encoder: Literal["both", "left", "right"] = "both",
+    lease: Optional[str] = None,
 ) -> dict:
     """Closed-loop curved drive: both wheels roll forward (or backward, see `travel`), the
     outer one faster, so the robot drives an arc of `radius_inches` (measured to the robot's center) until the
@@ -360,7 +368,7 @@ def drive_arc(
     """
     if _L() is None:
         return CTX._not_connected()
-    gate = CTX._confirm_gate(confirmed_safe)
+    gate = CTX._confirm_gate(confirmed_safe, lease)
     if gate:
         return gate
     if radius_inches < MIN_ARC_RADIUS_IN:
@@ -534,7 +542,8 @@ def drive_arc(
 def drive_until_range(target_mm: float, pwm: int, confirmed_safe: bool,
                       facing: Literal["auto", "forward", "reverse"] = "auto",
                       sensor: Optional[str] = None, tolerance_mm: float = 15.0,
-                      min_pwm: int = PWM_DEADBAND + 5) -> dict:
+                      min_pwm: int = PWM_DEADBAND + 5,
+                      lease: Optional[str] = None) -> dict:
     """Closed-loop approach: drive straight toward whatever a ToF sensor is looking at
     until its median range reads `target_mm`, then stop. The loop closes on the range
     sensor, not the encoders, so it works with the wheel encoders dead.
@@ -571,7 +580,7 @@ def drive_until_range(target_mm: float, pwm: int, confirmed_safe: bool,
     """
     if _L() is None:
         return CTX._not_connected()
-    gate = CTX._confirm_gate(confirmed_safe)
+    gate = CTX._confirm_gate(confirmed_safe, lease)
     if gate:
         return gate
     if target_mm < RANGE_MIN_TARGET_MM:
@@ -782,7 +791,8 @@ def drive_until_range(target_mm: float, pwm: int, confirmed_safe: bool,
 
 
 def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool,
-        require_telemetry: Optional[bool] = None) -> dict:
+        require_telemetry: Optional[bool] = None,
+        lease: Optional[str] = None) -> dict:
     """Raw open-loop command: drive at exactly (left_pwm, right_pwm) for duration_s
     seconds, then stop. No encoder target and no direction-aware sign correction (unlike
     drive_distance/turn_degrees) -- positive does not necessarily mean forward, see
@@ -802,7 +812,7 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool,
     """
     if _L() is None:
         return CTX._not_connected()
-    gate = CTX._confirm_gate(confirmed_safe)
+    gate = CTX._confirm_gate(confirmed_safe, lease)
     if gate:
         return gate
     if duration_s <= 0:

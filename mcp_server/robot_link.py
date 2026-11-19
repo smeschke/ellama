@@ -21,6 +21,8 @@ import serial
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 import bridge  # noqa: E402
+import drive_lease  # noqa: E402
+import operator_stop  # noqa: E402
 import sensors as sensorlib  # noqa: E402
 import recording  # noqa: E402
 import tilt_guard  # noqa: E402
@@ -58,6 +60,28 @@ IMU_STALE_FAULT_S = 0.5
 TILT = tilt_guard.TiltGuard(limit_deg=TILT_LIMIT_DEG, lookahead_s=TILT_LOOKAHEAD_S,
                             enabled=TILT_GUARD_ENABLED)
 
+# The operator's stop latch (mcp_server/operator_stop.py), process-wide for the same reason:
+# reconnecting must not release it. Read here at module level rather than through `self`, so
+# it holds for every RobotLink however it was built.
+OPSTOP = operator_stop.OperatorStop()
+
+# Who is driving (mcp_server/drive_lease.py). Checked at the tool gate in robot_server, not
+# in send_drive: a serial line does not know which client asked for it. It lives here so
+# that it is process-wide like the rest, and so guards() reports all of them together.
+_lease_env = os.environ.get("ELLAMA_DRIVE_LEASE", "").lower()
+LEASE = drive_lease.DriveLease(required=_lease_env in ("required", "on", "1", "true", "yes"))
+
+
+def _trace_event(kind, **fields):
+    """Best-effort trace into recordings/trace.jsonl. Never raises."""
+    try:
+        import trace as _tr
+        if not hasattr(_tr, "event"):
+            return
+        _tr.event(kind, **fields)
+    except Exception:
+        pass
+
 
 class GuardFault(Exception):
     """Raised by RobotLink.send_drive when the tilt guard refuses a drive command.
@@ -92,6 +116,9 @@ class RobotLink:
 
     def __init__(self, port=None):
         self.cfg = bridge.load_config()
+        problems = recording.check_config(self.cfg)
+        if problems:
+            raise RuntimeError("bad calibration config: %s" % "; ".join(problems))
         self.track_width_calibrated = (
             self.cfg["track_width_in"] != bridge.DEFAULT_CONFIG["track_width_in"]
         )
@@ -121,7 +148,17 @@ class RobotLink:
         self.policy = POLICY   # module-level: survives connect(), like the guards
         self.lock = threading.Lock()
         self.recorder = recording.Recorder(REPO_ROOT / "recordings")
+        self.recorder.vet.log("connect", {
+            "port": str(port),
+            "track_width_in": self.cfg["track_width_in"],
+            "track_width_calibrated": self.track_width_calibrated,
+            "required_sensors": list(self.policy.required),
+        })
         self.last_imu = None
+        # Last drive command overheard from another sender (the stick).
+        # Updated by the pump; read by the dashboard so hand driving is visible.
+        self.last_stick = None
+        self.last_stick_wall = None
 
         # Serial writes come from tool threads AND the pump (the tilt trip sends "stop" from
         # there, ~20 ms after the offending IMU sample), so a line must never interleave.
@@ -167,6 +204,12 @@ class RobotLink:
                     self.recorder.on_enc(self.enc, self.orient, sl, sr)
                 elif kind == "CMD":
                     self.recorder.on_cmd(*payload)  # the stick's command, overheard by the bridge
+                    prev_wall = self.last_stick_wall
+                    self.last_stick = tuple(payload)
+                    self.last_stick_wall = now
+                    if prev_wall is None or now - prev_wall > 2.0:
+                        _trace_event("stick", action="driving",
+                                     left=payload[0], right=payload[1])
                 elif kind == "IMU":
                     ax, ay, az, gx, gy, gz, ms = payload
                     agx, agy, agz, dx, dy, dz = self.orient.update(ax, ay, az, gx, gy, gz, ms)
@@ -251,7 +294,10 @@ class RobotLink:
     def _drive_refusal(self):
         """Why a nonzero drive command must not go out right now, or None.
 
-        Two different questions, asked in this order:
+        Before anything else: has the operator latched a stop? That is a person at the
+        robot saying no, and it outranks every measurement below.
+
+        Then two different questions, asked in this order:
 
         1. Is a sensor this run was DECLARED to need missing? That is the policy's call
            (set_required_sensors), not this file's opinion. A sensor that is absent but not
@@ -264,6 +310,9 @@ class RobotLink:
         guard, which sensors() states as a fact; whether to drive anyway was already
         settled by question 1.
         """
+        stopped = OPSTOP.describe()
+        if stopped is not None:
+            return stopped
         missing = self.missing_required()
         if missing:
             return ("%s -- required by the current sensor policy. Fix the link, or call "
@@ -310,7 +359,8 @@ class RobotLink:
             tilt["inactive_because"] = "no live IMU: nothing measures lean"
         elif not tilt["ready"]:
             tilt["inactive_because"] = "no level reference captured yet"
-        return {"tilt": tilt, "policy": self.policy.snapshot(self.sensors)}
+        return {"tilt": tilt, "policy": self.policy.snapshot(self.sensors),
+                "operator_stop": OPSTOP.snapshot(), "drive_lease": LEASE.snapshot()}
 
     def send_stop(self):
         self.send_line("stop")
@@ -374,7 +424,7 @@ class RobotLink:
         channels = {}
         for (name, index) in sorted(self.tof.channels):
             entry = self.tof.channels[(name, index)]
-            median = self.tof.median_mm(name, index)
+            median = self.tof.median_mm(name, index, now=now)
             stream = self.sensors.get(name)
             channels[bridge.TofState.label(name, index)] = dict(
                 sensor=name,
@@ -388,7 +438,7 @@ class RobotLink:
                 latest_in_range=not entry["invalid"],
                 live=bool(stream and stream.live(now)),
             )
-        closest = self.tof.closest_mm()
+        closest = self.tof.closest_mm(now=now)
         live_any = any(c["live"] for c in channels.values())
         return dict(
             channels=channels,
@@ -436,6 +486,10 @@ class RobotLink:
                 sensors=self.sensors.summary(now),
                 bridge=dict(dropped_frames=self.sensors.dropped,
                             foreign_frames=self.sensors.foreign),
+                stick=(None if self.last_stick_wall is None else dict(
+                    left=self.last_stick[0], right=self.last_stick[1],
+                    age_s=round(now - self.last_stick_wall, 2),
+                    active=(now - self.last_stick_wall) < 1.0)),
                 required_sensors=list(self.policy.required),
                 missing_sensors=self.policy.missing(self.sensors, now),
                 gear_ratio_used=self.cfg["gear_ratio"],

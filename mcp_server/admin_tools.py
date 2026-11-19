@@ -351,13 +351,65 @@ def stop_recording() -> dict:
 
 
 
+def take_drive_lease(holder: str, operator: str, purpose: str = "",
+                     ttl_s: Optional[float] = None) -> dict:
+    """Become the one client that may drive. Does not move the robot.
+
+    `holder` says who you are ("Claude Code session", "find_object.py"). `operator` names
+    the person who is watching the robot and can reach the stop; ask them, do not invent
+    one. On success the result carries `lease`, a token: pass it as lease=... on every
+    drive call. It only says whose moves these are -- each move still needs
+    confirmed_safe under DRIVING_POLICY.md.
+
+    Refused while another client holds the lease, with who holds it and when it frees up.
+    A holder is given up on after ttl_s (default 120, 10-600) with no drive call and no
+    renew_drive_lease, never while it has a move in progress. Reading sensors and calling
+    stop need no lease, ever. Call release_drive_lease when you are done driving.
+    """
+    ok, info = CTX.LEASE.take(holder, operator, purpose, ttl_s)
+    return {"ok": ok, **info}
+
+
+def renew_drive_lease(lease: str) -> dict:
+    """Keep your drive lease while you are not driving -- thinking, or waiting on the
+    operator -- so that it does not lapse to another client. Every drive call renews it
+    too. Does not move the robot."""
+    ok, info = CTX.LEASE.renew(lease)
+    return {"ok": ok, **info}
+
+
+def release_drive_lease(lease: str) -> dict:
+    """Give up your drive lease so another client can drive. Does not move the robot and
+    does not stop it: refused while a move you started is still in progress."""
+    ok, info = CTX.LEASE.release(lease)
+    return {"ok": ok, **info}
+
+
+def vetbook_recent(n: int = 20) -> dict:
+    """Read-only. The robot's lifetime logbook: recent run starts/stops, guard and
+    sensor-policy changes, and connects, newest last. Never moves the robot."""
+    if _L() is None:
+        return CTX._not_connected()
+    try:
+        n = max(1, min(int(n), 200))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "n must be a number of entries (1-200)"}
+    return {"ok": True, "entries": _L().recorder.vet.recent(n)}
+
+
 ADMIN_TOOLS = (connect, read_telemetry, sensors, read_range, set_required_sensors,
                guards, set_guard, zero_odometry, stop, clear_tilt_fault,
-               set_level_reference, listen, start_recording, add_marker, stop_recording)
+               set_level_reference, listen, start_recording, add_marker, stop_recording,
+               take_drive_lease, renew_drive_lease, release_drive_lease, vetbook_recent)
 
 
 def register(mcp, ctx):
     global CTX
     CTX = ctx
+    traced = getattr(ctx, "_traced", None)
     for fn in ADMIN_TOOLS:
-        mcp.tool()(fn)
+        if traced is not None and fn.__name__ in ("read_telemetry", "sensors",
+                                                  "read_range", "guards"):
+            mcp.tool()(traced(fn))
+        else:
+            mcp.tool()(fn)

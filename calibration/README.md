@@ -11,7 +11,7 @@ Needs on the robot: `robot_encoders_as5600` and a `robot_imu_*` sketch. Python: 
 
 | File | What it does |
 |---|---|
-| `live_view.py` | Live plots + a big readout of distance/heading since you last pressed `z`. Type `d <inches>` / `t <degrees>` to calibrate wheel diameter / track width from a real measurement. |
+| `live_view.py` | Live plots + a big readout of distance/heading since you last pressed `z`. Type `d <inches>` / `t <degrees>` to calibrate wheel diameter / track width from a real measurement. Run with `--daemon` when the robot daemon owns the bridge (see below). |
 | [`../bridge/`](../bridge/) | Serial reader, line parsing, config load/save, and the distance/orientation math that `live_view.py` uses (shared with the MCP server). |
 | `config.json` | Wheel diameter, gear ratio (6.33, same as the bench sketch), track width. Read by `live_view.py`, which writes it when you calibrate. |
 | `analyze_csv.py` / `analyze_run.py` | Post-run analysis of recording CSVs. |
@@ -22,6 +22,23 @@ Needs on the robot: `robot_encoders_as5600` and a `robot_imu_*` sketch. Python: 
 ```
 python3 calibration/live_view.py
 ```
+
+## With the daemon
+
+When `mcp_server/robot_server.py` owns the bridge, opening the serial port a
+second time fails with "Resource temporarily unavailable" -- and this script
+now says so instead of dumping a traceback. Run the daemon with `--http`,
+then point the dashboard at it:
+
+```
+mcp_server/.venv/bin/python mcp_server/robot_server.py --http
+python3 calibration/live_view.py --daemon
+```
+
+`--daemon` polls the daemon's `GET /state`, so the dashboard is read-only and
+never fights the daemon for the port. `z` re-zeros the display only (true
+odometry lives in the daemon); the DRIVE panel shows the daemon's stop, lease,
+and move state instead of overheard stick commands.
 
 1. Put the robot at a mark, press `z` in the plot window.
 2. Drive one foot with the stick. The readout shows distance in inches and feet.

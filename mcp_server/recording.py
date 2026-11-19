@@ -25,6 +25,7 @@ Lock order: RobotLink.lock first, then Recorder's own lock -- never the reverse.
 """
 
 import csv
+import json
 import re
 import threading
 import time
@@ -35,6 +36,69 @@ HEADER = ["time_s", "source", "dist_l_in", "dist_r_in", "dist_avg_in",
           "pitch_deg", "roll_deg", "yaw_deg", "acc_x_g", "acc_y_g", "acc_z_g",
           "range_closest_mm", "note"]
 
+#: Lifetime logbook beside the per-run directories: one JSON object per line,
+#: appended for every run, guard/policy change, and server start. Local only --
+#: recordings/ is git-ignored, so this never leaves the machine.
+VETBOOK_NAME = "vetbook.jsonl"
+
+#: Sane ranges for the measured constants in calibration/config.json. A value
+#: outside these means a bad calibration save, not a different robot: e.g. a
+#: 200 in track width would silently scale every distance the robot reports.
+_CONFIG_RANGES = {
+    "wheel_diameter_in": (4.0, 20.0),
+    "ticks_per_rev": (512, 16384),
+    "gear_ratio": (1.0, 20.0),
+    "track_width_in": (8.0, 30.0),
+}
+
+
+def check_config(cfg):
+    """Validate a config dict. Returns a list of problem strings, empty when fine."""
+    problems = []
+    for key, (lo, hi) in _CONFIG_RANGES.items():
+        if key not in cfg:
+            problems.append("missing required key %r" % key)
+        elif not isinstance(cfg[key], (int, float)):
+            problems.append("%r must be a number, got %r" % (key, cfg[key]))
+        elif not (lo <= cfg[key] <= hi):
+            problems.append("%r=%r outside sane range %s..%s" % (key, cfg[key], lo, hi))
+    sign = cfg.get("encoder_sign")
+    if sign is None:
+        problems.append("missing required key 'encoder_sign'")
+    elif list(sign) not in ([1, 1], [1, -1], [-1, 1], [-1, -1]):
+        problems.append("encoder_sign must be two entries of +-1, got %r" % (sign,))
+    return problems
+
+
+class VetLog:
+    """Append-only lifetime log: every run and config change, one JSON line each."""
+
+    def __init__(self, base_dir):
+        self.path = Path(base_dir) / VETBOOK_NAME
+        self._lock = threading.Lock()
+
+    def log(self, event, details=None):
+        record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                  "event": event, **(details or {})}
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        return record
+
+    def recent(self, n=20):
+        try:
+            lines = self.path.read_text().splitlines()
+        except FileNotFoundError:
+            return []
+        out = []
+        for line in lines[-max(1, n):]:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue
+        return out
+
 
 def _num(value, fmt="%.4f"):
     """Format a number, or "nan" when it is not known. Never substitutes a zero."""
@@ -44,6 +108,7 @@ def _num(value, fmt="%.4f"):
 class Recorder:
     def __init__(self, base_dir):
         self.base_dir = Path(base_dir)
+        self.vet = VetLog(self.base_dir)
         self._lock = threading.Lock()
         self._file = self._writer = None
         self._cmd_file = self._cmd_writer = None
@@ -87,6 +152,7 @@ class Recorder:
             self._speed = (0.0, 0.0)
             self._acc = (0.0, 0.0, 0.0)
             self._range_mm = None
+            self.vet.log("run_start", {"name": name, "csv": str(self.csv_path)})
             return self.csv_path
 
     def stop(self):
@@ -98,10 +164,12 @@ class Recorder:
             self._file = self._writer = None
             self._cmd_file.close()
             self._cmd_file = self._cmd_writer = None
-            return dict(csv=str(self.csv_path), dir=str(self.dir),
-                        duration_s=round(time.monotonic() - self._t0, 1),
-                        samples=self._rows, markers=self._markers,
-                        commands=self._cmds)
+            summary = dict(csv=str(self.csv_path), dir=str(self.dir),
+                           duration_s=round(time.monotonic() - self._t0, 1),
+                           samples=self._rows, markers=self._markers,
+                           commands=self._cmds)
+        self.vet.log("run_stop", summary)
+        return summary
 
     def on_enc(self, enc, orient, speed_l, speed_r):
         self._speed = (speed_l if speed_l is not None else 0.0,
@@ -123,6 +191,7 @@ class Recorder:
 
     def on_config(self, what):
         """A guard or sensor-policy change, so a run's CSV shows what it was driven under."""
+        self.vet.log("config", {"note": what})
         with self._lock:
             if self._writer is None:
                 return None

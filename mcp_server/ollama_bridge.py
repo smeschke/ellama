@@ -16,6 +16,9 @@ always set that true, because that is what makes the call succeed. DRIVING_POLIC
 section 1 requires the ask every time, regardless of how small the move is.
 
 Run:  mcp_server/.venv/bin/python mcp_server/ollama_bridge.py
+Daemon mode: set ELLAMA_MCP_URL=http://127.0.0.1:8765 and it connects to an
+already-running robot_server.py --http instead of spawning a private stdio
+server. The daemon owns serial; this loop only translates model <-> tools.
 """
 
 import asyncio, json, os, sys, time, urllib.request
@@ -109,8 +112,26 @@ def ollama_chat(messages, tools):
     }).encode()
     req = urllib.request.Request(f"{OLLAMA}/api/chat", body,
                                  {"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=1800) as r:
-        return json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=1800) as r:
+            data = json.load(r)
+        _trace_event("model", model=MODEL, purpose="chat",
+                     prompt_tokens=data.get("prompt_eval_count"),
+                     completion_tokens=data.get("eval_count"))
+        return data
+    except Exception as e:
+        _trace_event("model", model=MODEL, purpose="chat", error=repr(e))
+        raise
+
+
+def _trace_event(kind, **fields):
+    """Best-effort model-side trace into the daemon's trace file."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import trace as _tr
+        _tr.event(kind, **fields)
+    except Exception:
+        pass
 
 
 def as_ollama_tool(t):
@@ -156,18 +177,35 @@ def approve(name, args):
         return False
     if answer == "yes":
         args["confirmed_safe"] = True   # set HERE, by the human, not by the model
+        _trace_event("approval", tool=name, args=args, approved=True)
         return True
     print("  not approved\n")
+    _trace_event("approval", tool=name, args=args, approved=False)
     return False
 
 
 async def main():
     simple = "--simple" in sys.argv
-    here = os.path.dirname(os.path.abspath(__file__))
-    params = StdioServerParameters(
-        command=sys.executable, args=[os.path.join(here, "robot_server.py")],
-    )
-    async with stdio_client(params) as (read, write):
+    url = os.environ.get("ELLAMA_MCP_URL", "").rstrip("/")
+    if url:
+        # Daemon mode: talk to an already-running robot_server.py --http
+        # instead of spawning a private stdio server. The daemon owns serial.
+        if not url.endswith("/mcp"):
+            url = url + "/mcp"
+        print(f"connecting to daemon {url} ...")
+        from mcp.client.streamable_http import streamable_http_client
+        async with streamable_http_client(url) as (read, write, _sid):
+            await run_session(read, write, simple)
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
+        params = StdioServerParameters(
+            command=sys.executable, args=[os.path.join(here, "robot_server.py")],
+        )
+        async with stdio_client(params) as (read, write):
+            await run_session(read, write, simple)
+
+
+async def run_session(read, write, simple):
         async with ClientSession(read, write) as session:
             await session.initialize()
             found = (await session.list_tools()).tools
