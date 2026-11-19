@@ -6,3 +6,8 @@ mcp_server/.venv/
 mcp_server/models/
 *.mp4
 *~
+
+# local secrets, never committed
+.env
+lll_key.txt
+rkey.txt
