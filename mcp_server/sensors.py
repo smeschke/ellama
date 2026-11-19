@@ -210,19 +210,25 @@ class SensorRegistry:
         s = self.get(name)
         return None if s is None else s.age_s(now or time.monotonic())
 
-    def resolve(self, required, now=None):
+    def resolve(self, required, now=None, trusted_only=True):
         """Stream names satisfying one required entry: either that exact name, or, for a
         group ("tof"/"range"), every stream whose name starts with the group's prefix.
 
         Only trusted streams count. A policy must never be satisfied by a name that one
-        garbled line invented."""
+        garbled line invented.
+
+        trusted_only=False also returns a name that has been seen just once. That can
+        never satisfy a policy (see SAMPLES_TO_TRUST), but it is exactly what a
+        diagnostic needs in order to say "seen once, not confirmed" rather than
+        reporting the sensor as one that never existed."""
         want = canon(required)
         prefix = GROUP_PREFIXES.get(want)
         with self._lock:
-            trusted = {n for n, st in self.streams.items() if st.trusted}
+            names = {n for n, st in self.streams.items()
+                     if st.trusted or not trusted_only}
             if prefix is None:
-                return [want] if want in trusted else []
-            return sorted(n for n in trusted if n.startswith(prefix))
+                return [want] if want in names else []
+            return sorted(n for n in names if n.startswith(prefix))
 
     def trusted_live(self, name, now=None):
         """Live AND seen more than once -- what "this sensor is present" means."""

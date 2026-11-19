@@ -25,14 +25,27 @@ about the sides, the floor, a drop, or anything behind.
 
 Setup:
     pip install mcp pyserial
-    python3 mcp_server/robot_server.py
+    python3 mcp_server/robot_server.py            # stdio: one client launches and owns it
+    python3 mcp_server/robot_server.py --http     # daemon: runs on its own, clients connect
+
+Daemon mode (--http) serves the same tools at http://127.0.0.1:8765/mcp and adds the
+operator's side, which is plain HTTP and needs no MCP client (see daemon_http.py):
+    GET  /        a page with a STOP button and the robot's state
+    POST /stop    latch the operator stop: zero PWM now, every drive refused until...
+    POST /resume  ...the operator releases it. No MCP tool can.
+    POST /lease/revoke  take driving away from whichever client holds the lease
+    GET  /state   connection, guards and telemetry as JSON
 
 Env:
     ELLAMA_SERIAL_PORT       explicit serial port; default auto-detects
     ELLAMA_REQUIRED_SENSORS  sensors the drive tools insist on; default "enc,imu"
     ELLAMA_TILT_LIMIT_DEG / ELLAMA_TILT_LOOKAHEAD_S / ELLAMA_TILT_GUARD (robot_link)
+    ELLAMA_HTTP_HOST / ELLAMA_HTTP_PORT   daemon bind address; default 127.0.0.1:8765
+    ELLAMA_DRIVE_LEASE       "required" / "optional": whether driving needs a lease when
+                             nobody holds one. Default: required under --http, else optional
 """
 
+import argparse
 import atexit
 import functools
 import os
@@ -50,7 +63,8 @@ import tilt_guard  # noqa: E402
 from drive_math import *  # noqa: E402,F401,F403
 from drive_math import (RANGE_LATENCY_S, TELEMETRY_STALE_S, approach_pwm,  # noqa: E402
                         pwm_for_speed, speed_for_pwm)
-from robot_link import (IMU_STALE_FAULT_S, POLICY, TILT, GuardFault,  # noqa: E402
+from robot_link import (IMU_STALE_FAULT_S, LEASE, OPSTOP, POLICY, TILT,  # noqa: E402
+                        GuardFault,
                         RobotLink, TiltFault)
 
 from mcp.server.mcpserver import MCPServer as FastMCP  # noqa: E402  mcp>=2 renamed
@@ -85,9 +99,72 @@ def _shutdown():
         link.emergency_stop()
 
 
+def operator_stop(who="operator", reason=""):
+    """Latch the operator's stop and brake. Latch first, then send: a drive command that
+    was already past its check goes out before our "stop" and is overridden by it, and
+    every one after it is refused at send_drive. Works with no robot connected -- the
+    latch is still set, so a robot that connects later starts out stopped."""
+    snap = OPSTOP.latch(who, reason)
+    if link is not None:
+        link.emergency_stop()
+    try:
+        import trace as _tr
+        _tr.event("operator", action="stop", who=who, reason=reason)
+    except Exception:
+        pass
+    return snap
+
+
+def operator_resume(who="operator"):
+    """Release the operator's stop. Only the operator's side calls this (daemon_http)."""
+    out = OPSTOP.clear(who)
+    try:
+        import trace as _tr
+        _tr.event("operator", action="resume", who=who)
+    except Exception:
+        pass
+    return out
+
+
+def operator_clear_tilt(who="operator"):
+    """Release a latched tilt fault from the operator page. The person pressing the button
+    is standing at the robot, which is the confirmation clear_tilt_fault asks a model for.
+    TiltGuard.clear() still refuses while the robot leans within the margin of the limit
+    or is still rocking. Returns (ok, message, tilt snapshot or None)."""
+    if link is None:
+        return False, "no robot connected", None
+    with link.lock:
+        ok, msg = link.tilt.clear()
+        snap = link.tilt.snapshot()
+    try:
+        import trace as _tr
+        _tr.event("operator", action="clear_tilt", who=who, ok=ok,
+                  error=None if ok else msg)
+    except Exception:
+        pass
+    return ok, msg, snap
+
+
+def operator_revoke_lease(who="operator"):
+    """Take the drive lease away from whoever holds it. Operator's side only. It does not
+    stop a move in progress -- that is operator_stop -- it ends that client's turn."""
+    out = LEASE.revoke(who)
+    try:
+        import trace as _tr
+        _tr.event("operator", action="revoke_lease", who=who)
+    except Exception:
+        pass
+    return out
+
+
 atexit.register(_shutdown)
+# os._exit, not sys.exit: SystemExit raised from a handler lands inside the MCP stdio
+# loop, which then blocks forever waiting on its worker thread parked in a stdin read --
+# the process survived SIGTERM still holding the serial port, so the next run of
+# a script that wanted the port could not open it. _shutdown has already sent the stop and
+# flushed the port by this line, and atexit would only run the same _shutdown again.
 for _sig in (signal.SIGINT, signal.SIGTERM):
-    signal.signal(_sig, lambda signum, frame: (_shutdown(), sys.exit(1)))
+    signal.signal(_sig, lambda signum, frame: (_shutdown(), os._exit(1)))
 
 try:
     _connect(os.environ.get("ELLAMA_SERIAL_PORT"))
@@ -109,7 +186,11 @@ def _tilt_gate():
     if why is None:
         return None
     missing = link.missing_required()
-    if missing:
+    if OPSTOP.latched:
+        hint = ("a person at the robot stopped it. Do not retry and do not look for a way "
+                "round this: say what you were doing, ask the operator what they saw, and "
+                "wait for them to press Resume.")
+    elif missing:
         hint = ("either bring %s back (check the board's power and link, then connect()), or "
                 "decide this run does not need it: set_required_sensors() lists what each one "
                 "costs. sensors() shows everything that IS reporting."
@@ -127,21 +208,46 @@ def _tilt_gate():
 def _tilt_guarded(fn):
     """Turn a TiltFault raised mid-move into a normal tool result. The tool's own `finally`
     has already sent the stop by the time this sees it."""
+    if getattr(fn, "_ellama_traced", False):
+        return fn
+
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        import time as _t
+        start = _t.monotonic()
         try:
-            return fn(*args, **kwargs)
+            out = fn(*args, **kwargs)
+            _trace.event("tool", tool=fn.__name__,
+                         ok=bool(isinstance(out, dict) and out.get("ok", True)),
+                         elapsed_s=round(_t.monotonic() - start, 3))
+            return out
         except GuardFault as e:
-            return {"ok": False, "error": "guard: %s" % e, "guards": e.info,
-                    "telemetry": link.telemetry_snapshot() if link is not None else None}
+            out = {"ok": False, "error": "guard: %s" % e, "guards": e.info,
+                   "telemetry": link.telemetry_snapshot() if link is not None else None}
+            _trace.event("tool", tool=fn.__name__, ok=False,
+                         error=out["error"], elapsed_s=round(_t.monotonic() - start, 3))
+            return out
+        finally:
+            # Pairs with the LEASE.begin() in _confirm_gate. Every drive tool goes through
+            # this wrapper, so the lease stops counting a move as in progress however the
+            # tool ended; it is a no-op for a call the gate refused.
+            LEASE.end()
+    wrapper._ellama_traced = True
     return wrapper
 
 
-def _confirm_gate(confirmed_safe: bool):
+def _confirm_gate(confirmed_safe: bool, lease: Optional[str] = None):
+    """The gate every drive tool passes before a wheel turns. In order: is the robot
+    allowed to move at all (operator stop, sensor policy, tilt guard); is this caller the
+    one driving (the lease); did the operator agree to this move (confirmed_safe)."""
     tilt_block = _tilt_gate()
     if tilt_block:
         return tilt_block
+    lease_block = LEASE.check(lease)
+    if lease_block:
+        return {"ok": False, "error": lease_block, "drive_lease": LEASE.snapshot()}
     if confirmed_safe:
+        LEASE.begin()   # ended by _tilt_guarded's finally
         return None
     rng = link.range_snapshot() if link is not None else None
     return {
@@ -164,6 +270,34 @@ def _confirm_gate(confirmed_safe: bool):
 
 import admin_tools  # noqa: E402
 import drive_tools  # noqa: E402
+import trace as _trace  # noqa: E402
+
+
+def _traced(fn):
+    """Wrap a read-only tool so its calls appear in recordings/trace.jsonl.
+
+    Used by admin_tools.register (MCP path) and once more after the re-export
+    below (direct-call path). Never raises; never double-wraps.
+    """
+    if getattr(fn, "_ellama_traced", False):
+        return fn
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        import time as _t
+        start = _t.monotonic()
+        try:
+            out = fn(*args, **kwargs)
+            _trace.event("tool", tool=fn.__name__,
+                         ok=bool(isinstance(out, dict) and out.get("ok", True)),
+                         elapsed_s=round(_t.monotonic() - start, 3))
+            return out
+        except Exception as e:
+            _trace.event("tool", tool=fn.__name__, ok=False, error=repr(e))
+            raise
+    wrapper._ellama_traced = True
+    return wrapper
+
 
 admin_tools.register(mcp, sys.modules[__name__])
 drive_tools.register(mcp, sys.modules[__name__])
@@ -172,10 +306,46 @@ drive_tools.register(mcp, sys.modules[__name__])
 # test suite) keep working after the split.
 from admin_tools import (add_marker, clear_tilt_fault, connect, guards, listen,  # noqa: E402
                          read_range, read_telemetry, sensors, set_guard,
-                         set_level_reference, set_required_sensors, start_recording,
-                         stop, stop_recording, zero_odometry)
+                         release_drive_lease, renew_drive_lease, set_level_reference,
+                         set_required_sensors, start_recording, stop, stop_recording,
+                         take_drive_lease, vetbook_recent, zero_odometry)
 from drive_tools import (drive_arc, drive_distance, drive_until_range, jog,  # noqa: E402
                          turn_degrees)
 
+# Direct-call copies (used by tests and sweep scripts) get the same trace
+# wrapper the MCP path got at register time. _traced/_tilt_guarded refuse to
+# double-wrap, so this is a no-op for names that already went through them.
+for _n in ("read_telemetry", "sensors", "read_range", "guards"):
+    globals()[_n] = _traced(globals()[_n])
+
+import daemon_http  # noqa: E402
+
+daemon_http.register(mcp, sys.modules[__name__])
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--http", action="store_true",
+                    help="run as a daemon over streamable HTTP instead of stdio")
+    ap.add_argument("--host", default=os.environ.get("ELLAMA_HTTP_HOST", "127.0.0.1"),
+                    help="daemon bind address (default 127.0.0.1: this machine only)")
+    ap.add_argument("--port", type=int,
+                    default=int(os.environ.get("ELLAMA_HTTP_PORT", "8765")))
+    args = ap.parse_args(argv)
+    import recording as _rec  # noqa: E402
+    _rec.VetLog(REPO_ROOT / "recordings").log(
+        "server_start", {"mode": "http" if args.http else "stdio",
+                         "host": args.host, "port": args.port})
+    if args.http:
+        # Several clients can connect to a daemon, so driving takes a lease there unless
+        # the operator has said otherwise. Under stdio there is exactly one client.
+        if os.environ.get("ELLAMA_DRIVE_LEASE", "").lower() not in ("optional", "off", "0",
+                                                                    "false", "no"):
+            LEASE.required = True
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    else:
+        mcp.run()
+
+
 if __name__ == "__main__":
-    mcp.run()
+    main()

@@ -10,12 +10,16 @@ in calibration/ until 2026-10-24, which read as calibration-only.
 computer_bridge.ino is listen-only until it is sent a drive line, and the
 scripts here never send one, so they can run while you drive with the stick.
 
-Serial lines this understands:
-  ENC <left> <right> <ms>                  cumulative AS5600 counts per wheel (legacy packet)
-  IMU <ax> <ay> <az> <gx> <gy> <gz> <ms>   raw accel LSB (+-2g), bias-corrected gyro LSB (+-250 dps)
-                                           (legacy packet)
-  CMD <left> <right>                       a drive command the bridge overheard (e.g. from the stick)
-  <NAME> <value>... <ms>                   any SensorPacket sender, e.g. "TOF_FRONT 812 -1 48213"
+Serial lines this understands (v2, from computer_bridge.ino v2):
+  @ <seq> ENC <left> <right> <ms> *CC
+  @ <seq> IMU <ax> <ay> <az> <gx> <gy> <gz> <ms> *CC
+  @ <seq> CMD <left> <right> *CC
+  @ <seq> <NAME> <value>... <ms> *CC   e.g. "@ 123 TOF_FRONT 812 -1 48213 *5A"
+  @ <seq> DROPPED <n> *CC / @ <seq> FOREIGN <n> *CC
+  @ status ... *00                        bridge chatter (never telemetry)
+Legacy v1 lines without the "@ ... *CC" wrapper are still accepted during the
+changeover but count as deprecated: they have no checksum, so a torn line can
+still invent a sensor name.
 
 The last form is the current scheme (firmware/libraries/LlamaSensors/LlamaSensors.h): the
 packet carries its own name, so adding a sensor needs no table here and no change to the
@@ -38,12 +42,13 @@ import queue
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 
 import serial
 import serial.tools.list_ports as list_ports
 
-BAUD_RATE = 115200
+BAUD_RATE = 921600  # v2 bridge firmware; reflash computer_bridge.ino together with this
 RESET_SETTLE_S = 2.0  # opening the port resets the ESP32; wait for boot + ESP-NOW join
 
 # Mirrors SENSOR_VALUE_INVALID in LlamaSensors.h: a sensor that reported but could not
@@ -171,44 +176,86 @@ _SENSOR_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _BRIDGE_WORDS = frozenset({"DROPPED", "UNK"})
 
 
+def _v2_checksum(payload_text):
+    """XOR of every byte in payload_text (the part between "@ " and " *")."""
+    cs = 0
+    for b in payload_text.encode("ascii", errors="ignore"):
+        cs ^= b
+    return cs
+
+
+def _classify_tokens(parts):
+    """Shared dispatch for v1 and v2 token lists (no "@", no checksum)."""
+    if not parts:
+        return None, ""
+    if parts[0] == "ENC" and len(parts) == 4:
+        left, right, ms = (int(x) for x in parts[1:4])
+        # Check for the sentinel BEFORE applying the sign: negating it would turn it
+        # into an ordinary-looking large count. An unavailable wheel becomes None.
+        left = None if left == SENSOR_VALUE_UNAVAILABLE else left * ENC_SIGN[0]
+        right = None if right == SENSOR_VALUE_UNAVAILABLE else right * ENC_SIGN[1]
+        return "ENC", (left, right, ms)
+    if parts[0] == "CMD" and len(parts) == 3:
+        return "CMD", tuple(int(x) for x in parts[1:3])
+    if parts[0] == "IMU" and len(parts) == 8:
+        return "IMU", tuple(int(x) for x in parts[1:8])
+
+    # Generic SensorPacket line: a name, at least one value, then the sender's ms.
+    if len(parts) >= 3 and parts[0] not in _BRIDGE_WORDS and _SENSOR_NAME_RE.match(parts[0]):
+        nums = tuple(int(x) for x in parts[1:])
+        return "SENSOR", (parts[0], nums[:-1], nums[-1])
+    return None, " ".join(parts)
+
+
 def parse_line(raw):
-    """Classify one line of computer_bridge.ino output.
+    """Classify one line of computer_bridge.ino output (v2 preferred, v1 fallback).
+
+    v2: "@ <seq> <NAME> <fields...> *<CC>" with XOR checksum. A bad checksum or a
+    torn frame returns (None, text) so the caller drops it instead of inventing
+    a sensor. v1 lines without the wrapper are still accepted as deprecated.
 
     Returns one of:
-      ("ENC", (left, right, ms))                    legacy encoder packet, signs applied
-      ("IMU", (ax, ay, az, gx, gy, gz, ms))         legacy IMU packet
+      ("ENC", (left, right, ms))                    encoder packet, signs applied
+      ("IMU", (ax, ay, az, gx, gy, gz, ms))         IMU packet
       ("CMD", (left, right))                        an overheard drive command
       ("SENSOR", (name, values, ms))                any SensorPacket sender; values is a
                                                     tuple of raw ints, uninterpreted
       (None, decoded_text)                          bridge chatter or garbage
-
-    The SENSOR branch is generic on purpose: a new sender needs no change here, which is
-    the point of the name travelling inside the packet.
     """
     text = raw.decode("ascii", errors="ignore").strip()
-    parts = text.split()
-    if not parts:
+    if not text:
         return None, text
+    if text.startswith("@"):
+        # v2 frame. "@ status ..." is bridge chatter, never telemetry.
+        if text.startswith("@ status"):
+            return None, text
+        try:
+            head, _, cc_hex = text.rpartition(" *")
+            if not head.startswith("@ ") or not cc_hex:
+                return None, text
+            payload = head[2:]
+            want = int(cc_hex.strip()[:2], 16)
+            if _v2_checksum(payload) != want:
+                return None, text
+            tokens = payload.split()
+            if len(tokens) < 2:
+                return None, text
+            int(tokens[0])  # seq: validated, otherwise ignored
+            if tokens[1] in ("DROPPED", "FOREIGN"):
+                # Bridge's own counters: keep the v1 "DROPPED <n>" shape the
+                # pump already parses, without the framing around it.
+                return None, " ".join(tokens[1:])
+            kind, payload_out = _classify_tokens(tokens[1:])
+            if kind is None:
+                return None, text
+            return kind, payload_out
+        except ValueError:
+            return None, text
     try:
-        if parts[0] == "ENC" and len(parts) == 4:
-            left, right, ms = (int(x) for x in parts[1:4])
-            # Check for the sentinel BEFORE applying the sign: negating it would turn it
-            # into an ordinary-looking large count. An unavailable wheel becomes None.
-            left = None if left == SENSOR_VALUE_UNAVAILABLE else left * ENC_SIGN[0]
-            right = None if right == SENSOR_VALUE_UNAVAILABLE else right * ENC_SIGN[1]
-            return "ENC", (left, right, ms)
-        if parts[0] == "CMD" and len(parts) == 3:
-            return "CMD", tuple(int(x) for x in parts[1:3])
-        if parts[0] == "IMU" and len(parts) == 8:
-            return "IMU", tuple(int(x) for x in parts[1:8])
-
-        # Generic SensorPacket line: a name, at least one value, then the sender's ms.
-        # Requiring every remaining field to be an integer is what keeps bridge chatter
-        # out -- "UNK len=5" fails on "len=5", and "DROPPED 3" has too few fields to be
-        # a reading, so neither needs special-casing beyond the name check.
-        if len(parts) >= 3 and parts[0] not in _BRIDGE_WORDS and _SENSOR_NAME_RE.match(parts[0]):
-            nums = tuple(int(x) for x in parts[1:])
-            return "SENSOR", (parts[0], nums[:-1], nums[-1])
+        kind, payload_out = _classify_tokens(text.split())
+        if kind is None:
+            return None, text
+        return kind, payload_out
     except ValueError:
         pass
     return None, text
@@ -328,13 +375,16 @@ class TofState:
     def __init__(self):
         self.channels = {}   # (name, index) -> dict(mm, inches, ms, invalid)
         self.recent = {}     # (name, index) -> list of recent valid mm, newest last
+        self.last_wall = {}  # (name, index) -> time.monotonic() of last packet touching it
 
     def update(self, name, values, ms):
         """Store one sensor's packet. Returns the list of keys it touched."""
+        now = time.monotonic()
         keys = []
         for i, raw in enumerate(values):
             invalid = raw == SENSOR_VALUE_INVALID
             key = (name, i)
+            self.last_wall[key] = now
             self.channels[key] = dict(
                 mm=None if invalid else raw,
                 inches=None if invalid else raw / MM_PER_IN,
@@ -362,7 +412,7 @@ class TofState:
         entry = self.channels.get((name, index))
         return entry["mm"] if entry else None
 
-    def median_mm(self, name, index):
+    def median_mm(self, name, index, now=None, stale_after_s=2.0):
         """Median of the recent valid readings for one channel, or None if there are none.
 
         The firmware deliberately sends any distance inside the sensor's physical range
@@ -374,18 +424,29 @@ class TofState:
 
         Use this rather than mm() for anything that steers; use mm() when you want the
         latest raw sample, such as a live plot.
+
+        now/stale_after_s expire channels a torn line invented at a reconnect:
+        opening the port resets the ESP32, and a boot-time splice can parse as
+        one packet with extra values. Those keys never refresh, so without this
+        they would steer closest_mm forever. Pass now=None for the old
+        never-expire behavior.
         """
+        if now is not None:
+            last = self.last_wall.get((name, index), 0.0)
+            if now - last > stale_after_s:
+                return None
         hist = self.recent.get((name, index))
         if not hist:
             return None
         return sorted(hist)[len(hist) // 2]
 
-    def closest_mm(self):
+    def closest_mm(self, now=None, stale_after_s=2.0):
         """Smallest valid distance across every channel, or None if nothing is in range.
 
         This is the figure obstacle avoidance actually wants, and keeping it here means
         callers never have to remember to filter the invalid readings out first.
         """
-        medians = [self.median_mm(*key) for key in self.channels]
+        medians = [self.median_mm(*key, now=now, stale_after_s=stale_after_s)
+                   for key in self.channels]
         valid = [m for m in medians if m is not None]
         return min(valid) if valid else None

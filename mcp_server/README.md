@@ -94,6 +94,39 @@ directly to sanity-check it starts:
 mcp_server/.venv/bin/python mcp_server/robot_server.py
 ```
 
+### Daemon + dashboard (one owner, many viewers)
+
+```
+mcp_server/.venv/bin/python mcp_server/robot_server.py --http --port 8765
+```
+
+The daemon owns serial and serves MCP tools at `/mcp` plus the operator page at
+`/`. The page has two camera slots (type `192.168.0.33:8080` or a full MJPEG URL and press
+Connect; with no path it tries the usual stream paths (`/video`, `/video/mjpeg`, ...) and,
+with no scheme, http then https. The browser shows it at most
+640x480, straight from the camera, and remembers the address), a Live panel (the `live_view.py` streams in a browser), a
+Recent activity card (tool calls, model runs, approvals, operator stops, newest
+first) fed by `/api/trace`, hold-to-drive buttons (forward/back/spin, with
+separate PWM sliders for forward/back and spin), and a **Clear tilt fault** button that appears while the tilt guard is
+latched (`POST /tilt/clear`; still refused until the robot is back under limit − 5° and
+settled). Holding a button drives through the same guard choke point as every
+tool, under a 0.8 s watchdog; releasing brakes. Anyone opening the page can
+drive, so keep it on the home network (use a VPN, not port forwarding, to reach
+it from outside). The full log is
+`recordings/trace.jsonl`. Point the Ollama loop at it instead of spawning stdio:
+
+```
+ELLAMA_MCP_URL=http://127.0.0.1:8765 mcp_server/.venv/bin/python mcp_server/ollama_bridge.py
+```
+
+### Bridge wire format v2
+
+`computer_bridge.ino` prints checksummed sequenced lines
+(`@ <seq> <NAME> <fields...> *<CC>`) at 921600 baud with a 64-frame queue.
+`bridge.parse_line` validates the checksum and drops torn lines; v1 lines are
+still accepted during the changeover. Reflash the bridge and restart the server
+together; the sensor sketches need no change.
+
 ## Tools
 
 | Tool | Moves the robot? | Needs `confirmed_safe`? |

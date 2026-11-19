@@ -157,6 +157,8 @@ def make_link():
     link.tilt = tg.TiltGuard(mode="off")      # not under test here
     link.recorder = NoRecorder()
     link.last_imu = None
+    link.last_stick = None
+    link.last_stick_wall = None
     return link
 
 
@@ -189,6 +191,18 @@ def test_telemetry_survives_a_dead_encoder():
     # The left wheel's distance is HELD, not zeroed: a missing encoder is not a still wheel.
     assert snap["dist_l_in"] == 0.0, snap["dist_l_in"]
     assert snap["dist_r_in"] > 0
+
+
+def test_overheard_stick_command_shows_in_telemetry_snapshot():
+    link = make_link()
+    assert link.telemetry_snapshot()["stick"] is None   # never driven by hand
+    link.last_stick = (80, -80)
+    link.last_stick_wall = time.monotonic()
+    snap = link.telemetry_snapshot()
+    assert snap["stick"]["active"] is True, snap["stick"]
+    assert (snap["stick"]["left"], snap["stick"]["right"]) == (80, -80)
+    link.last_stick_wall -= 5.0                          # hand driving ended a while ago
+    assert link.telemetry_snapshot()["stick"]["active"] is False
 
 
 def test_last_counts_is_none_unless_both_wheels_reported():
@@ -229,6 +243,35 @@ def test_range_block_separates_nothing_in_range_from_blind():
                          when=time.monotonic() - 99)
     blind = link.range_snapshot()
     assert blind["live"] is False and "blind, not clear" in blind["note"], blind["note"]
+
+
+def test_a_torn_boot_line_does_not_steer_closest_forever():
+    link = make_link()
+    # What a reset-time splice looks like: one TOF_FRONT packet with extra values
+    # (IMU-shaped numbers glued on). Seen live when opening the port reset the
+    # bridge: phantom channels tof_front[2..5] and closest stuck at -83.
+    link.tof.update("TOF_FRONT", (134, 111, 16180, -83, -29, 49), 1000)
+    link.sensors.observe("TOF_FRONT", (134, 111), 1000, available=[True, True])
+    # On first sight it is indistinguishable from a wider board, so it counts...
+    assert link.range_snapshot()["closest_mm"] == -83
+    # ...until it ages: those keys never refresh, while normal traffic resumes.
+    for key in list(link.tof.last_wall):
+        if key[1] > 1:
+            link.tof.last_wall[key] -= 5.0
+    link.tof.update("TOF_FRONT", (134, 111), 2000)
+    rng = link.range_snapshot()
+    assert rng["channels"]["front_left"]["mm"] == 134
+    assert rng["closest_mm"] == 111, rng["closest_mm"]
+
+
+def test_a_channel_that_goes_quiet_stops_steering():
+    link = make_link()
+    link.tof.update("TOF_FRONT", (134, 111), 1000)
+    assert link.range_snapshot()["closest_mm"] == 111
+    link.tof.last_wall[("TOF_FRONT", 1)] -= 5.0
+    assert link.range_snapshot()["closest_mm"] == 134
+    link.tof.last_wall[("TOF_FRONT", 0)] -= 5.0
+    assert link.range_snapshot()["closest_mm"] is None
 
 
 def test_an_unknown_sensor_needs_no_code_to_appear():
@@ -284,6 +327,43 @@ def test_requiring_a_sensor_that_is_silent_refuses_even_if_others_are_live():
     assert link._drive_refusal() is not None, "one packet is not yet a sensor"
     link.sensors.observe("TOF_FRONT", (501, 499), 120, available=[True, True])
     assert link._drive_refusal() is None
+
+
+def test_a_group_sensor_that_dies_is_reported_by_age_not_as_never_seen():
+    """Measured on the robot: a run ended with "tof not reporting (never seen)" after the
+    board had been streaming for eight minutes. No stream is ever called "tof" -- the
+    board reports as TOF_FRONT -- so looking the required name up directly could only
+    ever answer "never seen", and that sent the operator looking for an unplugged cable
+    instead of a link that had just dropped."""
+    link = make_link()
+    encoders_live(link)
+    imu_live(link)
+    link.policy.set(["enc", "imu", "tof"])
+    for i in range(40):
+        link.sensors.observe("TOF_FRONT", (812, 900), 100 + i * 20, available=[True, True])
+    assert link._drive_refusal() is None, "a live ToF must satisfy the group"
+
+    link.sensors.get("TOF_FRONT").last_wall = time.monotonic() - 3.0   # board goes quiet
+    assert link.missing_required() == ["tof"]
+    why = link._drive_refusal()
+    assert "never seen" not in why, why
+    assert "tof_front" in why, why          # which board, not just which group
+    assert "last sample 3.0s ago" in why, why
+    assert "set_required_sensors" in why, why
+
+
+def test_a_group_sensor_that_never_reported_still_says_never_seen():
+    """The other half: "never seen" must keep meaning never seen."""
+    link = make_link()
+    encoders_live(link)
+    imu_live(link)
+    link.policy.set(["enc", "imu", "tof"])
+    assert "tof not reporting (never seen)" in link._drive_refusal(), link._drive_refusal()
+    # One packet is a torn line until a second one confirms it, and it says which it is.
+    link.sensors.observe("TOF_FRONT", (500, 500), 110, available=[True, True])
+    why = link._drive_refusal()
+    assert "seen only once" in why, why
+    assert "never seen" not in why, why
 
 
 def test_a_torn_serial_line_does_not_invent_a_sensor():
