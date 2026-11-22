@@ -4,7 +4,7 @@ Like analyze_csv.py, but corrects old recordings for the gear ratio and can
 export the dead-reckoned trajectory as JSON.
 
 live_view.py bakes distances into the CSV using the gear_ratio in config.json
-at record time (6.33 until the 4.5 fix). Distance is proportional to
+at record time (6.33 before the 4.5 fix, 4.5 after). Distance is proportional to
 1/gear_ratio, so this script rescales the encoder columns from the ratio the
 file was recorded with to the true one. config.json is not read or changed.
 

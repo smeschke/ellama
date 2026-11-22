@@ -28,7 +28,9 @@ def test_v2_enc_parses():
     raw = frame(7, "ENC", 100, 200, 5000)
     kind, payload = bridge.parse_line(raw)
     assert kind == "ENC", (raw, kind, payload)
-    assert payload == (100, 200, 5000), payload
+    # encoder_sign from calibration/config.json ([-1, -1]: forward counts up)
+    # is applied at parse time, so the wire counts come back negated.
+    assert payload == (-100, -200, 5000), payload
 
 
 def test_v2_bad_checksum_drops():
@@ -62,6 +64,16 @@ def _v2_dropped(n):
 def test_v2_dropped_reaches_pump_shape():
     kind, payload = bridge.parse_line(_v2_dropped(3))
     assert kind is None and payload == "DROPPED 3", (kind, payload)
+
+
+def test_yaw_follows_imu_yaw_sign():
+    # Positive gz must move yaw in the direction IMU_YAW_SIGN says is
+    # nose-left (ground-verified operator convention, see bridge config).
+    ori = bridge.OrientationState()
+    lsb = bridge.GYRO_LSB_PER_DPS * 90.0  # +90 dps for 1 s
+    ori.update(0, 0, 16384, 0, 0, int(lsb), 1000)
+    ori.update(0, 0, 16384, 0, 0, int(lsb), 2000)
+    assert ori.yaw == bridge.IMU_YAW_SIGN * 90.0, (ori.yaw, bridge.IMU_YAW_SIGN)
 
 
 _FUNCS = [v for k, v in sorted(globals().items())

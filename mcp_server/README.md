@@ -250,12 +250,26 @@ lead together.
   Re-verify after any change to wiring, motor board firmware, or which physical wheel is
   "left" vs "right" — and verify it by where the robot ends up, never by the ticks a
   "forward" command produces, which assumes the answer.
-- **Encoder count direction: `(-1, -1)` since 2026-10-24.** Forward travel counts the
-  encoders *down* on this robot. The earlier `(1, 1)` was read off a "forward"
-  `drive_distance`, which applied the then-wrong `FORWARD_PWM_SIGN` — so it recorded a
-  backward move's tick direction and called it forward. Only `drive_arc` reads this
-  (`traveled_inches` is unsigned, so `drive_distance` is unaffected). Only the right
-  channel was verified; the left `-1` is assumed by symmetry — confirm both per robot.
+- **Left/right drive channels are swapped on this unit.** `spin_left` (-pwm, +pwm)
+  turned the nose clockwise while forward drove forward (forward is unaffected by a
+  side swap). `DRIVE_SWAP_SIDES` in `drive_math.py` is now `True`: the dashboard and
+  tools speak true left/right and `RobotLink.send_drive` transposes to the mirrored
+  wiring. The handheld stick bypasses the server and is not covered. Set `False`
+  after uncrossing the motor wires.
+- **IMU yaw sign is flipped on this unit.** Nose-left rotation must increase yaw;
+  the mounted board reports `gz` with the opposite sign. `IMU_YAW_SIGN` in
+  `bridge/__init__.py` is now `-1`, applied in `OrientationState` so live view,
+  `/state`, `turn_degrees` and the mapper all agree. Flip back after any IMU remount.
+- **Encoder count direction: `(+1, +1)` since 2026-11-22, by operator fiat.** Forward
+  travel now counts the encoders *up*: `config.json encoder_sign` is `[-1, -1]` (negates
+  the raw magnet counts at parse time) and `ENCODER_FORWARD_SIGN` is `(1, 1)` to match.
+  History: `(-1, -1)` since 2026-10-24 (forward counted down, verified by a watched
+  forward jog); the earlier `(1, 1)` was read off a mis-signed `drive_distance` and was
+  wrong. Only `drive_arc` reads `ENCODER_FORWARD_SIGN` (`traveled_inches` is unsigned,
+  so `drive_distance` is unaffected). Old recordings baked the down convention — do not
+  mix them with new ones in one replay. Flipping both signs negates
+  `heading_deg`, so it now opposes IMU yaw; the mapper's turn rendering follows the
+  encoders. Re-verify `drive_arc` live after any encoder wiring or firmware change.
 - **Wheel encoders overestimate in-place turns by ~2x — verified 2026-09-27.** Robot on
   the ground, four 90° turns left then four right, pwm=60: the encoder-differential
   estimate (`dr - dl` over `track_width_in`) reported ~92° per commanded 90° turn, but
@@ -270,11 +284,11 @@ lead together.
   IMU yaw drift over a multi-minute session is a separate, smaller concern this hasn't
   characterized yet — fine for single turns a few seconds long, unverified for anything
   longer.
-- **Gear ratio is overridden in memory, not in the file.** `calibration/config.json`
-  still says `gear_ratio: 6.33`; `calibration/analyze_run.py` found the true ratio is
-  `4.5` (confirmed by `calibration/30_inches.csv`, a real tape-measured run). This server
-  uses `4.5` regardless of what the file says — `TRUE_GEAR_RATIO` in `drive_math.py` —
-  left that way deliberately so it could be tested independently before touching the file.
+- **Gear ratio is `4.5`, in the file and in memory.** `calibration/analyze_run.py` found
+  the true ratio is `4.5` (~90t wheel gear / 20t encoder gear, confirmed by
+  `calibration/30_inches.csv`, a real tape-measured run); `calibration/config.json` now
+  says `4.5` too. `TRUE_GEAR_RATIO` in `drive_math.py` still overrides in memory as a guard
+  so a bad file edit can never silently rescale every closed-loop move.
 
 ## Tilt guard (`tilt_guard.py`)
 

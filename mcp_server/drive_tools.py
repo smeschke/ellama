@@ -796,7 +796,8 @@ def jog(left_pwm: int, right_pwm: int, duration_s: float, confirmed_safe: bool,
     """Raw open-loop command: drive at exactly (left_pwm, right_pwm) for duration_s
     seconds, then stop. No encoder target and no direction-aware sign correction (unlike
     drive_distance/turn_degrees) -- positive does not necessarily mean forward, see
-    FORWARD_PWM_SIGN. This is for bench/commissioning tests where a fixed, observable
+    FORWARD_PWM_SIGN. The DRIVE_SWAP_SIDES side convention in send_drive still applies,
+    so left/right agree with the dashboard. This is for bench/commissioning tests where a fixed, observable
     duration matters more than hitting a distance or angle (checking direction, deadband,
     turn convention by eye). Same confirmed_safe gate as the other drive tools. Capped at
     MAX_PWM_CEILING=125 per side; duration_s has no upper bound, so an open-loop call runs

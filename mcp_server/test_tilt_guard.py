@@ -208,7 +208,10 @@ def test_send_drive_is_the_choke_point():
         link.tilt.update(0.0, 0.0, t, gyro_dps=1.0)
     link.sensors.touch("imu")
     link.send_drive(60, -60)
-    assert link.ser.lines[-1] == "60 -60"
+    # DRIVE_SWAP_SIDES: this unit's wiring is mirrored, so the wire order is
+    # the transpose of the requested (left, right). Symmetric drives are
+    # unaffected, which is why only this assertion changes.
+    assert link.ser.lines[-1] == "-60 60", link.ser.lines[-1]
 
     # IMU goes quiet mid-move -> refuses, because the policy requires it
     link.sensors.touch("imu", when=time.monotonic() - 1.0)

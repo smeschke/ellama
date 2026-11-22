@@ -130,6 +130,15 @@ def test_stop_is_safe_when_idle():
     assert code == 200 and out["was_driving"] is False
 
 
+def test_frame_conventions_reports_live_settings():
+    import types
+    assert dh.frame_conventions(None) == {
+        "drive_swap_sides": True, "imu_yaw_sign": -1,
+        "encoder_sign": [1, 1], "gear_ratio_used": 4.5}
+    stub = types.SimpleNamespace(cfg={"encoder_sign": [1, -1], "gear_ratio": 4.5})
+    assert dh.frame_conventions(stub)["encoder_sign"] == [1, -1]
+
+
 _FUNCS = [v for k, v in sorted(globals().items())
           if k.startswith("test_") and callable(v)]
 

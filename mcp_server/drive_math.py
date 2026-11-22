@@ -21,8 +21,8 @@ MAX_PWM_CEILING = 125
 
 # True gear ratio confirmed by calibration/30_inches.csv (a real tape-measured 30in
 # straight run) -- see calibration/analyze_run.py's TRUE_GEAR_RATIO and its docstring.
-# calibration/config.json still says 6.33 and is being left as-is for now, so this
-# overrides it in memory only; it does not touch the file.
+# calibration/config.json now agrees (4.5); the in-memory override stays as a guard
+# so a bad file edit can never silently rescale every closed-loop move.
 TRUE_GEAR_RATIO = 4.5
 
 # A stream with no packet for this long is treated as silent. Everything reports at 5 Hz
@@ -232,7 +232,10 @@ ARC_MAX_STEP_PWM = 5
 # robot.
 # Only drive_arc uses this; re-check it after any encoder wiring or firmware change, and
 # check it by where the robot ends up, never by a "forward" command's own ticks.
-ENCODER_FORWARD_SIGN = (-1, -1)
+# Flipped to (+1, +1) at the operator's direction (2026-11-22): forward counts UP
+# by fiat. Must stay consistent with config.json encoder_sign, which negates the
+# raw counts at parse time -- if the two disagree, drive_arc measures backwards.
+ENCODER_FORWARD_SIGN = (1, 1)
 
 # Re-verified 2026-10-24, robot on the ground and driving: with this at -1, repeated
 # direction="forward" moves at pwm=60 carried the robot visibly backwards, confirmed by
@@ -242,4 +245,12 @@ ENCODER_FORWARD_SIGN = (-1, -1)
 # Re-check this after any change to wiring, motor board firmware, or which physical
 # wheel is "left" vs "right".
 FORWARD_PWM_SIGN = 1
+
+# Ground-verified by the operator: forward (pwm, pwm) drives forward, but a
+# spin-left command (-pwm, +pwm) turned the nose clockwise. Forward is unaffected
+# by a left/right swap while spins mirror -- so the drive channels reach the
+# opposite physical sides on this unit. The dashboard and tools keep speaking
+# true left/right; RobotLink.send_drive translates below. Set False after
+# uncrossing the motor wires, then re-verify spin left = counter-clockwise.
+DRIVE_SWAP_SIDES = True
 

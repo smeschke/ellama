@@ -21,13 +21,34 @@ arriving. Anyone who can open the page can drive, so keep it on the home network
 """
 
 import json
+import sys
 import threading
 import time
+from pathlib import Path
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
 CTX = None
+
+
+def frame_conventions(link=None):
+    """The robot-frame settings this daemon drives under, for the dashboard's
+    frame row: which side is left, which way yaw grows, per-wheel encoder
+    signs, and the gear both sides use. Static intent plus live config --
+    nothing here moves the robot."""
+    root = str(Path(__file__).resolve().parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)  # bridge/ and drive_math live beside mcp_server/
+    import bridge
+    from drive_math import DRIVE_SWAP_SIDES
+    cfg = getattr(link, "cfg", None) or {}
+    return dict(
+        drive_swap_sides=bool(DRIVE_SWAP_SIDES),
+        imu_yaw_sign=int(getattr(bridge, "IMU_YAW_SIGN", 1)),
+        encoder_sign=list(cfg.get("encoder_sign", list(bridge.DEFAULT_CONFIG["encoder_sign"]))),
+        gear_ratio_used=cfg.get("gear_ratio", bridge.DEFAULT_CONFIG["gear_ratio"]),
+    )
 
 # ---- hold-to-drive -----------------------------------------------------------
 # The page sends /drive/hold every 250 ms while a button is held; the watchdog
@@ -196,6 +217,7 @@ def _state():
         "connect_error": CTX._connect_error if link is None else None,
         "operator_stop": CTX.OPSTOP.snapshot(),
         "drive_lease": CTX.LEASE.snapshot(),
+        "frame": frame_conventions(link),
     }
     if link is not None:
         try:
@@ -370,28 +392,28 @@ cannot release it. Full activity log: recordings/trace.jsonl.</small></p>
 <div class="cams">
 <div class="card camcard" data-cam="1">
   <div class="camhead">
-    <span class="banner">Camera 1</span>
+    <span class="banner">Arrow-end camera</span>
     <input class="camaddr" placeholder="192.168.0.33:8080" autocomplete="off"
-           spellcheck="false" aria-label="Camera 1 MJPEG stream URL">
+           spellcheck="false" aria-label="Arrow-end camera MJPEG stream URL">
     <button class="camconnect">Connect</button>
   </div>
   <small class="camstatus"></small>
   <div class="viewbox"><div class="camframe">
-    <img class="camimg" alt="camera 1" hidden>
-    <div class="camempty">Enter the camera's address (like 192.168.0.33:8080) and press Connect.</div>
+    <img class="camimg" alt="arrow-end camera" hidden>
+    <div class="camempty">Mount a phone at the arrow end, enter its address (like 192.168.0.33:8080) and press Connect.</div>
   </div></div>
 </div>
 <div class="card camcard" data-cam="2">
   <div class="camhead">
-    <span class="banner">Camera 2</span>
+    <span class="banner">Tail-end camera</span>
     <input class="camaddr" placeholder="192.168.0.34:8080" autocomplete="off"
-           spellcheck="false" aria-label="Camera 2 MJPEG stream URL">
+           spellcheck="false" aria-label="Tail-end camera MJPEG stream URL">
     <button class="camconnect">Connect</button>
   </div>
   <small class="camstatus"></small>
   <div class="viewbox"><div class="camframe">
-    <img class="camimg" alt="camera 2" hidden>
-    <div class="camempty">Enter the camera's address (like 192.168.0.33:8080) and press Connect.</div>
+    <img class="camimg" alt="tail-end camera" hidden>
+    <div class="camempty">Mount a phone at the tail end, enter its address (like 192.168.0.34:8080) and press Connect.</div>
   </div></div>
 </div>
 </div>
@@ -443,6 +465,10 @@ async function refresh() {
   h += row('odometry', t.dist_avg_in !== undefined ? `${Math.abs(t.dist_avg_in).toFixed(1)} in` : '—');
   h += row('stick', t.stick ? (t.stick.active
     ? `driving (${t.stick.left}, ${t.stick.right})` : `idle ${Math.round(t.stick.age_s)}s ago`) : '—');
+  const f = s.frame || {};
+  h += row('frame', `drive ${f.drive_swap_sides ? 'L/R swapped' : 'L/R straight'}`
+    + ` · yaw ${f.imu_yaw_sign === -1 ? 'flipped' : 'straight'}`
+    + ` · enc [${(f.encoder_sign || []).join(',')}] · gear ${f.gear_ratio_used ?? '—'}`);
   $('facts').innerHTML = h;
   const L = s.drive_lease;
   $('driver').textContent = L.held ? `Driving: ${L.holder}`

@@ -76,6 +76,14 @@ ACCEL_LSB_PER_G = 16384.0
 GYRO_LSB_PER_DPS = 131.0
 COMPLEMENTARY_ALPHA = 0.98
 
+# Ground-verified by the operator: rotating the nose left (counter-clockwise
+# seen from above) must increase yaw. The IMU board's mounting reports gz with
+# the opposite sign on this unit, so the filter negates it -- every consumer
+# (live_view, the daemon's /state, turn_degrees, realtime_map) reads the
+# corrected yaw from OrientationState. Flip back to +1 after any IMU remount,
+# verified by hand: motors off, rotate nose left, yaw must climb.
+IMU_YAW_SIGN = -1
+
 # config.json lives in calibration/, not beside this file: it holds measured constants
 # that the calibration scripts produce and save_config() writes back. Resolved explicitly
 # because load_config() swallows FileNotFoundError -- a wrong path here would not raise,
@@ -85,7 +93,7 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "calibration" / "config.j
 DEFAULT_CONFIG = {
     "wheel_diameter_in": 10.0,
     "ticks_per_rev": 4096,       # AS5600, per revolution of the MAGNET shaft (not the wheel)
-    "gear_ratio": 6.33,          # encoder-shaft turns per wheel turn; empirical, same as the bench sketch
+    "gear_ratio": 4.5,           # encoder-shaft turns per wheel turn; ~90t/20t teeth, confirmed by the tape-measured 30in run
     "track_width_in": 20.0,      # PLACEHOLDER until calibrated -- wheel-to-wheel distance
     "encoder_sign": [1, 1],      # [left, right]; -1 flips a wheel whose magnet/encoder counts backward
 }
@@ -354,7 +362,7 @@ class OrientationState:
             acc_roll = math.degrees(math.atan2(agy, agz))
             self.pitch = COMPLEMENTARY_ALPHA * (self.pitch + dy * dt) + (1 - COMPLEMENTARY_ALPHA) * acc_pitch
             self.roll = COMPLEMENTARY_ALPHA * (self.roll + dx * dt) + (1 - COMPLEMENTARY_ALPHA) * acc_roll
-            self.yaw += dz * dt
+            self.yaw += IMU_YAW_SIGN * dz * dt
         self.last_ms = ms
         return agx, agy, agz, dx, dy, dz
 

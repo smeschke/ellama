@@ -36,8 +36,9 @@ def test_encoder_packet_with_one_wheel_out_parses_to_none():
     assert kind == "ENC", (kind, payload)
     left, right, ms = payload
     # None, never a number: the sentinel must not survive as a count, and negating it
-    # (encoder_sign) would turn it into an ordinary-looking large value.
-    assert left is None and right == 1234 and ms == 5000, payload
+    # (encoder_sign) would turn it into an ordinary-looking large value. The live
+    # channel carries the parse-time sign (config [-1, -1]: forward counts up).
+    assert left is None and right == -1234 and ms == 5000, payload
 
 
 def test_tof_packet_parses_generically():

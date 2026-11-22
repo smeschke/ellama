@@ -26,7 +26,7 @@ import operator_stop  # noqa: E402
 import sensors as sensorlib  # noqa: E402
 import recording  # noqa: E402
 import tilt_guard  # noqa: E402
-from drive_math import (MAX_PWM_CEILING, TELEMETRY_STALE_S,  # noqa: E402
+from drive_math import (DRIVE_SWAP_SIDES, MAX_PWM_CEILING, TELEMETRY_STALE_S,  # noqa: E402
                         TRUE_GEAR_RATIO, selected_wheels)
 
 # ---------------------------------------------------------------------------
@@ -337,6 +337,12 @@ class RobotLink:
     _tilt_refusal = _drive_refusal
 
     def send_drive(self, left, right):
+        # DRIVE_SWAP_SIDES (drive_math.py): the dashboard and tools speak true
+        # left/right; the swap to this unit's mirrored wiring happens here, so
+        # every PC drive path -- dashboard hold, drive_*, turn_*, jog -- agrees.
+        # The handheld stick bypasses this server and is not covered by it.
+        if DRIVE_SWAP_SIDES:
+            left, right = right, left
         left = max(-MAX_PWM_CEILING, min(MAX_PWM_CEILING, int(left)))
         right = max(-MAX_PWM_CEILING, min(MAX_PWM_CEILING, int(right)))
         with self._wlock:  # check and write atomically vs. the trip's "stop" (also under it)

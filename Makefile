@@ -13,6 +13,7 @@ test: ## Run the hardware-free test suites (script-style runners)
 	$(PY) mcp_server/test_drive_lease.py
 	$(PY) mcp_server/test_vetbook.py
 	$(PY) calibration/test_live_view_daemon.py
+	$(PY) tools/test_realtime_map.py
 
 check: ## Byte-compile all Python sources
 	python3 -m py_compile bridge/__init__.py calibration/*.py mcp_server/*.py tools/*.py
