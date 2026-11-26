@@ -322,6 +322,14 @@ import daemon_http  # noqa: E402
 
 daemon_http.register(mcp, sys.modules[__name__])
 
+import watch_and_repeat  # noqa: E402
+
+watch_and_repeat.register(mcp, sys.modules[__name__])
+
+import tag_module  # noqa: E402
+
+tag_module.register(mcp, sys.modules[__name__])
+
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])

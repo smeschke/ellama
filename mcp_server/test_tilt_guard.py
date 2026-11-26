@@ -177,6 +177,7 @@ def make_link(rs, **guard_kw):
     link.sensors.set_stale_after("imu", rs.IMU_STALE_FAULT_S)
     link.policy = sensorlib.SensorPolicy()      # the default: enc + imu
     link.recorder = _NoRecorder()
+    link.cfg = {}   # no robot profile: send_drive falls back to the DRIVE_SWAP_SIDES default
     link.sensors.touch("enc")
     link.sensors.touch("imu")
     return link

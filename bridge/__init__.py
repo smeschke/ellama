@@ -38,6 +38,7 @@ of you editing source.
 
 import json
 import math
+import os
 import queue
 import re
 import sys
@@ -99,10 +100,70 @@ DEFAULT_CONFIG = {
 }
 
 
+# One dashboard serves several robots: ELLAMA_ROBOT picks
+# calibration/robots/<name>.json. Unset means the historical
+# calibration/config.json. A named profile that does not exist is a loud error,
+# never a silent fallback -- a typo must not mis-calibrate distances.
+ROBOT_NAME = os.environ.get("ELLAMA_ROBOT") or "default"
+PROFILES_DIR = CONFIG_PATH.parent / "robots"
+
+
+def resolve_config_path():
+    if ROBOT_NAME == "default":
+        return CONFIG_PATH
+    p = PROFILES_DIR / (ROBOT_NAME + ".json")
+    if not p.exists():
+        raise RuntimeError("ELLAMA_ROBOT=%r: no such profile %s "
+                           "(see calibration/robots/README.md)" % (ROBOT_NAME, p))
+    return p
+
+
+# Lowercase so a profile name is also a safe file name on every OS.
+PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+def list_profiles():
+    """Names of the robot profiles in calibration/robots/, sorted."""
+    return sorted(p.stem for p in PROFILES_DIR.glob("*.json"))
+
+
+def set_robot(name):
+    """Switch the active profile at runtime ("default" = calibration/config.json).
+
+    Updates ROBOT_NAME and ENC_SIGN together; callers holding a cfg dict must
+    reload it. An unknown name raises and leaves the active profile unchanged."""
+    global ROBOT_NAME, ENC_SIGN
+    if name != "default" and not (PROFILES_DIR / (str(name) + ".json")).exists():
+        raise RuntimeError("no such robot profile %r (have: %s)"
+                           % (name, ", ".join(list_profiles()) or "none"))
+    old = ROBOT_NAME
+    ROBOT_NAME = name
+    try:
+        sign = tuple(load_config()["encoder_sign"])
+    except Exception:
+        ROBOT_NAME = old
+        raise
+    ENC_SIGN = sign
+
+
+def save_profile(name, cfg, overwrite=False):
+    """Write calibration/robots/<name>.json. Refuses a bad name, "default", and
+    (unless overwrite) an existing profile. Returns the path."""
+    if not isinstance(name, str) or not PROFILE_NAME_RE.match(name) or name == "default":
+        raise ValueError("robot name must be lowercase letters, digits, - or _ "
+                         "(starting with a letter), and not 'default'")
+    p = PROFILES_DIR / (name + ".json")
+    if p.exists() and not overwrite:
+        raise FileExistsError("profile %r already exists" % name)
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(cfg, indent=2) + "\n")
+    return p
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     try:
-        cfg.update(json.loads(CONFIG_PATH.read_text()))
+        cfg.update(json.loads(resolve_config_path().read_text()))
     except FileNotFoundError:
         pass
     return cfg
@@ -112,7 +173,7 @@ ENC_SIGN = tuple(load_config()["encoder_sign"])  # applied to ENC counts in pars
 
 
 def save_config(cfg):
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+    resolve_config_path().write_text(json.dumps(cfg, indent=2) + "\n")
 
 
 def in_per_tick(cfg):
@@ -271,6 +332,13 @@ def parse_line(raw):
 
 # ---------------- state ----------------
 
+# A wheel that arrived as None (board silent or slot unwired) keeps its last
+# distance; it reads unavailable only after this long with no real count. Two
+# single-encoder boards interleave left-only and right-only packets, so judging
+# availability per packet would flicker -- the latch holds while either board
+# streams, without masking a board that actually died.
+ENC_CHANNEL_STALE_S = 1.0
+
 class EncoderState:
     """Per-wheel distance/speed since the last zero(), plus a differential-drive
     heading estimate from the wheel difference.
@@ -287,9 +355,10 @@ class EncoderState:
         self.cfg = cfg
         self.first = [None, None]   # per-wheel counts at the zero point
         self.last = [None, None]    # per-wheel counts at the previous sample
-        self.last_ms = None
+        self.last_ms = [None, None]  # per-wheel sender clocks; two boards don't share one
+        self.last_seen = [None, None]  # wall time of the last real count per wheel
         self.dist_l = self.dist_r = 0.0
-        self.available = [False, False]   # [left, right] reporting as of the last packet
+        self.available = [False, False]   # [left, right] latched per wheel (see update)
 
     @property
     def dist_avg(self):
@@ -312,59 +381,134 @@ class EncoderState:
         self.first = list(self.last)
         self.dist_l = self.dist_r = 0.0
 
-    def update(self, left, right, ms):
-        """Fold in one ENC packet. Either count may be None (encoder not responding)."""
+    def update(self, left, right, ms, now=None):
+        """Fold in one ENC packet. Either count may be None (encoder not responding).
+
+        Two single-encoder boards interleave left-only and right-only packets on
+        unrelated sender clocks: each wheel is differenced against its own
+        clock, and availability latches per wheel with a timeout instead of
+        flickering with every packet. A board that actually dies still reads
+        unavailable once its channel goes quiet past ENC_CHANNEL_STALE_S.
+        `now` is wall time for the staleness latch (tests pass it explicitly).
+        """
+        if now is None:
+            now = time.monotonic()
         k = in_per_tick(self.cfg)
         counts = (left, right)
-        self.available = [c is not None for c in counts]
         dists = [self.dist_l, self.dist_r]
         speeds = [None, None]
 
-        dt = None
-        if self.last_ms is not None and ms > self.last_ms:
-            dt = (ms - self.last_ms) / 1000.0
-
         for i, c in enumerate(counts):
             if c is None:
-                # Hold the last distance; a missing encoder is not a wheel at zero. Clear
-                # `last` so the next real reading is not differenced against a stale one
-                # across the gap, which would show up as a single huge speed spike.
-                self.last[i] = None
+                # Hold the last distance and keep `last`: the next real reading is
+                # differenced on this wheel's own clock, so a silent gap reads as
+                # the average speed across it, not a spike and not a zero.
                 continue
+            dt = None
+            if self.last_ms[i] is not None and ms > self.last_ms[i]:
+                dt = (ms - self.last_ms[i]) / 1000.0
             if self.first[i] is None:
                 self.first[i] = c
             dists[i] = (c - self.first[i]) * k
             if dt is not None and self.last[i] is not None:
                 speeds[i] = (c - self.last[i]) * k / dt
             self.last[i] = c
+            self.last_ms[i] = ms
+            self.last_seen[i] = now
 
         self.dist_l, self.dist_r = dists
-        self.last_ms = ms
+        self.available = [t is not None and (now - t) < ENC_CHANNEL_STALE_S
+                          for t in self.last_seen]
         return tuple(speeds)
 
 
+# Zero-point (bias) update for the yaw gyro while the robot is stopped.
+#
+# The IMU firmware measures the gyro bias once, in the ~1 s still window at boot. An
+# MPU-6050 (GY-521) warms up for minutes after power-on and its bias moves with it, so
+# a cold boot bias leaves the yaw creeping by tenths of a degree per second at rest
+# (0.3-0.4 deg/s measured 2026-11-10). The fix: whenever the wheel encoders say the
+# robot is standing still, (1) re-learn the z bias from what the gyro reads, and (2) do
+# not integrate yaw at all, since a robot whose wheels are still is not turning.
+#
+# "Still" needs all of: both encoders reporting and fresh, neither wheel moved more
+# than STILL_DIST_IN for STILL_AFTER_S, and the bias-corrected gyro under
+# STILL_GYRO_MAX_DPS (so a robot lifted and rotated by hand, or skidding with locked
+# wheels, still integrates). Without encoders this does nothing, which is the old
+# behaviour.
+ZUPT_ENABLED = True
+STILL_AFTER_S = 0.75        # wheels quiet this long before the robot counts as stopped
+STILL_DIST_IN = 0.05        # per-wheel movement below this is encoder jitter, not motion
+STILL_GYRO_MAX_DPS = 2.0    # a real rotation faster than this is never "still"
+ENC_FRESH_S = 0.5           # encoder packets older than this say nothing about motion
+BIAS_TAU_S = 2.0            # bias learning time constant while still
+BIAS_MAX_DPS = 10.0         # clamp: a bias this large means something is wrong
+
+
 class OrientationState:
-    """Complementary filter on the PC side; dt from the packet's own ms."""
+    """Complementary filter on the PC side; dt from the packet's own ms. Yaw also gets
+    a zero-point update while the wheels are still (see ZUPT_ENABLED above): call
+    note_wheels() on every encoder packet to feed it."""
 
     def __init__(self):
         self.pitch = self.roll = self.yaw = 0.0
         self.last_ms = None
+        self.gz_bias_dps = 0.0      # learned on top of the firmware's boot bias
+        self.still = False
+        self.still_s = 0.0          # total time yaw was held by the zero-point update
+        self._wheel_ref = None      # (dist_l, dist_r) when the wheels last moved
+        self._wheels_quiet_since = None
+        self._last_enc_t = None
 
     def zero_yaw(self):
         self.yaw = 0.0
 
-    def update(self, ax, ay, az, gx, gy, gz, ms):
+    def note_wheels(self, dist_l, dist_r, now=None):
+        """Feed one encoder reading (inches; None for a wheel that is not reporting)."""
+        now = time.monotonic() if now is None else now
+        self._last_enc_t = now
+        if dist_l is None or dist_r is None:
+            self._wheel_ref = self._wheels_quiet_since = None
+            return
+        ref = self._wheel_ref
+        if (ref is None or abs(dist_l - ref[0]) > STILL_DIST_IN
+                or abs(dist_r - ref[1]) > STILL_DIST_IN):
+            self._wheel_ref = (dist_l, dist_r)
+            self._wheels_quiet_since = now
+
+    def wheels_still(self, now=None):
+        now = time.monotonic() if now is None else now
+        return (ZUPT_ENABLED and self._wheels_quiet_since is not None
+                and self._last_enc_t is not None
+                and now - self._last_enc_t < ENC_FRESH_S
+                and now - self._wheels_quiet_since >= STILL_AFTER_S)
+
+    def update(self, ax, ay, az, gx, gy, gz, ms, now=None):
         agx, agy, agz = ax / ACCEL_LSB_PER_G, ay / ACCEL_LSB_PER_G, az / ACCEL_LSB_PER_G
-        dx, dy, dz = gx / GYRO_LSB_PER_DPS, gy / GYRO_LSB_PER_DPS, gz / GYRO_LSB_PER_DPS
+        dx, dy, dz_raw = gx / GYRO_LSB_PER_DPS, gy / GYRO_LSB_PER_DPS, gz / GYRO_LSB_PER_DPS
+        dz = dz_raw - self.gz_bias_dps
+        still = self.wheels_still(now) and abs(dz) < STILL_GYRO_MAX_DPS
+        self.still = still
         if self.last_ms is not None and ms > self.last_ms:
             dt = (ms - self.last_ms) / 1000.0
             acc_pitch = math.degrees(math.atan2(-agx, math.hypot(agy, agz)))
             acc_roll = math.degrees(math.atan2(agy, agz))
             self.pitch = COMPLEMENTARY_ALPHA * (self.pitch + dy * dt) + (1 - COMPLEMENTARY_ALPHA) * acc_pitch
             self.roll = COMPLEMENTARY_ALPHA * (self.roll + dx * dt) + (1 - COMPLEMENTARY_ALPHA) * acc_roll
-            self.yaw += IMU_YAW_SIGN * dz * dt
+            if still and dt < 1.0:
+                a = min(1.0, dt / BIAS_TAU_S)
+                b = self.gz_bias_dps + a * (dz_raw - self.gz_bias_dps)
+                self.gz_bias_dps = max(-BIAS_MAX_DPS, min(BIAS_MAX_DPS, b))
+                self.still_s += dt
+            else:
+                self.yaw += IMU_YAW_SIGN * dz * dt
         self.last_ms = ms
         return agx, agy, agz, dx, dy, dz
+
+    def zupt_snapshot(self):
+        return {"enabled": ZUPT_ENABLED, "still": self.still,
+                "gz_bias_dps": round(self.gz_bias_dps, 4),
+                "held_s": round(self.still_s, 1)}
 
 
 

@@ -4,7 +4,7 @@ An MCP server that lets an AI agent drive eLlama by encoder feedback instead of 
 guessing a duration — "go forward 10 inches" becomes a tool call that watches the wheel
 encoders and stops itself at the target, rather than a fixed-time open-loop command.
 
-Talks over the same USB-serial link as `calibration/live_view.py`:
+Talks over USB serial to
 [`firmware/computer_bridge/computer_bridge.ino`](../firmware/computer_bridge/computer_bridge.ino)
 on a spare ESP32, plugged into whatever machine runs this server. Reuses
 [`bridge/`](../bridge/) for serial I/O, line parsing, and the
@@ -58,7 +58,7 @@ stationary wheel.
 ## Setup
 
 `robot_server.py` imports the top-level [`bridge/`](../bridge/) package from this same
-repo, so the server and `calibration/live_view.py` compute distance, heading and range from
+repo, so the server and the calibration tools compute distance, heading and range from
 one copy of that math. It lived at `calibration/bridge.py` until 2026-10-24; it is a shared
 client library for the bridge firmware, not a calibration script. Note that `config.json`
 stayed in `calibration/`, and `bridge/__init__.py` resolves it by an explicit path.
@@ -104,7 +104,7 @@ The daemon owns serial and serves MCP tools at `/mcp` plus the operator page at
 `/`. The page has two camera slots (type `192.168.0.33:8080` or a full MJPEG URL and press
 Connect; with no path it tries the usual stream paths (`/video`, `/video/mjpeg`, ...) and,
 with no scheme, http then https. The browser shows it at most
-640x480, straight from the camera, and remembers the address), a Live panel (the `live_view.py` streams in a browser), a
+640x480, straight from the camera, and remembers the address), a Live panel (encoder, IMU and range streams in the browser), a
 Recent activity card (tool calls, model runs, approvals, operator stops, newest
 first) fed by `/api/trace`, hold-to-drive buttons (forward/back/spin, with
 separate PWM sliders for forward/back and spin), and a **Clear tilt fault** button that appears while the tilt guard is
@@ -113,7 +113,8 @@ settled). Holding a button drives through the same guard choke point as every
 tool, under a 0.8 s watchdog; releasing brakes. Anyone opening the page can
 drive, so keep it on the home network (use a VPN, not port forwarding, to reach
 it from outside). The full log is
-`recordings/trace.jsonl`. Point the Ollama loop at it instead of spawning stdio:
+`recordings/trace.jsonl`. Point the drive-by-chat loop at it instead of spawning stdio
+(router settings come from the environment, else Raven's `~/raven/.env`):
 
 ```
 ELLAMA_MCP_URL=http://127.0.0.1:8765 mcp_server/.venv/bin/python mcp_server/ollama_bridge.py
@@ -233,6 +234,33 @@ for `RANGE_NO_PROGRESS_S`. The ToF median lags by half its window while the robo
 instead of crept: `RANGE_LATENCY_S` folds that lag, one sample interval and the braking
 lead together.
 
+
+## Watch and repeat (`watch_and_repeat.py`, `route_math.py`)
+
+Teach the robot a closed loop by driving it once, then let it drive the loop itself.
+The daemon serves a page for this at `http://127.0.0.1:8765/route`, separate from the
+operator page (which links to it).
+
+1. **Start recording**, then drive the loop with the stick or the operator page and
+   finish where you started. The recorder samples the full telemetry snapshot at 10 Hz
+   and never drives. **Keyframe** pins the current pose as a waypoint the route must
+   pass through (and saves a camera frame if you gave a camera URL). **End recording**
+   saves `recordings/routes/<name>/samples.jsonl` and `keyframes.json`.
+2. **Process route** dead-reckons the trail (the live map's `PoseTracker`, so it uses the
+   same frame), spreads the loop-closure error over the trail by path length, simplifies
+   it to waypoints (Ramer-Douglas-Peucker; start, end and keyframes are pinned) and
+   compiles turn+drive legs into `route.json` and `route.png`. A large closure error
+   means dead reckoning drifted, or the run did not end at its start.
+3. **Test turn** spins 10 degrees left. Check the nose really goes left before following.
+4. **Follow route** runs a follower under the drive lease (holder `watch_and_repeat`).
+   Pressing it is the go-ahead for the whole route. **ABORT** latches the operator stop.
+
+Followers are pluggable (`FOLLOWERS` in `watch_and_repeat.py`). The shipped `legs`
+follower turns by the IMU (`turn_degrees`) and drives by the encoders (`drive_distance`),
+so every guard applies to every leg. Recordings keep every sensor field and each waypoint
+carries its sensor snapshot (ToF, yaw, camera), so a camera or ToF follower can be added
+later without recording again. MCP tools: `route_status`, `route_process`,
+`route_follow(confirmed_safe, lease, ...)`.
 
 ## Known unknowns
 

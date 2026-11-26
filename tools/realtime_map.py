@@ -140,6 +140,12 @@ class PoseTracker:
         dd = (dist_avg_in - self.prev_dist) if enc_live else 0.0
         dh = wrap_deg(yaw_deg - self.prev_yaw) if (imu_live and yaw_deg is not None
                                                   and self.prev_yaw is not None) else 0.0
+        # A physical left turn arrives as yaw DECREASING (verified IRL: a left
+        # spin reads left encoder down / right encoder up, and the dashboard
+        # agrees), so theta integrates -dh to render left turns CCW like the
+        # dashboard. If the IMU sign is ever corrected upstream, drop this
+        # negation instead of "fixing" the dashboard to match.
+        dh = -dh
         if enc_live:
             self.prev_dist = dist_avg_in
         if imu_live and yaw_deg is not None:

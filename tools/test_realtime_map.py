@@ -10,13 +10,26 @@ import realtime_map as rm  # noqa: E402
 
 
 def test_pose_straight_then_turn():
+    # Physical left turns arrive as yaw DECREASING (verified IRL), so the
+    # turn here feeds yaw 0 -> -90 and must come out toward +y (map-left).
     p = rm.PoseTracker()
     p.update(0.0, 0.0, 0.0, True, True)
     p.update(10.0, 0.0, 1.0, True, True)
     assert abs(p.x - 10.0) < 1e-6 and abs(p.y) < 1e-6, (p.x, p.y)
-    p.update(10.0, 90.0, 2.0, True, True)
-    p.update(20.0, 90.0, 3.0, True, True)
+    p.update(10.0, -90.0, 2.0, True, True)
+    p.update(20.0, -90.0, 3.0, True, True)
     assert abs(p.x - 10.0) < 1e-6 and abs(p.y - 10.0) < 1e-6, (p.x, p.y)
+
+
+def test_pose_spin_left_renders_ccw():
+    # IRL ground truth for a spin in place to the left: left encoder down,
+    # right encoder up, no distance travelled, yaw decreasing. The map icon
+    # must rotate CCW (theta positive), matching the dashboard.
+    p = rm.PoseTracker()
+    p.update(0.0, 0.0, 0.0, True, True)
+    p.update(0.0, -90.0, 1.0, True, True)
+    assert abs(p.x) < 1e-6 and abs(p.y) < 1e-6, (p.x, p.y)
+    assert p.theta > 0, math.degrees(p.theta)
 
 
 def test_pose_stale_holds():

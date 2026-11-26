@@ -163,9 +163,11 @@ def make_link():
     return link
 
 
-def feed_enc(link, left, right, ms):
-    """One ENC packet through the same path the pump uses."""
-    link.enc.update(left, right, ms)
+def feed_enc(link, left, right, ms, now=None):
+    """One ENC packet through the same path the pump uses. Pass now to simulate
+    wall time passing between packets (a silent channel goes unavailable only
+    past the latch timeout, so back-to-back packets stay latched)."""
+    link.enc.update(left, right, ms, now=now)
     link.sensors.observe("enc", (left, right), ms, available=list(link.enc.available))
 
 
@@ -183,12 +185,16 @@ def imu_live(link):
 
 def test_telemetry_survives_a_dead_encoder():
     link = make_link()
-    feed_enc(link, 1000, 2000, 100)
-    feed_enc(link, None, 2100, 120)          # left encoder stops responding
+    t0 = time.monotonic()
+    feed_enc(link, 1000, 2000, 100, now=t0)
+    feed_enc(link, None, 2100, 120, now=t0 + 0.02)  # left out this packet: latched live
+    snap = link.telemetry_snapshot()                # (interleaved boards look like this)
+    assert snap["encoders_available"] == [True, True], snap["encoders_available"]
+    feed_enc(link, None, 2200, 140, now=t0 + 1.5)   # left quiet past the latch: dead
     snap = link.telemetry_snapshot()         # must not raise -- it used to, on heading_deg
     assert snap["encoders_available"] == [False, True], snap["encoders_available"]
     assert snap["heading_deg"] is None       # never computed from one live, one frozen wheel
-    assert snap["left_ticks"] is None and snap["right_ticks"] == 2100
+    assert snap["left_ticks"] is None and snap["right_ticks"] == 2200
     # The left wheel's distance is HELD, not zeroed: a missing encoder is not a still wheel.
     assert snap["dist_l_in"] == 0.0, snap["dist_l_in"]
     assert snap["dist_r_in"] > 0
@@ -208,11 +214,15 @@ def test_overheard_stick_command_shows_in_telemetry_snapshot():
 
 def test_last_counts_is_none_unless_both_wheels_reported():
     link = make_link()
-    feed_enc(link, 1000, 2000, 100)
+    t0 = time.monotonic()
+    feed_enc(link, 1000, 2000, 100, now=t0)
     assert link.last_counts() == (1000, 2000)
-    feed_enc(link, None, 2100, 120)
-    # Not a tuple with a None in it: every drive loop subtracts these, and None - int
-    # would raise mid-move with the motors running.
+    feed_enc(link, None, 2100, 120, now=t0 + 0.02)
+    # Latched live: a single half-packet may be the other board's turn, not a death,
+    # so the reading holds (stale wheels difference to stationary, never raise).
+    assert link.last_counts() == (1000, 2100)
+    feed_enc(link, None, 2200, 140, now=t0 + 1.5)
+    # Past the latch with no left word: no reading, and the drive loops abort on None.
     assert link.last_counts() is None
 
 
@@ -459,9 +469,10 @@ def test_recording_leaves_an_unknowable_heading_blank_rather_than_crashing(tmp):
     rec = recording.Recorder(tmp)
     rec.start("run")
     link = make_link()
-    feed_enc(link, 1000, 2000, 100)
+    t0 = time.monotonic()
+    feed_enc(link, 1000, 2000, 100, now=t0)
     rec.on_enc(link.enc, link.orient, 1.0, 1.0)
-    feed_enc(link, None, 2100, 120)          # left encoder out: heading is unknowable
+    feed_enc(link, None, 2100, 120, now=t0 + 1.5)  # left encoder out: heading is unknowable
     rec.on_enc(link.enc, link.orient, None, 1.0)
     rec.on_sensor("TOF_FRONT", (812, -1), link.enc, link.orient)
     rec.on_config("tilt guard: mode=off")

@@ -42,13 +42,115 @@ def frame_conventions(link=None):
         sys.path.insert(0, root)  # bridge/ and drive_math live beside mcp_server/
     import bridge
     from drive_math import DRIVE_SWAP_SIDES
-    cfg = getattr(link, "cfg", None) or {}
+    cfg = getattr(link, "cfg", None)
+    if not cfg:
+        # Not connected: report the selected robot's file, not built-in defaults.
+        try:
+            cfg = bridge.load_config()
+        except Exception:
+            cfg = {}
     return dict(
-        drive_swap_sides=bool(DRIVE_SWAP_SIDES),
+        robot=str(getattr(bridge, "ROBOT_NAME", "default")),
+        drive_swap_sides=bool(cfg.get("drive_swap_sides", DRIVE_SWAP_SIDES)),
         imu_yaw_sign=int(getattr(bridge, "IMU_YAW_SIGN", 1)),
         encoder_sign=list(cfg.get("encoder_sign", list(bridge.DEFAULT_CONFIG["encoder_sign"]))),
         gear_ratio_used=cfg.get("gear_ratio", bridge.DEFAULT_CONFIG["gear_ratio"]),
     )
+
+# ---- robot profiles ----------------------------------------------------------
+# Pick Lenny / Lisa / unknown (calibration/config.json) from the page, or save a
+# new profile from the page's direction check. Switching never moves the robot,
+# and is refused while anything is driving.
+
+def _bridge():
+    root = str(Path(__file__).resolve().parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import bridge
+    return bridge
+
+
+def robot_profiles():
+    bridge = _bridge()
+    out = []
+    for name in bridge.list_profiles():
+        try:
+            cfg = json.loads((bridge.PROFILES_DIR / (name + ".json")).read_text())
+        except (OSError, ValueError) as e:
+            out.append({"name": name, "error": str(e)})
+            continue
+        out.append({"name": name,
+                    "encoder_sign": cfg.get("encoder_sign"),
+                    "drive_swap_sides": cfg.get("drive_swap_sides"),
+                    "track_width_in": cfg.get("track_width_in")})
+    return {"active": bridge.ROBOT_NAME, "profiles": out}
+
+
+def _robot_busy(ctx):
+    """Why the profile must not change right now, or None."""
+    with _dash_lock:
+        if _dash_driving:
+            return "the dashboard is driving -- release the button first"
+    L = ctx.LEASE.snapshot()
+    if L.get("held") and L.get("holder") != DASH_HOLDER:
+        return "%s holds the drive lease" % L.get("holder")
+    if L.get("move_in_progress"):
+        return "a move is in progress"
+    return None
+
+
+def robot_select(ctx, name):
+    """(status, body). "unknown" means calibration/config.json."""
+    name = "default" if name in (None, "", "unknown") else str(name)
+    busy = _robot_busy(ctx)
+    if busy:
+        return 409, {"ok": False, "error": "not switching robots: " + busy}
+    bridge = _bridge()
+    try:
+        if ctx.link is not None:
+            ctx.link.switch_robot(name)
+        else:
+            bridge.set_robot(name)   # the next connect loads it
+    except Exception as e:
+        return 400, {"ok": False, "error": str(e)}
+    _trace_event("robot_profile", robot=name)
+    return 200, dict(ok=True, **robot_profiles())
+
+
+def robot_save(ctx, name, encoder_sign, drive_swap_sides, overwrite=False):
+    """Save a profile from the direction check and switch to it. The other
+    calibration values (wheel size, track width, ...) are copied from the
+    active profile."""
+    bridge = _bridge()
+    import recording
+    if (not isinstance(encoder_sign, list) or len(encoder_sign) != 2
+            or any(s not in (1, -1) or isinstance(s, bool) for s in encoder_sign)):
+        return 400, {"ok": False, "error": "encoder_sign must be two of 1/-1"}
+    if not isinstance(drive_swap_sides, bool):
+        return 400, {"ok": False, "error": "drive_swap_sides must be true/false"}
+    busy = _robot_busy(ctx)
+    if busy:
+        return 409, {"ok": False, "error": "not saving: " + busy}
+    cfg = dict(bridge.DEFAULT_CONFIG)
+    try:
+        cfg.update(json.loads(bridge.resolve_config_path().read_text()))
+    except FileNotFoundError:
+        pass
+    cfg["encoder_sign"] = list(encoder_sign)
+    cfg["drive_swap_sides"] = drive_swap_sides
+    problems = recording.check_config(cfg)
+    if problems:
+        return 400, {"ok": False, "error": "; ".join(problems)}
+    try:
+        bridge.save_profile(name, cfg, overwrite=bool(overwrite))
+    except FileExistsError as e:
+        return 409, {"ok": False, "exists": True, "error": str(e)}
+    except ValueError as e:
+        return 400, {"ok": False, "error": str(e)}
+    _trace_event("robot_profile_saved", robot=name, encoder_sign=list(encoder_sign),
+                 drive_swap_sides=drive_swap_sides)
+    return robot_select(ctx, name)
+
 
 # ---- hold-to-drive -----------------------------------------------------------
 # The page sends /drive/hold every 250 ms while a button is held; the watchdog
@@ -312,6 +414,8 @@ PAGE = """<!doctype html>
                     font-size:18px; }
   .camhead button.on { background:var(--muted); }
   .camstatus { display:block; min-height:1.35em; font-size:16px; }
+  .lat { font-weight:700; }
+  .lat.ok { color:#3fb950; } .lat.warn { color:#d29922; } .lat.bad { color:#f85149; }
   button { width:100%; border:0; border-radius:12px; color:#fff; font:inherit;
            font-weight:700; cursor:pointer; }
   h1 { font-size:20px; margin:0 0 8px; }
@@ -343,10 +447,28 @@ PAGE = """<!doctype html>
   dt { color:var(--muted); } dd { margin:0; font-variant-numeric: tabular-nums;
                                    overflow-wrap:anywhere; }
   small { color:var(--muted); font-size:16px; }
+  #robotbtns { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+  #robotbtns button, .calrow button { width:auto; flex:1; min-width:5em; padding:10px 14px;
+          font-size:19px; background:var(--muted); }
+  #robotbtns button.active { background:#2f6fd0; outline:3px solid var(--fg); }
+  #robotbanner.unknown { color:#c98a12; }
+  #calib summary { cursor:pointer; margin-top:10px; font-weight:700; }
+  #calib ol { padding-left:1.2em; margin:6px 0 0; }
+  #calib li { margin-top:10px; }
+  .calrow { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; align-items:center; }
+  .calrow button { background:#2f6fd0; }
+  .calrow input { flex:1; min-width:6em; font:inherit; padding:7px 10px; border-radius:8px;
+                  border:1px solid var(--line); background:var(--bg); color:var(--fg); }
+  .calres { display:block; margin-top:4px; }
 </style></head><body><main>
 <div class="layout">
 <div class="side">
 <h1>eLlama operator</h1>
+<div class="card" id="modules">
+  <div class="banner">Modules (each opens its own window)</div>
+  <p><a href="/route" style="color:var(--muted)">Watch and repeat (record a route) &rarr;</a></p>
+  <p><a href="/tag" style="color:var(--muted)">Tag turn (center on a tag) &rarr;</a></p>
+</div>
 <button id="stop">STOP</button>
 <button id="resume" hidden>Resume: let it drive again</button>
 <button id="cleartilt" hidden>Clear tilt fault (robot is level)</button>
@@ -354,6 +476,34 @@ PAGE = """<!doctype html>
 <div class="card">
   <div class="banner" id="banner">connecting…</div>
   <dl id="facts"></dl>
+</div>
+<div class="card" id="robotcard">
+  <div class="banner" id="robotbanner">Robot: …</div>
+  <div id="robotbtns"></div>
+  <small id="robotmsg" class="calres"></small>
+  <details id="calib">
+    <summary>Calibrate a robot (direction check)</summary>
+    <small>Robot on the floor with room to roll a foot forward and spin. Uses the
+    Drive buttons, so every guard still applies.</small>
+    <ol>
+      <li>Wheel encoders: press <b>Start</b>, hold <b>Forward</b> for about a second,
+        then press <b>Check</b>.
+        <div class="calrow"><button id="encstart">Start</button>
+          <button id="enccheck" disabled>Check</button></div>
+        <small id="encres" class="calres"></small></li>
+      <li>Motor sides: press <b>Start</b>, then briefly hold <b>Spin left</b>. Seen from above,
+        which way did the nose turn?
+        <div class="calrow"><button id="spinstart">Start</button></div>
+        <div class="calrow"><button id="spinccw" disabled>Left (counter-clockwise)</button>
+          <button id="spincw" disabled>Right (clockwise)</button></div>
+        <small id="spinres" class="calres"></small></li>
+      <li>Save as a robot profile (wheel size and track width are copied from the
+        robot selected above).
+        <div class="calrow"><input id="calname" placeholder="name, e.g. lisa"
+          autocapitalize="off" autocomplete="off"><button id="calsave" disabled>Save</button></div>
+        <small id="saveres" class="calres"></small></li>
+    </ol>
+  </details>
 </div>
 <div class="card">
   <div class="banner" id="driver">…</div>
@@ -438,6 +588,111 @@ $('cleartilt').onclick = async () => {
   refresh();
 };
 function row(k, v) { return `<dt>${k}</dt><dd>${v}</dd>`; }
+// ---- robot profile picker + direction check ----
+const cap = n => n.charAt(0).toUpperCase() + n.slice(1);
+let robotActive = null;
+async function postJSON(path, body) {
+  const r = await fetch(path, {method:'POST', headers:{'content-type':'application/json'},
+                               body: JSON.stringify(body)});
+  return [r.status, await r.json()];
+}
+function drawRobots(d) {
+  robotActive = d.active;
+  const unknown = d.active === 'default';
+  $('robotbanner').textContent = unknown
+    ? 'Robot: unknown — which robot is this?' : `Robot: ${cap(d.active)}`;
+  $('robotbanner').className = 'banner' + (unknown ? ' unknown' : '');
+  const box = $('robotbtns');
+  box.innerHTML = '';
+  const opts = d.profiles.map(p => [p.name, cap(p.name), p]).concat([['default', 'Unknown', null]]);
+  for (const [name, label, p] of opts) {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.className = name === d.active ? 'active' : '';
+    b.title = p ? `encoders [${p.encoder_sign}] · sides ${p.drive_swap_sides ? 'swapped' : 'straight'}`
+                  + ` · track ${p.track_width_in} in`
+                : 'calibration/config.json (no named robot)';
+    b.onclick = () => pickRobot(name);
+    box.appendChild(b);
+  }
+}
+async function loadRobots() {
+  try { drawRobots(await (await fetch('/robot/profiles', {cache:'no-store'})).json()); }
+  catch (e) { $('robotmsg').textContent = 'daemon not reachable'; }
+}
+async function pickRobot(name) {
+  if (name === robotActive) return;
+  try {
+    const [code, d] = await postJSON('/robot/select', {name});
+    if (d.ok) { drawRobots(d); $('robotmsg').textContent = 'Switched. Odometry restarted from zero.'; }
+    else $('robotmsg').textContent = d.error || 'refused';
+  } catch (e) { $('robotmsg').textContent = 'daemon not reachable'; }
+  refresh();
+}
+const cal = {startL: null, startR: null, startYaw: null, sign: null, swap: null, frame: null};
+async function calState() { return await (await fetch('/state', {cache:'no-store'})).json(); }
+function calReady() { $('calsave').disabled = !(cal.sign && cal.swap !== null); }
+$('encstart').onclick = async () => {
+  const s = await calState(), t = s.telemetry || {}, av = t.encoders_available || [];
+  if (!(av[0] && av[1])) { $('encres').textContent = 'Both encoders must be reporting first.'; return; }
+  cal.startL = t.dist_l_in; cal.startR = t.dist_r_in; cal.frame = s.frame;
+  $('enccheck').disabled = false;
+  $('encres').textContent = 'Now hold Forward for about a second, then press Check.';
+};
+$('enccheck').onclick = async () => {
+  const s = await calState(), t = s.telemetry || {};
+  const dl = t.dist_l_in - cal.startL, dr = t.dist_r_in - cal.startR;
+  const MIN = 0.5;
+  if (!(Math.abs(dl) >= MIN && Math.abs(dr) >= MIN)) {
+    $('encres').textContent = `Not enough movement (L ${dl.toFixed(2)} in, R ${dr.toFixed(2)} in). `
+      + 'Hold Forward a little longer, then Check again.';
+    return;
+  }
+  const cur = cal.frame.encoder_sign;
+  cal.sign = [cur[0] * Math.sign(dl), cur[1] * Math.sign(dr)];
+  const say = (n, d) => `${n} ${d >= 0 ? '+' : ''}${d.toFixed(1)} in ${d >= 0 ? 'ok' : '→ flip'}`;
+  $('encres').textContent = `${say('L', dl)}, ${say('R', dr)}. Encoder sign: [${cal.sign}].`;
+  calReady();
+};
+$('spinstart').onclick = async () => {
+  const s = await calState(), t = s.telemetry || {};
+  cal.frame = s.frame; cal.startYaw = t.imu_live ? t.yaw_deg : null;
+  $('spinccw').disabled = $('spincw').disabled = false;
+  $('spinres').textContent = 'Now briefly hold Spin left, then answer.';
+};
+async function spinAnswer(ccw) {
+  const s = await calState(), t = s.telemetry || {};
+  const cur = !!cal.frame.drive_swap_sides;
+  cal.swap = ccw ? cur : !cur;
+  let hint = '';
+  if (cal.startYaw != null && t.imu_live && t.yaw_deg != null) {
+    hint = ` (IMU yaw changed ${(t.yaw_deg - cal.startYaw).toFixed(0)}°)`;
+  }
+  $('spinres').textContent = (ccw ? 'Spin direction correct' : 'Spin direction backwards → swap sides')
+    + `. Sides: ${cal.swap ? 'swapped' : 'straight'}${hint}.`;
+  calReady();
+}
+$('spinccw').onclick = () => spinAnswer(true);
+$('spincw').onclick = () => spinAnswer(false);
+let calOverwrite = null;
+$('calname').oninput = () => { calOverwrite = null; $('calsave').textContent = 'Save'; };
+$('calsave').onclick = async () => {
+  const name = $('calname').value.trim().toLowerCase();
+  if (!name) { $('saveres').textContent = 'Give the robot a name.'; return; }
+  try {
+    const [code, d] = await postJSON('/robot/save', {name, encoder_sign: cal.sign,
+      drive_swap_sides: cal.swap, overwrite: calOverwrite === name});
+    if (d.ok) {
+      drawRobots(d); calOverwrite = null; $('calsave').textContent = 'Save';
+      $('saveres').textContent = `Saved ${cap(name)} and switched to it. Try Spin left again to confirm.`;
+    } else if (d.exists) {
+      calOverwrite = name; $('calsave').textContent = `Overwrite ${cap(name)}`;
+      $('saveres').textContent = `${cap(name)} already has a profile. Press again to overwrite it.`;
+    } else $('saveres').textContent = d.error || 'refused';
+  } catch (e) { $('saveres').textContent = 'daemon not reachable'; }
+  refresh();
+};
+loadRobots();
 async function refresh() {
   let s;
   try { s = await (await fetch('/state', {cache:'no-store'})).json(); }
@@ -466,7 +721,8 @@ async function refresh() {
   h += row('stick', t.stick ? (t.stick.active
     ? `driving (${t.stick.left}, ${t.stick.right})` : `idle ${Math.round(t.stick.age_s)}s ago`) : '—');
   const f = s.frame || {};
-  h += row('frame', `drive ${f.drive_swap_sides ? 'L/R swapped' : 'L/R straight'}`
+  if (f.robot && robotActive !== null && f.robot !== robotActive) loadRobots();
+  h += row('frame', `robot ${!f.robot || f.robot === 'default' ? 'unknown' : f.robot} · drive ${f.drive_swap_sides ? 'L/R swapped' : 'L/R straight'}`
     + ` · yaw ${f.imu_yaw_sign === -1 ? 'flipped' : 'straight'}`
     + ` · enc [${(f.encoder_sign || []).join(',')}] · gear ${f.gear_ratio_used ?? '—'}`);
   $('facts').innerHTML = h;
@@ -574,17 +830,22 @@ function drawLive(t) {
   g.fillRect(0, 0, W, cv.height);
   let y = 2;
   const sens = t.sensors || {};
-  // status strip: DRIVE, ENC, IMU, RANGE liveness
+  // status strip: DRIVE plus one chip per sensor board this robot transmits,
+  // whatever they are -- a missing board simply has no chip. A ToF board shows
+  // here by its own name (TOF_FRONT); the RANGE section below is the same data
+  // per chip, so it gets no chip of its own.
+  const tofBoards = new Set(Object.values((t.range && t.range.channels) || {})
+    .map(c => String(c.sensor || '').toLowerCase()));
+  const isTof = k => tofBoards.has(k.toLowerCase()) || k.toLowerCase().startsWith('tof');
   const chips = [];
   const st = t.stick;
   chips.push(['DRIVE', st && st.active ? ['live', GOOD] : ['idle', MUT]]);
-  const enc = sens['enc'];
-  chips.push(['ENC', enc ? (enc.live ? [`${enc.rate_hz ?? ''} Hz`, GOOD] : ['SILENT', BAD]) : ['never', MUT]]);
-  const imu = sens['imu'];
-  chips.push(['IMU', imu ? (imu.live ? [`${imu.rate_hz ?? ''} Hz`, GOOD] : ['SILENT', BAD]) : ['never', MUT]]);
-  const rngLive = t.range && t.range.live;
-  chips.push(['RANGE', t.range ? (rngLive ? ['live', GOOD] : ['silent', BAD]) : ['never', MUT]]);
-  const cw = W / 4;
+  Object.keys(sens).sort().forEach((name) => {
+    const s = sens[name];
+    chips.push([name.toUpperCase(),
+      s.live ? [`${s.rate_hz ?? ''} Hz`, GOOD] : ['SILENT', BAD]]);
+  });
+  const cw = W / Math.max(chips.length, 1);
   chips.forEach(([name, [state, col]], i) => {
     const x = i * cw + 2;
     g.fillStyle = LINE;
@@ -613,7 +874,7 @@ function drawLive(t) {
   y += 66;
   // ENCODERS: distances, heading, history
   ltext(g, 'ENCODERS', 4, y + 18, H1, MUT);
-  ltext(g, t.heading_deg == null ? 'heading: needs both' : `heading ${t.heading_deg.toFixed(1)}°`, 140, y + 18, SM, MUT);
+  ltext(g, t.imu_live && t.yaw_deg != null ? `heading ${t.yaw_deg.toFixed(1)}° (IMU)` : 'heading: no IMU data', 140, y + 18, SM, t.imu_live ? MUT : BAD);
   y += 28;
   const av = t.encoders_available || [false, false];
   ltext(g, `L ${av[0] && t.dist_l_in !== undefined ? t.dist_l_in.toFixed(2) + ' in' : 'NOT RESPONDING'}`, 4, y + 19, V, av[0] ? FG : BAD);
@@ -627,8 +888,9 @@ function drawLive(t) {
     lspark(g, 4, y, W - 8, 44, LH.dr, lo, hi, ORANGE);
   }
   y += 54;
-  // IMU: horizon, compass, angles, accel
-  ltext(g, 'IMU', 4, y + 18, H1, MUT);
+  // IMU: horizon, compass, angles, accel. A robot with no IMU board would
+  // otherwise show plausible-looking zeros, so the header says so.
+  ltext(g, t.imu_live ? 'IMU' : 'IMU — no data (board silent or not fitted)', 4, y + 18, H1, t.imu_live ? MUT : BAD);
   y += 28;
   const pitch = t.pitch_deg || 0, roll = t.roll_deg || 0, yaw = t.yaw_deg || 0;
   const r = 38, cx = 44, cx2 = 132, cy = y + 42;
@@ -691,6 +953,21 @@ function drawLive(t) {
   ltext(g, '0', 4, y + gh - 2, SM, MUT);
   names.forEach((k, i) => lspark(g, gx0, y, gw, gh,
     (LHR[k] || []).map(v => v == null ? null : Math.min(v, 2000)), 0, 2000, i % 2 ? ORANGE : BLUE));
+  // Any other streams this robot transmits (a future sensor): one line each, so
+  // a robot gains a panel with no page change. ToF boards already have RANGE.
+  const extra = Object.keys(sens).filter(k => k !== 'enc' && k !== 'imu' && !isTof(k));
+  if (extra.length) {
+    y += 8;
+    ltext(g, 'OTHER SENSORS', 4, y + 18, H1, MUT);
+    y += 28;
+    extra.sort().forEach((k) => {
+      const s = sens[k];
+      const state = s.live ? `${s.rate_hz ?? ''} Hz${s.measuring ? '' : ' (nothing to report)'}` : 'SILENT';
+      ltext(g, k, 4, y + 18, SM, FG);
+      ltext(g, state, 150, y + 18, SM, s.live ? GOOD : BAD);
+      y += 28;
+    });
+  }
 }
 async function liveTick() {
   let s;
@@ -788,8 +1065,34 @@ function makeCamera(card) {
                        catch (e) {} };
   const show = (pic, msg) => { img.hidden = !pic; empty.hidden = pic;
                                if (msg !== undefined) empty.textContent = msg; };
+  /* Latency: the browser can't timestamp MJPEG frames, so every 2 s it times a fetch of a
+     fresh snapshot from the same camera. That request queues in the phone's uplink behind
+     the stream, so it grows with the same backlog that makes the picture lag. no-cors gives
+     an opaque response but the timing is real; a 404 (no /shot.jpg) still times the trip. */
+  let lats = [], probing = false;
+  async function probe(g) {
+    if (probing || !on || g !== gen || img.hidden || !img.naturalWidth) return;
+    probing = true;
+    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 5000);
+    const t0 = performance.now();
+    let ms;
+    try {
+      await fetch(new URL(url).origin + '/shot.jpg?t=' + Date.now(),
+                  {mode: 'no-cors', cache: 'no-store', signal: ctl.signal});
+      ms = performance.now() - t0;
+    } catch (e) { ms = ctl.signal.aborted ? Infinity : null; }
+    clearTimeout(t); probing = false;
+    if (g !== gen || ms === null) return;
+    lats.push(ms); if (lats.length > 5) lats.shift();
+  }
+  function latHtml() {
+    if (!lats.length) return '';
+    const s = [...lats].sort((a, b) => a - b), m = s[s.length >> 1];
+    const cls = m < 150 ? 'ok' : m < 500 ? 'warn' : 'bad';
+    return ` · <span class="lat ${cls}">${m === Infinity ? '>5 s' : Math.round(m) + ' ms'}</span>`;
+  }
   function stop() {
-    gen++; on = false;
+    gen++; on = false; lats = [];
     img.onload = img.onerror = null;
     img.removeAttribute('src');                 // closes the MJPEG connection
     btn.textContent = 'Connect'; btn.classList.remove('on');
@@ -839,9 +1142,12 @@ function makeCamera(card) {
   btn.onclick = () => { if (on) { stop(); save(); } else start(); };
   input.addEventListener('keydown', e => { if (e.key === 'Enter') start(); });
   setInterval(() => {
-    if (on && img.naturalWidth && !img.hidden)
+    if (on && img.naturalWidth && !img.hidden) {
       status.textContent = `${url} · ${img.naturalWidth}×${img.naturalHeight}`;
+      status.insertAdjacentHTML('beforeend', latHtml());
+    }
   }, 1000);
+  setInterval(() => probe(gen), 2000);
   try {
     const s = JSON.parse(localStorage.getItem(key) || 'null');
     if (s && s.url) { input.value = s.url; if (s.on) start(); }
@@ -898,6 +1204,30 @@ def register(mcp, ctx):
         except Exception as e:  # a status page must not 500
             return JSONResponse({"events": [], "error": repr(e)})
         return JSONResponse({"events": events})
+
+    async def _json_body(request):
+        try:
+            body = json.loads(await request.body() or b"{}")
+        except ValueError:
+            body = {}
+        return body if isinstance(body, dict) else {}
+
+    @mcp.custom_route("/robot/profiles", methods=["GET"], include_in_schema=False)
+    async def robot_profiles_route(request: Request):
+        return JSONResponse(robot_profiles())
+
+    @mcp.custom_route("/robot/select", methods=["POST"], include_in_schema=False)
+    async def robot_select_route(request: Request):
+        body = await _json_body(request)
+        code, out = robot_select(CTX, body.get("name"))
+        return JSONResponse(out, status_code=code)
+
+    @mcp.custom_route("/robot/save", methods=["POST"], include_in_schema=False)
+    async def robot_save_route(request: Request):
+        body = await _json_body(request)
+        code, out = robot_save(CTX, body.get("name"), body.get("encoder_sign"),
+                               body.get("drive_swap_sides"), body.get("overwrite", False))
+        return JSONResponse(out, status_code=code)
 
     @mcp.custom_route("/", methods=["GET"], include_in_schema=False)
     async def page(request: Request):

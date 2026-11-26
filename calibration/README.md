@@ -11,41 +11,38 @@ Needs on the robot: `robot_encoders_as5600` and a `robot_imu_*` sketch. Python: 
 
 | File | What it does |
 |---|---|
-| `live_view.py` | Live plots + a big readout of distance/heading since you last pressed `z`. Type `d <inches>` / `t <degrees>` to calibrate wheel diameter / track width from a real measurement. Run with `--daemon` when the robot daemon owns the bridge (see below). |
-| [`../bridge/`](../bridge/) | Serial reader, line parsing, config load/save, and the distance/orientation math that `live_view.py` uses (shared with the MCP server). |
-| `config.json` | Wheel diameter, gear ratio (4.5: ~90t/20t teeth, confirmed by the tape-measured 30 in run), track width. Read by `live_view.py`, which writes it when you calibrate. Old recordings baked 6.33 — see `analyze_run.py`. |
+| Operator dashboard | Live plots + distance/heading readout: run the robot daemon with `--http` and open http://127.0.0.1:8765 (see [`mcp_server/`](../mcp_server/README.md)). Replaces the old `live_view.py` desktop window (removed; in git history if needed). |
+| [`../bridge/`](../bridge/) | Serial reader, line parsing, config load/save, and the distance/orientation math shared with the MCP server. |
+| `config.json` | Wheel diameter, gear ratio (4.5: ~90t/20t teeth, confirmed by the tape-measured 30 in run), track width. Edit by hand and restart the daemon to apply. Old recordings baked 6.33 — see `analyze_run.py`. |
 | `analyze_csv.py` / `analyze_run.py` | Post-run analysis of recording CSVs. |
 | `*.csv` | Kept measurements, e.g. the PWM → speed characterization runs and `30_inches.csv`. Cited by `mcp_server/drive_math.py`; `ROBOT_CHARACTERIZATION.md` reports the numbers. |
 
-## Drive one foot
+## Check the sensors
 
 ```
-python3 calibration/live_view.py
+mcp_server/.venv/bin/python mcp_server/robot_server.py --http --port 8765
 ```
 
-## With the daemon
+then open http://127.0.0.1:8765. Only the daemon opens the serial port; the
+page polls its `GET /state`, so it never fights the daemon for the bridge.
 
-When `mcp_server/robot_server.py` owns the bridge, opening the serial port a
-second time fails with "Resource temporarily unavailable" -- and this script
-now says so instead of dumping a traceback. Run the daemon with `--http`,
-then point the dashboard at it:
+Just eyeballing whether a sensor is alive? Stop the daemon and stream the
+bridge's raw serial prints (dense `@ seq NAME … *CC` lines; Ctrl+] quits):
 
 ```
-mcp_server/.venv/bin/python mcp_server/robot_server.py --http
-python3 calibration/live_view.py --daemon
+mcp_server/.venv/bin/python -m serial.tools.miniterm /dev/ttyUSB0 921600
 ```
 
-`--daemon` polls the daemon's `GET /state`, so the dashboard is read-only and
-never fights the daemon for the port. `z` re-zeros the display only (true
-odometry lives in the daemon); the DRIVE panel shows the daemon's stop, lease,
-and move state instead of overheard stick commands.
+## Calibrate by hand
 
-1. Put the robot at a mark, press `z` in the plot window.
-2. Drive one foot with the stick. The readout shows distance in inches and feet.
-3. If it's off, type the measured distance in the terminal (`d 12`). The wheel diameter in
-   `config.json` is rescaled and applied immediately. Press `z` and repeat to confirm.
-4. For turns: `z`, spin the robot through a measured angle, type `t 90` (the real angle).
-   Do the distance calibration first; the turn estimate depends on it.
+The old `d`/`t` typing is gone with `live_view.py`; the same corrections as
+edits to `config.json` (daemon restart applies them):
+
+1. Put the robot at a mark, note the dashboard distance, drive one foot with
+   the stick. Multiply wheel diameter by (real inches) / (shown inches).
+2. For turns: zero odometry, spin through a measured angle, multiply track
+   width by (real degrees) / (shown heading degrees). Do distance first; the
+   turn estimate depends on it.
 
 `track_width_in` is 19 in, measured wheel-to-wheel on this unit. Units differ, so measure
 yours or calibrate it with `t`. Precision matters less than it looks: every encoder-derived

@@ -132,9 +132,13 @@ def test_stop_is_safe_when_idle():
 
 def test_frame_conventions_reports_live_settings():
     import types
+    # Not connected: the selected robot's file (here config.json), not built-in defaults.
+    bridge = dh._bridge()
+    cfg = bridge.load_config()
     assert dh.frame_conventions(None) == {
-        "drive_swap_sides": True, "imu_yaw_sign": -1,
-        "encoder_sign": [1, 1], "gear_ratio_used": 4.5}
+        "robot": "default", "drive_swap_sides": cfg.get("drive_swap_sides", True),
+        "imu_yaw_sign": -1, "encoder_sign": list(cfg["encoder_sign"]),
+        "gear_ratio_used": cfg["gear_ratio"]}
     stub = types.SimpleNamespace(cfg={"encoder_sign": [1, -1], "gear_ratio": 4.5})
     assert dh.frame_conventions(stub)["encoder_sign"] == [1, -1]
 

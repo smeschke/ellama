@@ -114,15 +114,68 @@ def _pick_port(explicit):
 class RobotLink:
     """Owns the serial connection, the background telemetry pump, and drive commands."""
 
-    def __init__(self, port=None):
-        self.cfg = bridge.load_config()
-        problems = recording.check_config(self.cfg)
+    _profile_gen = 0   # bumped by switch_robot; class default for links built in tests
+
+    @staticmethod
+    def _load_profile():
+        """(cfg, track_width_calibrated) for the active robot profile, validated."""
+        cfg = bridge.load_config()
+        problems = recording.check_config(cfg)
+        swap = cfg.get("drive_swap_sides", DRIVE_SWAP_SIDES)
+        if not isinstance(swap, bool):
+            problems.append("'drive_swap_sides' must be true/false, got %r" % (swap,))
         if problems:
-            raise RuntimeError("bad calibration config: %s" % "; ".join(problems))
-        self.track_width_calibrated = (
-            self.cfg["track_width_in"] != bridge.DEFAULT_CONFIG["track_width_in"]
-        )
-        self.cfg["gear_ratio"] = TRUE_GEAR_RATIO
+            raise RuntimeError("bad calibration config (%s): %s"
+                               % (bridge.ROBOT_NAME, "; ".join(problems)))
+        calibrated = cfg["track_width_in"] != bridge.DEFAULT_CONFIG["track_width_in"]
+        cfg["gear_ratio"] = TRUE_GEAR_RATIO
+        return cfg, calibrated
+
+    def _apply_profile_policy(self, reset_when_unset=False):
+        """A profile may preset the sensor policy (e.g. an IMU-less robot runs
+        ["enc"]). A profile without one leaves the policy alone at connect (it
+        survives reconnects, like the guards) and resets it to the default on a
+        robot switch. An explicit ELLAMA_REQUIRED_SENSORS env var always wins."""
+        if _required_env is not None:
+            return
+        prof = self.cfg.get("required_sensors")
+        if isinstance(prof, str):
+            prof = [prof]
+        names = [n for part in (prof or []) for n in re.split(r"[,\s]+", part) if n]
+        if names or reset_when_unset:
+            POLICY.set(names or list(sensorlib.SensorPolicy.DEFAULT),
+                       by="robot profile %s" % bridge.ROBOT_NAME)
+
+    def switch_robot(self, name):
+        """Switch to another robot profile without reconnecting. Odometry restarts
+        from zero (the encoder sign may have changed). Unknown or invalid profile
+        raises and leaves everything as it was. Callers must not switch mid-move."""
+        old = bridge.ROBOT_NAME
+        with self.lock:
+            bridge.set_robot(name)
+            try:
+                cfg, calibrated = self._load_profile()
+            except Exception:
+                bridge.set_robot(old)
+                raise
+            self.cfg = cfg
+            self.track_width_calibrated = calibrated
+            self.enc = bridge.EncoderState(self.cfg)
+            # The pump parses (applying ENC_SIGN) outside this lock; a packet parsed
+            # under the old sign must not become the new EncoderState's zero point.
+            self._profile_gen += 1
+        self._apply_profile_policy(reset_when_unset=True)
+        self.recorder.vet.log("robot_profile", {
+            "from": old, "to": name,
+            "encoder_sign": list(self.cfg["encoder_sign"]),
+            "drive_swap_sides": self.cfg.get("drive_swap_sides", DRIVE_SWAP_SIDES),
+            "track_width_in": self.cfg["track_width_in"],
+        })
+        return self.cfg
+
+    def __init__(self, port=None):
+        self.cfg, self.track_width_calibrated = self._load_profile()
+        self._profile_gen = 0
 
         port = _pick_port(port)
         # exclusive=True so a second process opening this port fails loudly instead of
@@ -146,6 +199,7 @@ class RobotLink:
         # already means it is guessing. Hold the IMU to a tighter deadline than the rest.
         self.sensors.set_stale_after("imu", IMU_STALE_FAULT_S)
         self.policy = POLICY   # module-level: survives connect(), like the guards
+        self._apply_profile_policy()
         self.lock = threading.Lock()
         self.recorder = recording.Recorder(REPO_ROOT / "recordings")
         self.recorder.vet.log("connect", {
@@ -189,16 +243,23 @@ class RobotLink:
                 raw = self.reader.q.get(timeout=0.2)
             except Exception:
                 continue
+            gen = self._profile_gen   # read BEFORE parse: see switch_robot
             kind, payload = bridge.parse_line(raw)
             tripped = None
             now = time.monotonic()
             with self.lock:
-                if kind == "ENC":
+                if kind == "ENC" and gen != self._profile_gen:
+                    pass   # parsed under the previous robot's encoder sign: drop it
+                elif kind == "ENC":
                     left, right, ms = payload
                     # Either count may be None: that encoder is not responding, which is a
                     # routine state next to a wheel, not an error. EncoderState holds that
                     # wheel's distance rather than reading it as a stationary wheel.
                     sl, sr = self.enc.update(left, right, ms)
+                    # Wheels still -> the IMU re-learns its yaw zero-point and holds yaw.
+                    both = all(self.enc.available)
+                    self.orient.note_wheels(self.enc.dist_l if both else None,
+                                            self.enc.dist_r if both else None, now)
                     self.sensors.observe("enc", (left, right), ms,
                                          available=list(self.enc.available), when=now)
                     self.recorder.on_enc(self.enc, self.orient, sl, sr)
@@ -212,7 +273,8 @@ class RobotLink:
                                      left=payload[0], right=payload[1])
                 elif kind == "IMU":
                     ax, ay, az, gx, gy, gz, ms = payload
-                    agx, agy, agz, dx, dy, dz = self.orient.update(ax, ay, az, gx, gy, gz, ms)
+                    agx, agy, agz, dx, dy, dz = self.orient.update(ax, ay, az, gx, gy, gz, ms,
+                                                                         now=now)
                     self.sensors.observe("imu", (ax, ay, az, gx, gy, gz), ms, when=now)
                     self.recorder.on_imu(self.enc, self.orient, (agx, agy, agz))
                     self.last_imu = dict(ax=ax, ay=ay, az=az, gx=gx, gy=gy, gz=gz, ms=ms)
@@ -337,11 +399,17 @@ class RobotLink:
     _tilt_refusal = _drive_refusal
 
     def send_drive(self, left, right):
-        # DRIVE_SWAP_SIDES (drive_math.py): the dashboard and tools speak true
-        # left/right; the swap to this unit's mirrored wiring happens here, so
-        # every PC drive path -- dashboard hold, drive_*, turn_*, jog -- agrees.
-        # The handheld stick bypasses this server and is not covered by it.
-        if DRIVE_SWAP_SIDES:
+        # Drive side convention: the dashboard and tools speak true left/right;
+        # the swap to mirrored motor wiring happens here, so every PC drive
+        # path -- dashboard hold, drive_*, turn_*, jog -- agrees. Per robot:
+        # cfg "drive_swap_sides" (a real boolean) wins, else the DRIVE_SWAP_SIDES
+        # default in drive_math.py. The handheld stick bypasses this server and
+        # is not covered by it.
+        swap = self.cfg.get("drive_swap_sides", DRIVE_SWAP_SIDES)
+        if not isinstance(swap, bool):
+            raise RuntimeError("bad calibration config: 'drive_swap_sides' must be "
+                               "true/false, got %r" % (swap,))
+        if swap:
             left, right = right, left
         left = max(-MAX_PWM_CEILING, min(MAX_PWM_CEILING, int(left)))
         right = max(-MAX_PWM_CEILING, min(MAX_PWM_CEILING, int(right)))
@@ -383,15 +451,16 @@ class RobotLink:
             pass
 
     def last_counts(self):
-        """(left, right) cumulative ticks, or None unless BOTH wheels reported.
+        """(left, right) cumulative ticks, or None unless BOTH wheels are live.
 
-        EncoderState.last holds a per-wheel value that is None while that encoder is not
-        responding. Callers difference these to measure a move, and one None would make
-        that arithmetic raise mid-move with the motors running -- so a partial reading is
-        reported as no reading, and the drive tools decide what to do about it."""
+        Liveness is EncoderState.available (latched per wheel with a timeout), not the
+        last packet's shape: two single-encoder boards interleave half-packets, and a
+        partial reading must still be reported as no reading, so callers never
+        difference a stale wheel mid-move -- the drive tools decide what to do about it."""
         with self.lock:
-            left, right = self.enc.last
-            return None if (left is None or right is None) else (left, right)
+            if not all(self.enc.available):
+                return None
+            return tuple(self.enc.last)
 
     def wheel_counts(self, encoder="both"):
         """(left, right) cumulative ticks, or None unless the channels `encoder` needs
@@ -400,12 +469,12 @@ class RobotLink:
         last_counts() insists on both wheels because its callers difference both. A move
         measured by one nominated encoder needs only that one, so this is the same reading
         with a narrower requirement: the unselected slot may come back None, and nothing
-        is allowed to difference it."""
+        is allowed to difference it. "Reporting" is the latched per-wheel availability,
+        so interleaved single-encoder boards stay measurable and a dead one reads None."""
         with self.lock:
-            counts = tuple(self.enc.last)
-        if any(counts[i] is None for i in selected_wheels(encoder)):
-            return None
-        return counts
+            if not all(self.enc.available[i] for i in selected_wheels(encoder)):
+                return None
+            return tuple(self.enc.last)
 
     def range_snapshot(self, now=None):
         """Every ToF channel, or None if no range sensor has ever reported.
@@ -468,8 +537,10 @@ class RobotLink:
             left_ticks, right_ticks = self.enc.last
             heading = self.enc.heading_deg   # None while either encoder is missing
             return dict(
-                left_ticks=left_ticks,
-                right_ticks=right_ticks,
+                # A stale count presented as current would read as a stopped wheel;
+                # report ticks only for live channels (same latch as availability).
+                left_ticks=left_ticks if self.enc.available[0] else None,
+                right_ticks=right_ticks if self.enc.available[1] else None,
                 # [left, right]: which encoder answered in the last packet. A damaged one
                 # is routine, so this is reported, not treated as a fault.
                 encoders_available=list(self.enc.available),
@@ -483,6 +554,7 @@ class RobotLink:
                 pitch_deg=round(self.orient.pitch, 2),
                 roll_deg=round(self.orient.roll, 2),
                 yaw_deg=round(self.orient.yaw, 2),
+                yaw_zupt=self.orient.zupt_snapshot(),
                 tilt=self.tilt.snapshot(),
                 telemetry_age_s=None if age is None else round(age, 2),
                 telemetry_live=age is not None and age < TELEMETRY_STALE_S,

@@ -11,3 +11,9 @@ mcp_server/models/
 .env
 lll_key.txt
 rkey.txt
+
+# run outputs and local archives
+map.png
+map_log.csv
+*.zip
+SESSION_NOTES.md

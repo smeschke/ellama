@@ -40,8 +40,10 @@ The stick controller and the computer bridge send the same drive packet over ESP
 3. Flash the firmware: [`firmware/README.md`](firmware/README.md) says which sketch goes on which ESP32.
 4. Drive it with the stick controller. No computer needed.
 5. To drive from a computer, flash `computer_bridge` on a spare ESP32 and send `<left> <right>` lines over serial.
-6. To check the encoders and IMU, run [`calibration/live_view.py`](calibration/README.md).
+6. To check the encoders and IMU, run the daemon and open the operator page ([`mcp_server/`](mcp_server/README.md)).
 7. To let an AI agent drive it, set up [`mcp_server/`](mcp_server/README.md) and read [`DRIVING_POLICY.md`](DRIVING_POLICY.md) first.
+
+**Dashboard in one line:** `./run_dashboard.sh [robot]` from the repo root, then open http://127.0.0.1:8765. The optional robot name picks a profile from [`calibration/robots/`](calibration/robots/README.md) (per-robot calibration and sensor policy); without one it uses `calibration/config.json`. The page adapts to whatever sensors the plugged-in robot transmits — missing boards simply show as silent, and a new sensor name appears as its own panel with no code change.
 
 ## Status
 

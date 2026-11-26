@@ -1,2 +1,4 @@
 mcp>=2.0
 pyserial>=3.5
+numpy>=1.26
+matplotlib>=3.8
