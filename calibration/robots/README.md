@@ -15,6 +15,7 @@ optional policy key:
 | `wheel_diameter_in`, `ticks_per_rev`, `gear_ratio`, `track_width_in`, `encoder_sign` | Same as `config.json`: measured per robot. Restart the daemon to apply. |
 | `required_sensors` | Optional list (e.g. `["enc"]` for an IMU-less robot, `[]` if something outside the robot closes the loop). An explicit `ELLAMA_REQUIRED_SENSORS` env var always wins over this. Missing key means the default `["enc", "imu"]`. |
 | `drive_swap_sides` | Optional boolean. `true` if a spin-left command turns this robot's nose clockwise (mirrored motor wiring, like the original unit); `false` if spin-left already turns it counter-clockwise. Missing key means the `DRIVE_SWAP_SIDES` default in `drive_math.py` (currently `true`). Must be a real JSON boolean, not a string. |
+| `camera` | Optional object for the camera tag turn aims with. `hfov_deg`: its horizontal field of view in degrees (default 60, a guess). Example: `"camera": {"hfov_deg": 66}`. Read on every Center, so no restart needed. |
 
 A named profile that does not exist is a startup error, never a silent
 fallback — a typo must not mis-calibrate distances.

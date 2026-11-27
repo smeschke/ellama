@@ -262,6 +262,37 @@ carries its sensor snapshot (ToF, yaw, camera), so a camera or ToF follower can 
 later without recording again. MCP tools: `route_status`, `route_process`,
 `route_follow(confirmed_safe, lease, ...)`.
 
+## Show AprilTags (`apriltag_module.py`)
+
+Page at `http://127.0.0.1:8765/apriltag` (linked from the operator page). Type the camera
+address (`192.168.0.52:4444`, `192 168 0 52 4444` or a full stream URL). The page shows the
+newest frame with each tag outlined and numbered, plus a table of tag ids and pixel centres.
+It watches only and never drives. MCP tool: `apriltags_in_view(camera_address, family)`.
+
+Detection is [`tools/find_tags.py`](../tools/find_tags.py), which also runs on its own:
+`mcp_server/.venv/bin/python tools/find_tags.py photo.jpg`. Both use the official
+[AprilRobotics library](https://github.com/AprilRobotics/apriltag), which is not on PyPI:
+run `tools/install_apriltag.sh` once per machine to build it into `mcp_server/.venv`.
+
+## Tag turn (`tag_turn.py`)
+
+Page at `http://127.0.0.1:8765/tag`: the Show AprilTags page plus a **Center** button.
+While the page is open it holds the drive lease (holder `tag-turn`, shown on the operator
+page); close it and within 3 s the robot is braked and the lease released.
+
+Center spins the robot toward the tag (blank id = the biggest tag in view) using the
+dashboard's spin commands, at a PWM stepped by how far off the tag is: 100 beyond 30 deg,
+88, 75, 63, and 50 within 6 deg. Inside 3 deg it brakes, waits 0.6 s for the camera to
+catch up, and looks again: still inside = centered, else it keeps turning. It stops only
+on Stop, the hub STOP, or a guard refusing (the tilt guard: tipped over). Everything else is
+ridden out: dropped camera frames brake and wait (gives up after 30 s with none), a tag that
+leaves the frame brakes and waits (5 s), and a stall (the tag has not moved 1 deg in the
+picture for 1.5 s) adds 10 PWM and carries on, failing only when stuck at 100. Plan's
+`toward` and `find` share this code (`vision_drive.py`). Overall limit 60 s. Field of view: the robot profile's
+`camera.hfov_deg` (see [`calibration/robots/README.md`](../calibration/robots/README.md)),
+else 60 deg. MCP: `tag_turn_status()` (read-only). Tests: `test_tag_turn.py` (simulated
+robot and camera).
+
 ## Known unknowns
 
 - **Direction sign: re-verified 2026-10-24, on the ground.** Repeated

@@ -16,6 +16,9 @@ test: ## Run the hardware-free test suites (script-style runners)
 	$(PY) mcp_server/test_vetbook.py
 	$(PY) mcp_server/test_yaw_zupt.py
 	$(PY) mcp_server/test_watch_and_repeat.py
+	$(PY) mcp_server/test_apriltag_module.py
+	$(PY) mcp_server/test_tag_turn.py
+	$(PY) mcp_server/test_plan_module.py
 	$(PY) tools/test_realtime_map.py
 
 check: ## Byte-compile all Python sources

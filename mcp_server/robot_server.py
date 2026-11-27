@@ -326,9 +326,17 @@ import watch_and_repeat  # noqa: E402
 
 watch_and_repeat.register(mcp, sys.modules[__name__])
 
-import tag_module  # noqa: E402
+import apriltag_module  # noqa: E402
 
-tag_module.register(mcp, sys.modules[__name__])
+apriltag_module.register(mcp, sys.modules[__name__])
+
+import tag_turn  # noqa: E402
+
+tag_turn.register(mcp, sys.modules[__name__])
+
+import plan_module  # noqa: E402
+
+plan_module.register(mcp, sys.modules[__name__])
 
 
 def main(argv=None):
