@@ -513,6 +513,125 @@ def test_arc_pwms():
     assert vd.arc_pwms(1, 60, slow=True) == (50, 50)        # centred and close: creep
 
 
+
+def test_check_arc_steps():
+    clean, problems = pm.check_plan([{"cmd": "arc", "direction": "left", "radius_in": 24,
+                                      "degrees": 90, "stop_after": False, "warning": "x"}])
+    assert not problems, problems
+    assert clean[0] == {"cmd": "arc", "direction": "left", "radius_in": 24.0, "degrees": 90.0,
+                        "travel": "forward", "pwm": 60}, clean
+    assert "arc back left 90 deg, radius 24 in" in pm.describe(
+        pm.check_step({"cmd": "arc", "direction": "left", "radius_in": 24, "degrees": 90,
+                       "travel": "reverse"}))
+    for bad, why in [({"cmd": "arc", "direction": "up", "radius_in": 24, "degrees": 90}, "direction"),
+                     ({"cmd": "arc", "direction": "left", "radius_in": 3, "degrees": 90}, "radius_in"),
+                     ({"cmd": "arc", "direction": "left", "radius_in": 24, "degrees": 400}, "degrees"),
+                     ({"cmd": "arc", "direction": "left", "radius_in": 100, "degrees": 180}, "split"),
+                     ({"cmd": "arc", "direction": "left", "radius_in": 24, "degrees": 90,
+                       "travel": "sideways"}, "travel")]:
+        _, problems = pm.check_plan([bad])
+        assert problems and why in problems[0], (bad, problems)
+
+
+def test_arc_step_calls_drive_arc():
+    sim, ctx, p = setup({1: (48.0, 0.0)})
+    calls = []
+
+    def drive_arc(radius, degrees, direction, pwm, confirmed_safe, travel="forward", lease=None):
+        calls.append((radius, degrees, direction, pwm, confirmed_safe, travel, lease))
+        return {"ok": True, "actual_degrees_turned": -degrees}
+    ctx.drive_arc = drive_arc
+    try:
+        st = run_plan(p, [{"cmd": "arc", "direction": "right", "radius_in": 30, "degrees": 45,
+                           "travel": "reverse", "pwm": 70}])
+        assert st["phase"] == "done", st
+        assert calls == [(30.0, 45.0, "right", 70, True, "reverse", p.lease)], calls
+        assert st["steps"][0]["result"].startswith("turned 45"), st["steps"]
+        ctx.drive_arc = lambda *a, **k: {"ok": False, "abort_reason": "IMU went stale"}
+        st = run_plan(p, [{"cmd": "arc", "direction": "left", "radius_in": 30, "degrees": 45}])
+        assert st["phase"] == "failed" and "IMU went stale" in st["note"], st
+    finally:
+        sim.alive = False
+
+
+def test_drawings_list_and_load():
+    d = Path(tempfile.mkdtemp(prefix="drawings_"))
+    steps = [{"cmd": "forward", "inches": 48, "pwm": 50, "stop_after": False},
+             {"cmd": "arc", "direction": "left", "radius_in": 18, "degrees": 90,
+              "travel": "forward", "pwm": 60, "stop_after": True, "warning": "leaves the map"}]
+    (d / "garage_loop.json").write_text(json.dumps({"name": "garage loop", "steps": steps,
+                                                    "saved": "2026-11-28 06:00:00"}))
+    (d / "broken.json").write_text("{not json")
+    lst = pm.list_drawings(d)
+    assert {x["file"] for x in lst} == {"garage_loop.json", "broken.json"}, lst
+    good = next(x for x in lst if x["file"] == "garage_loop.json")
+    assert good["name"] == "garage loop" and good["steps"] == 2
+    assert "error" in next(x for x in lst if x["file"] == "broken.json")
+    code, out = pm.load_drawing("garage_loop.json", d)
+    assert code == 200 and out["ok"] and not out["problems"] and out["steps"] == steps, out
+    assert any("1 smooth link" in n for n in out["notes"]), out["notes"]
+    assert any("leaves the map" in n for n in out["notes"]), out["notes"]
+    assert pm.load_drawing("nope.json", d)[0] == 404
+    for bad in ("../secret.json", "/etc/passwd", "a/b.json", "x.txt", None, ".json/.."):
+        assert pm.load_drawing(bad, d)[0] == 400, bad
+
+
+def test_drawer_launch():
+    d = Path(tempfile.mkdtemp(prefix="drawer_")) / "plans"
+    d.mkdir()
+    (d / "lap.json").write_text("{}")
+    script = d.parent / "plan_drawer.py"
+    script.write_text("")
+    started = []
+
+    class Proc:
+        def __init__(self, cmd, **kw):
+            started.append((cmd, kw))
+            self.alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+    dr = pm.Drawer(script, d, popen=Proc)
+    code, out = dr.launch(env={})
+    assert code == 409 and "no screen" in out["error"] and not started, out
+    code, out = dr.launch("lap.json", env={"DISPLAY": ":0"})
+    assert code == 200, out
+    cmd, kw = started[0]
+    assert cmd[-2:] == ["--load", str((d / "lap.json").resolve())], cmd
+    assert kw["env"]["DISPLAY"] == ":0" and kw["start_new_session"]
+    code, out = dr.launch(env={"DISPLAY": ":0"})
+    assert code == 409 and "already open" in out["error"], out
+    dr.proc.alive = False
+    assert dr.launch(env={"DISPLAY": ":0"})[0] == 200 and "--load" not in started[1][0]
+    dr.proc.alive = False
+    assert dr.launch("../x.json", env={"DISPLAY": ":0"})[0] == 400
+    assert dr.launch("missing.json", env={"DISPLAY": ":0"})[0] == 404
+    assert len(started) == 2
+
+
+def test_the_drawer_saves_plans_the_page_accepts():
+    """A drawing made with the drawer's own geometry loads cleanly here."""
+    sys.path.insert(0, str(pm.DRAWER.parent))
+    import plan_drawer as pdraw
+    app = pdraw.App(288, 240, Path(tempfile.mkdtemp()) / "x.json", name="check")
+    app.start = {"x": 24.0, "y": 120.0, "heading": 0.0}
+    app.tags = [{"id": 5, "x": 260.0, "y": 120.0, "face": 180.0}]
+    app.intents = [
+        {"kind": "line", "target": [72, 120], "stop": True},
+        {"kind": "arc", "target": [120, 168], "stop": True},
+        {"kind": "line", "target": [168, 60], "smooth": True, "R": 18, "stop": False},
+        {"kind": "arc", "target": [140, 40], "rev": True, "stop": True},
+        {"kind": "line", "target": [100, 100], "rev": True, "smooth": False, "R": 18, "stop": True},
+        {"kind": "aim", "tag": 5},
+        {"kind": "toward", "tag": 5, "stop_in": 18, "stop": True},
+    ]
+    app.save()
+    code, out = pm.load_drawing(app.out.name, app.out.parent)
+    assert code == 200 and not out["problems"], out
+    assert {s["cmd"] for s in out["steps"]} >= {"forward", "arc", "turn", "back", "find", "toward"} \
+        or {s["cmd"] for s in out["steps"]} >= {"forward", "arc", "turn", "back", "aim", "toward"}, out
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

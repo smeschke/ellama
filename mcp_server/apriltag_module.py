@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """show-apriltag module: watch a camera and show the AprilTags it sees. Never drives.
 
-Registered by register(mcp, ctx) from robot_server, like watch_and_repeat and
-tag_turn. Its page lives at GET /apriltag on the daemon, linked from the operator
+Registered by register(mcp, ctx) from robot_server, like tag_turn and
+plan_module. Its page lives at GET /apriltag on the daemon, linked from the operator
 page. Detection is tools/find_tags.py (the official AprilRobotics library).
 
   Page      enter the camera address, see the latest frame with each tag

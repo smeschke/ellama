@@ -235,32 +235,18 @@ instead of crept: `RANGE_LATENCY_S` folds that lag, one sample interval and the 
 lead together.
 
 
-## Watch and repeat (`watch_and_repeat.py`, `route_math.py`)
+## Plan drawer (`test/plan_drawer/plan_drawer.py`)
 
-Teach the robot a closed loop by driving it once, then let it drive the loop itself.
-The daemon serves a page for this at `http://127.0.0.1:8765/route`, separate from the
-operator page (which links to it).
-
-1. **Start recording**, then drive the loop with the stick or the operator page and
-   finish where you started. The recorder samples the full telemetry snapshot at 10 Hz
-   and never drives. **Keyframe** pins the current pose as a waypoint the route must
-   pass through (and saves a camera frame if you gave a camera URL). **End recording**
-   saves `recordings/routes/<name>/samples.jsonl` and `keyframes.json`.
-2. **Process route** dead-reckons the trail (the live map's `PoseTracker`, so it uses the
-   same frame), spreads the loop-closure error over the trail by path length, simplifies
-   it to waypoints (Ramer-Douglas-Peucker; start, end and keyframes are pinned) and
-   compiles turn+drive legs into `route.json` and `route.png`. A large closure error
-   means dead reckoning drifted, or the run did not end at its start.
-3. **Test turn** spins 10 degrees left. Check the nose really goes left before following.
-4. **Follow route** runs a follower under the drive lease (holder `watch_and_repeat`).
-   Pressing it is the go-ahead for the whole route. **ABORT** latches the operator stop.
-
-Followers are pluggable (`FOLLOWERS` in `watch_and_repeat.py`). The shipped `legs`
-follower turns by the IMU (`turn_degrees`) and drives by the encoders (`drive_distance`),
-so every guard applies to every leg. Recordings keep every sensor field and each waypoint
-carries its sensor snapshot (ToF, yaw, camera), so a camera or ToF follower can be added
-later without recording again. MCP tools: `route_status`, `route_process`,
-`route_follow(confirmed_safe, lease, ...)`.
+Draw a plan with the mouse on a map of the garage (OpenCV window): start pose, tags,
+turn to tag, go to tag, straight and arc (forward or backing up), spin, stop-between or
+smooth links. Every click becomes one or two long moves, not a stream of stick commands.
+Saves `test/plan_drawer/plans/<name>.json`; the Plan page lists those under **Drawn
+plans** and loads one's steps into its list. The dashboard's Modules card and the Plan
+page's **New drawing** / **Edit in drawer** open the drawer on the daemon's own screen
+(`POST /plan/drawer`, one window at a time). Run it by hand with
+`mcp_server/.venv/bin/python test/plan_drawer/plan_drawer.py` (`--selftest` checks the
+geometry). Smooth links are saved as `stop_after: false`, but the plan runner still stops
+after every step.
 
 ## Show AprilTags (`apriltag_module.py`)
 

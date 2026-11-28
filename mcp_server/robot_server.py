@@ -322,10 +322,6 @@ import daemon_http  # noqa: E402
 
 daemon_http.register(mcp, sys.modules[__name__])
 
-import watch_and_repeat  # noqa: E402
-
-watch_and_repeat.register(mcp, sys.modules[__name__])
-
 import apriltag_module  # noqa: E402
 
 apriltag_module.register(mcp, sys.modules[__name__])

@@ -7,6 +7,7 @@ linked from the operator page's Modules card.
 Commands (each forward/back/turn/find/toward step has its own PWM):
   forward N in, back N in     drive_distance (encoders)
   turn left|right N deg       turn_degrees (IMU)
+  arc left|right N deg R in   drive_arc (IMU degrees, encoder path), forward or reverse
   aim TAG                     spin onto the tag (vision_drive.center, as on the tag turn page)
   find TAG [left|right]       turn in steps until the tag shows (up to 360 deg), then aim
   toward TAG                  arc toward the tag, never spinning, until it fills W% of the
@@ -33,6 +34,12 @@ the CSV's time_s, so the video can be lined up with another camera's recording l
 plan.json has csv_t0_unix_s, the wall-clock time of the CSV's time_s = 0. The recording stops when the
 plan ends, however it ends. Unticked, nothing is saved.
 
+Drawn plans: test/plan_drawer/plan_drawer.py (OpenCV, mouse) saves plans to
+test/plan_drawer/plans/<name>.json. The page lists them and loads one's steps into the
+list; "Open the drawer" starts the drawer on the daemon's screen (POST /plan/drawer).
+A drawn step with stop_after false is meant to flow into the next one; the runner still
+stops after every step, and the page says how many links that affects.
+
 Drive lease: held while the page is open (vision_drive.PageLease, holder "plan").
 Run is the go-ahead for the whole list; the plan is checked in full before anything
 moves, and stops at the first step that fails. Stop latches the operator stop (the only
@@ -42,6 +49,9 @@ page afterwards.
 
 import csv
 import json
+import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -54,7 +64,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import vision_drive as vd  # noqa: E402
 
 HOLDER = "plan"
-MAX_STEPS = 50
+MAX_STEPS = 500
+REPO = Path(__file__).resolve().parent.parent
+DRAWER = REPO / "test" / "plan_drawer" / "plan_drawer.py"
+DRAWINGS_DIR = REPO / "test" / "plan_drawer" / "plans"
+DRAWING_FILE = re.compile(r"^[A-Za-z0-9_.-]+\.json$")
+MAX_ARC_IN = 160.0          # drive_tools.MAX_SINGLE_ARC_IN
+MIN_ARC_RADIUS_IN = 6.0     # drive_tools.MIN_ARC_RADIUS_IN
 MAX_LAPS = 100
 VIDEO_FPS = 30             # above the ~21 fps the robot camera gives, so few frames drop
 VIDEO_MAX_REPEAT_S = 5.0    # pad at most this much per frame; a longer gap is made up later
@@ -66,7 +82,7 @@ def video_copies(t, written, fps=VIDEO_FPS, max_repeat_s=VIDEO_MAX_REPEAT_S):
     video is already past t: the camera is faster than fps)."""
     want = int(max(t, 0.0) * fps) + 1          # frames needed to reach t
     return max(0, min(want - written, int(max_repeat_s * fps)))
-DEFAULT_PWM = {"forward": 50, "back": 50, "turn": 60, "find": 60, "toward": 60}
+DEFAULT_PWM = {"forward": 50, "back": 50, "turn": 60, "arc": 60, "find": 60, "toward": 60}
 
 
 def wall_stamp(unix_s):
@@ -121,6 +137,19 @@ def check_step(step):
             raise ValueError("direction must be left or right")
         out["direction"] = step["direction"]
         out["degrees"] = _num(step, "degrees", 1, 360)
+    elif cmd == "arc":
+        if step.get("direction") not in ("left", "right"):
+            raise ValueError("direction must be left or right")
+        out["direction"] = step["direction"]
+        out["radius_in"] = _num(step, "radius_in", MIN_ARC_RADIUS_IN, 600)
+        out["degrees"] = _num(step, "degrees", 0.5, 360)
+        out["travel"] = step.get("travel") or "forward"
+        if out["travel"] not in ("forward", "reverse"):
+            raise ValueError("travel must be forward or reverse")
+        length = out["radius_in"] * out["degrees"] * 3.141592653589793 / 180.0
+        if length > MAX_ARC_IN:
+            raise ValueError("arc is %.0f in long, over the %g in one arc can drive: split it"
+                             % (length, MAX_ARC_IN))
     elif cmd == "aim":
         out["tag"] = _tag(step)
     elif cmd == "find":
@@ -186,6 +215,10 @@ def describe(s):
         return "%s %g in (pwm %d)" % (c, s["inches"], s["pwm"])
     if c == "turn":
         return "turn %s %g deg (pwm %d)" % (s["direction"], s["degrees"], s["pwm"])
+    if c == "arc":
+        return "arc %s%s %g deg, radius %g in (pwm %d)" % (
+            "back " if s["travel"] == "reverse" else "", s["direction"], s["degrees"],
+            s["radius_in"], s["pwm"])
     if c == "aim":
         return "aim at %s" % tag
     if c == "find":
@@ -505,6 +538,13 @@ class Plan:
             if not r.get("ok"):
                 return False, "refused: %s" % (r.get("error") or r.get("abort_reason") or "timeout")
             return True, "turned %s deg" % (abs(got) if isinstance(got, (int, float)) else got)
+        if c == "arc":
+            r = ctx.drive_arc(s["radius_in"], s["degrees"], s["direction"], s["pwm"], True,
+                              travel=s["travel"], lease=lease)
+            got = r.get("actual_degrees_turned")
+            if not r.get("ok"):
+                return False, "refused: %s" % (r.get("error") or r.get("abort_reason") or "timeout")
+            return True, "turned %s deg on the arc" % (abs(got) if isinstance(got, (int, float)) else got)
         if c == "aim":
             return vd.center(drv, s["tag"])
         if c == "find":
@@ -535,7 +575,102 @@ class Plan:
         return out
 
 
+def list_drawings(folder=None):
+    """Saved drawings, newest first: [{file, name, steps, saved, problems}]."""
+    folder = Path(folder or DRAWINGS_DIR)
+    out = []
+    for f in sorted(folder.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True):
+        try:
+            doc = json.loads(f.read_text())
+            out.append({"file": f.name, "name": doc.get("name") or f.stem,
+                        "steps": len(doc.get("steps") or []), "saved": doc.get("saved"),
+                        "problems": len(doc.get("problems") or [])})
+        except Exception as e:
+            out.append({"file": f.name, "name": f.stem, "steps": 0, "saved": None,
+                        "error": "unreadable: %s" % e})
+    return out
+
+
+def drawing_path(file, folder=None):
+    """The drawing's path, only for a plain file name inside the drawings folder."""
+    folder = Path(folder or DRAWINGS_DIR)
+    if not isinstance(file, str) or not DRAWING_FILE.match(file):
+        raise ValueError("not a drawing file name: %r" % (file,))
+    path = (folder / file).resolve()
+    if path.parent != folder.resolve():
+        raise ValueError("not a drawing file name: %r" % (file,))
+    return path
+
+
+def load_drawing(file, folder=None):
+    """(code, {ok, name, steps, notes, problems}): a drawing's steps, checked."""
+    try:
+        path = drawing_path(file, folder)
+        doc = json.loads(path.read_text())
+    except FileNotFoundError:
+        return 404, {"ok": False, "error": "no drawing %s" % file}
+    except Exception as e:
+        return 400, {"ok": False, "error": str(e)}
+    steps = doc.get("steps") or []
+    clean, problems = check_plan(steps)
+    notes = []
+    flows = sum(1 for s in steps[:-1] if isinstance(s, dict) and s.get("stop_after") is False)
+    if flows:
+        notes.append("%d smooth link%s: the robot still stops between those steps for now"
+                     % (flows, "" if flows == 1 else "s"))
+    warns = ["step %d: %s" % (i, s["warning"]) for i, s in enumerate(steps, 1)
+             if isinstance(s, dict) and s.get("warning")]
+    notes += warns
+    notes += ["drawing: %s" % p for p in doc.get("problems") or []]
+    return 200, {"ok": True, "file": path.name, "name": doc.get("name") or path.stem,
+                 "steps": steps, "problems": problems, "notes": notes}
+
+
+class Drawer:
+    """The plan drawer window, started on the daemon's own screen. One at a time."""
+
+    def __init__(self, script=DRAWER, folder=DRAWINGS_DIR, popen=subprocess.Popen):
+        self.script, self.folder, self.popen = Path(script), Path(folder), popen
+        self.proc = None
+        self.lock = threading.Lock()
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def launch(self, file=None, env=None):
+        env = dict(os.environ if env is None else env)
+        if not (env.get("DISPLAY") or env.get("WAYLAND_DISPLAY")):
+            return 409, {"ok": False, "error": "the daemon has no screen to open the drawer on "
+                         "(no DISPLAY): run it yourself: %s %s" % (sys.executable, self.script)}
+        if not self.script.exists():
+            return 409, {"ok": False, "error": "drawer not found at %s" % self.script}
+        cmd = [sys.executable, str(self.script)]
+        if file:
+            try:
+                path = drawing_path(file, self.folder)
+            except ValueError as e:
+                return 400, {"ok": False, "error": str(e)}
+            if not path.exists():
+                return 404, {"ok": False, "error": "no drawing %s" % file}
+            cmd += ["--load", str(path)]
+        with self.lock:
+            if self.running():
+                return 409, {"ok": False, "error": "the drawer is already open on the computer "
+                             "screen: close it first (q), then open this one"}
+            self.folder.mkdir(parents=True, exist_ok=True)
+            log = open(self.folder.parent / "drawer.log", "a")
+            try:
+                self.proc = self.popen(cmd, cwd=str(REPO), env=env, stdout=log, stderr=log,
+                                       stdin=subprocess.DEVNULL, start_new_session=True)
+            except Exception as e:
+                return 500, {"ok": False, "error": "could not start the drawer: %s" % e}
+            finally:
+                log.close()
+        return 200, {"ok": True, "opened": file or "new drawing"}
+
+
 SESSION = None
+DRAWER_APP = Drawer()
 
 
 def _watchdog_loop():
@@ -599,6 +734,22 @@ def register(mcp, ctx):
                                 bool(b.get("record")), bool(b.get("video")))
         return JSONResponse(out, status_code=code)
 
+    @mcp.custom_route("/plan/drawings", methods=["GET"], include_in_schema=False)
+    async def drawings(request: Request):
+        return JSONResponse({"drawings": list_drawings(), "folder": str(DRAWINGS_DIR),
+                             "drawer_open": DRAWER_APP.running()})
+
+    @mcp.custom_route("/plan/drawing", methods=["GET"], include_in_schema=False)
+    async def drawing(request: Request):
+        code, out = load_drawing(request.query_params.get("file"))
+        return JSONResponse(out, status_code=code)
+
+    @mcp.custom_route("/plan/drawer", methods=["POST"], include_in_schema=False)
+    async def drawer(request: Request):
+        b = await body_of(request)
+        code, out = DRAWER_APP.launch(b.get("file") or None)
+        return JSONResponse(out, status_code=code)
+
     @mcp.custom_route("/plan/stop", methods=["POST"], include_in_schema=False)
     async def stop(request: Request):
         code, out = SESSION.stop(who_of(request))
@@ -622,7 +773,7 @@ input.n{width:5.5em}
 button{font:inherit;padding:7px 14px;margin:3px;border-radius:7px;border:0;color:#fff;background:#3b4a5e;cursor:pointer}
 button:disabled{background:#333;color:#777;cursor:default}
 #run{background:#2e6b3a;padding:10px 26px}#stop{background:#c62828;padding:10px 26px}
-#add{background:#2f6fd0}
+#add,#loaddraw{background:#2f6fd0}
 ol{padding-left:1.6em;margin:6px 0}li{padding:5px 4px;border-bottom:1px solid #2c2c2c}
 li .t{display:inline-block;min-width:16em}li button{padding:2px 9px;margin:0 2px;background:#2c2c2c}
 li.running{background:#24364d}li.done .r{color:#7fd08a}li.failed .r,li.failed .t{color:#ff8a80}li.skipped{opacity:.5}
@@ -635,10 +786,15 @@ pre{white-space:pre-wrap;color:#c8c8c8;max-height:14em;overflow:auto}</style></h
  <div class=view><img id=f alt="camera (set the address above)"><div class=mid></div>
   <p id=b class=muted>&nbsp;</p></div>
  <div class=panel>
+  <h2>Drawn plans</h2>
+  <p><select id=drawings style="min-width:16em"><option value="">(none saved yet)</option></select>
+   <button id=loaddraw>Load</button> <button id=editdraw>Edit in drawer</button>
+   <button id=newdraw>New drawing</button></p>
+  <p id=drawmsg class=muted>Draw plans with the mouse in the plan drawer; saved ones show up here.</p>
   <h2>Add a step</h2>
   <p><select id=cmd>
     <option value=forward>forward</option><option value=back>back</option>
-    <option value=turn>turn</option><option value=aim>aim at tag</option>
+    <option value=turn>turn</option><option value=arc>arc</option><option value=aim>aim at tag</option>
     <option value=find>find tag</option><option value=toward>drive toward tag</option>
     <option value=wait>wait</option></select>
    <span id=fields class=fields></span> <button id=add>Add</button></p>
@@ -660,12 +816,14 @@ pre{white-space:pre-wrap;color:#c8c8c8;max-height:14em;overflow:auto}</style></h
 <pre id=log>(nothing yet)</pre>
 <script>
 const $ = id => document.getElementById(id);
-const PWM = {forward: 50, back: 50, turn: 60, find: 60, toward: 60};
-// [key, label, default, kind]; kind: num | dir | tag
+const PWM = {forward: 50, back: 50, turn: 60, arc: 60, find: 60, toward: 60};
+// [key, label, default, kind]; kind: num | dir | travel | tag
 const SPEC = {
   forward: [['inches', 'inches', 12, 'num'], ['pwm', 'pwm', 50, 'num']],
   back:    [['inches', 'inches', 12, 'num'], ['pwm', 'pwm', 50, 'num']],
   turn:    [['direction', '', 'right', 'dir'], ['degrees', 'degrees', 90, 'num'], ['pwm', 'pwm', 60, 'num']],
+  arc:     [['direction', '', 'left', 'dir'], ['degrees', 'degrees', 90, 'num'],
+            ['radius_in', 'radius in', 24, 'num'], ['travel', '', 'forward', 'travel'], ['pwm', 'pwm', 60, 'num']],
   aim:     [['tag', 'tag id (blank = biggest)', '', 'tag']],
   find:    [['tag', 'tag id', '', 'tag'], ['direction', 'turning', 'right', 'dir'], ['pwm', 'pwm', 60, 'num']],
   toward:  [['tag', 'tag id', '', 'tag'], ['width_pct', 'stop at frame width %', 29, 'num'],
@@ -677,6 +835,7 @@ const HINT = {
   forward: 'Drives straight by the wheel encoders.',
   back: 'Backs up straight by the wheel encoders.',
   turn: 'Turns in place by the IMU.',
+  arc: 'Drives a curve of that radius (to the robot centre) until the IMU says it turned that far. Reverse backs along it: nothing senses behind the robot. At most 160 in of path per arc.',
   aim: 'Spins onto the tag (same as the tag turn page). Fails if it is not in view.',
   find: 'Looks; if the tag is not in view, turns in steps (up to a full circle) until it is, then aims.',
   toward: 'Curves toward the tag without spinning, stopping when it fills that % of the frame width (and/or at the ToF distance).',
@@ -717,9 +876,10 @@ function renderFields() {
   for (const [key, label, def, kind] of SPEC[cmd]) {
     const lab = document.createElement('label');
     let el;
-    if (kind === 'dir') {
+    if (kind === 'dir' || kind === 'travel') {
       el = document.createElement('select');
-      for (const d of ['right', 'left']) { const o = document.createElement('option'); o.value = o.textContent = d; el.appendChild(o); }
+      for (const d of kind === 'dir' ? ['right', 'left'] : ['forward', 'reverse']) {
+        const o = document.createElement('option'); o.value = o.textContent = d; el.appendChild(o); }
       el.value = def;
     } else {
       el = document.createElement('input'); el.className = 'n'; el.value = def; el.inputMode = 'decimal';
@@ -749,6 +909,8 @@ function text(s) {
   switch (s.cmd) {
     case 'forward': case 'back': return s.cmd + ' ' + s.inches + ' in (pwm ' + s.pwm + ')';
     case 'turn': return 'turn ' + s.direction + ' ' + s.degrees + '° (pwm ' + s.pwm + ')';
+    case 'arc': return 'arc ' + (s.travel === 'reverse' ? 'back ' : '') + s.direction + ' ' + s.degrees
+      + '°, radius ' + s.radius_in + ' in (pwm ' + (s.pwm || PWM.arc) + ')' + (s.stop_after === false ? '  →' : '');
     case 'aim': return 'aim at ' + tag;
     case 'find': return 'find ' + tag + ', turning ' + s.direction + ' (pwm ' + s.pwm + ')';
     case 'toward': {
@@ -798,6 +960,50 @@ $('run').onclick = async () => {
   if (r.ok === false) $('s').textContent = 'Run refused: ' + (r.error || '?');
 };
 $('stop').onclick = () => post('/plan/stop', {});
+
+// ---- drawn plans
+let drawList = [], replaceArmed = 0;
+async function refreshDrawings() {
+  try {
+    const r = await (await fetch('/plan/drawings', {cache: 'no-store'})).json();
+    const keep = $('drawings').value;
+    drawList = r.drawings || [];
+    const sel = $('drawings'); sel.innerHTML = '';
+    if (!drawList.length) sel.innerHTML = '<option value="">(none saved yet)</option>';
+    for (const d of drawList) {
+      const o = document.createElement('option'); o.value = d.file;
+      o.textContent = d.name + ' (' + d.steps + ' steps' + (d.saved ? ', ' + d.saved.slice(5, 16) : '')
+        + (d.error ? ', ' + d.error : '') + ')';
+      sel.appendChild(o);
+    }
+    if (keep && drawList.some(d => d.file === keep)) sel.value = keep;
+    $('loaddraw').disabled = $('editdraw').disabled = !drawList.length || running;
+  } catch (e) {}
+}
+$('loaddraw').onclick = async () => {
+  const file = $('drawings').value;
+  if (!file) return;
+  if (plan.length && Date.now() - replaceArmed > 3000) {
+    replaceArmed = Date.now();
+    $('drawmsg').textContent = 'This replaces the ' + plan.length + ' steps below: press Load again.';
+    return;
+  }
+  replaceArmed = 0;
+  const r = await (await fetch('/plan/drawing?file=' + encodeURIComponent(file), {cache: 'no-store'})).json();
+  if (!r.ok) { $('drawmsg').textContent = 'Could not load: ' + (r.error || '?'); return; }
+  plan = r.steps.map(s => Object.assign({}, s));
+  await changed();
+  $('drawmsg').textContent = 'Loaded ' + r.name + ': ' + r.steps.length + ' steps.'
+    + (r.notes && r.notes.length ? '  ' + r.notes.join('; ') : '');
+};
+async function openDrawer(file) {
+  const r = await post('/plan/drawer', file ? {file} : {});
+  $('drawmsg').textContent = r.ok ? 'The drawer is open on the computer screen. Save there (w), then Load here.'
+    : 'Drawer: ' + (r.error || '?');
+}
+$('editdraw').onclick = () => openDrawer($('drawings').value);
+$('newdraw').onclick = () => openDrawer(null);
+refreshDrawings(); setInterval(refreshDrawings, 4000);
 
 let streaming = '', running = false;
 async function tick() {

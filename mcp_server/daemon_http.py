@@ -466,10 +466,15 @@ PAGE = """<!doctype html>
 <h1>eLlama operator</h1>
 <div class="card" id="modules">
   <div class="banner">Modules (each opens its own window)</div>
-  <p><a href="/route" style="color:var(--muted)">Watch and repeat (record a route) &rarr;</a></p>
   <p><a href="/tag" style="color:var(--muted)">Tag turn (center on a tag) &rarr;</a></p>
   <p><a href="/apriltag" style="color:var(--muted)">Show AprilTags (what the camera sees) &rarr;</a></p>
   <p><a href="/plan" style="color:var(--muted)">Plan (stack commands and run them) &rarr;</a></p>
+  <p><a href="#" id="drawerlink" style="color:var(--muted)" title="opens a window on this computer's screen"
+     onclick="event.preventDefault(); const m = document.getElementById('drawermsg'); m.textContent = 'opening…';
+       fetch('/plan/drawer', {method: 'POST', headers: {'content-type': 'application/json'}, body: '{}'})
+         .then(r => r.json()).then(j => { m.textContent = j.ok ? 'open on the computer screen; load it on the Plan page'
+           : (j.error || 'could not open it'); }).catch(() => { m.textContent = 'daemon not answering'; });"
+     >Plan drawer (draw a plan with the mouse) &rarr;</a><br><small id="drawermsg"></small></p>
 </div>
 <button id="stop">STOP</button>
 <button id="resume" hidden>Resume: let it drive again</button>
